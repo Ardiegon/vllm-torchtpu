@@ -5244,7 +5244,11 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        if (
+            envs.TPU_MOE_SKIP_PADDED_TOKENS
+            or uses_mxfp4_moe
+            or self._dp_lockstep_enabled()
+        ):
             max_padded_tokens = self.max_num_tokens
             if isinstance(self.drafter, DFlashProposer):
                 # A DFlash draft forward can outgrow the largest target

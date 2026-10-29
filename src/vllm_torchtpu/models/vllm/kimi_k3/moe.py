@@ -395,11 +395,23 @@ class KimiMoE(nn.Module):
         else:
             latent = routed_down_local
         routed = self.experts.routed_experts
-        routed_out = routed.quant_method.apply_monolithic(
-            routed, latent, router_logits
-        )
-        if self.tp_size > 1 or self.use_ep:
-            routed_out = tensor_model_parallel_all_reduce(routed_out)
+        if self.use_ep and routed.moe_config.dp_size > 1:
+            topk_weights, topk_ids = moe_routing.route(routed, latent, router_logits)
+            routed_out = routed.quant_method.apply_with_routing(
+                routed,
+                latent,
+                topk_weights,
+                topk_ids,
+                pipelined=True,
+            )
+            if self.tp_size > 1:
+                routed_out = tensor_model_parallel_all_reduce(routed_out)
+        else:
+            routed_out = routed.quant_method.apply_monolithic(
+                routed, latent, router_logits
+            )
+            if self.tp_size > 1 or self.use_ep:
+                routed_out = tensor_model_parallel_all_reduce(routed_out)
         if self.routed_expert_norm is not None:
             routed_out = self.routed_expert_norm(routed_out)
         routed_local = routed_out[

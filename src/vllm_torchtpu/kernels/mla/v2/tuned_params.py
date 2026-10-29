@@ -1464,18 +1464,22 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
 
-    # Kimi K3 unified KDA+MLA pool geometry (page_size=648 for BF16 or 324/648
-    # for FP8) across arbitrary (max_num_seqs, pages_per_seq) table shapes.
+    # Kimi K3 unified KDA+MLA pool geometry (page_size=1296/1294/648/324 for BF16 or
+    # FP8 across TP=4/8/16) across arbitrary (max_num_seqs, pages_per_seq) table shapes.
     if (
         tuning_key.case == "mixed"
         and tuning_key.actual_lkv_dim == 512
         and tuning_key.actual_r_dim == 64
-        and tuning_key.actual_num_q_heads <= 16
-        and tuning_key.page_size_per_kv_packing in (324, 162, 81)
+        and tuning_key.actual_num_q_heads <= 24
+        and tuning_key.page_size_per_kv_packing in (648, 647, 324, 162, 81)
         and tuning_key.max_num_tokens >= 64
     ):
         page_size = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
-        max_bq = 256 if tuning_key.actual_num_q_heads > 8 else 512
+        max_bq = (
+            128
+            if tuning_key.actual_num_q_heads > 16
+            else (256 if tuning_key.actual_num_q_heads > 8 else 512)
+        )
         bq = min(max_bq, 1 << (tuning_key.max_num_tokens - 1).bit_length())
         bkvp = 1 if page_size >= 512 else (4 if tuning_key.max_num_tokens <= 1024 else 8)
         return TunableParams(

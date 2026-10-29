@@ -54,7 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -351,16 +351,39 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
-        layer = cast("TpuRoutedExperts", layer)
-        activation_str = self._tpu_activation_str
-        assert activation_str is not None, (
-            "[moe] process_weights_after_loading did not run for this layer"
-        )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        return self.apply_with_routing(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            pipelined=enable_pipelined_collective_and_compute(),
+        )
+
+    def apply_with_routing(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        pipelined: bool,
+    ) -> torch.Tensor:
+        """Run the unquantized GMM kernel on pre-routed (x, topk_weights, topk_ids)."""
+        layer = cast("TpuRoutedExperts", layer)
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+            topk_ids, topk_weights, is_local_tensor=pipelined
+        )
 
         kwargs = {
             "hidden_states": x,
@@ -376,7 +399,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
+        if pipelined:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
