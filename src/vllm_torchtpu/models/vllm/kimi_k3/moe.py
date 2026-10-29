@@ -21,7 +21,11 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -32,10 +36,12 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 from .layers import KimiMLP
@@ -144,6 +150,8 @@ class KimiMoE(nn.Module):
 
         self.prefill_group = None
         self.shared_group = None
+        self.register_buffer("packed_moe_in_weight", None, persistent=False)
+        self.register_buffer("packed_moe_out_weight", None, persistent=False)
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
@@ -261,6 +269,98 @@ class KimiMoE(nn.Module):
             bias_param.copy_(bias)
             weight_param.copy_(weight)
 
+    def prepare_moe_projections(self) -> None:
+        """Pack MoE entry (shared gate_up + routed down + router gate) and exit
+        (shared down + row-sharded routed up) weights on TPU when eligible.
+
+        Fuses 3 entry matmuls into 1, 2 exit matmuls into 1, and eliminates
+        `routed_expert_up_proj`'s `[T, hidden_size]` all-gather by folding its
+        row-parallel partial sum into the single exit `all_reduce`.
+        """
+        self.packed_moe_in_weight = None
+        self.packed_moe_out_weight = None
+        if (
+            self.shared_group is not None
+            or self.shared_experts is None
+            or self.routed_expert_down_proj is None
+            or self.routed_expert_up_proj is None
+        ):
+            return
+        shared_gu = getattr(self.shared_experts, "gate_up_proj", None)
+        shared_down = getattr(self.shared_experts, "down_proj", None)
+        down_proj = self.routed_expert_down_proj
+        up_proj = self.routed_expert_up_proj
+        gate = self.gate
+        layers = (shared_gu, down_proj, gate, shared_down, up_proj)
+        if any(
+            layer is None
+            or getattr(layer, "weight", None) is None
+            or layer.weight.dtype != torch.bfloat16
+            or layer.weight.device.type != "tpu"
+            or getattr(layer, "bias", None) is not None
+            or not getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            for layer in layers
+        ):
+            return
+        w_shared_gu = shared_gu.weight
+        w_down = down_proj.weight
+        w_gate = gate.weight
+        w_shared_down = shared_down.weight
+        w_up = up_proj.weight
+        hidden_size = w_shared_gu.shape[0]
+        if w_down.shape[0] != hidden_size or w_gate.shape[0] != hidden_size:
+            return
+        if w_shared_down.shape[1] != hidden_size:
+            return
+        up_group = getattr(up_proj, "_chip_group", None)
+        tp_rank = get_tensor_model_parallel_rank()
+        latent_dim = w_up.shape[0]
+        if self.tp_size > 1 and latent_dim % self.tp_size != 0:
+            return
+        latent_local = latent_dim // max(1, self.tp_size)
+        with torch.no_grad():
+            if up_group is not None:
+                if up_group.world_size != self.tp_size:
+                    return
+                full_w_up = up_group.all_gather(w_up, dim=-1)
+                rank = up_group.rank_in_group
+            else:
+                full_w_up = w_up
+                rank = tp_rank
+            if full_w_up.shape != (latent_dim, hidden_size):
+                return
+            w_up_row = full_w_up[
+                rank * latent_local : (rank + 1) * latent_local, :
+            ].contiguous()
+
+            shared_gu_cols = w_shared_gu.shape[1]
+            down_cols = w_down.shape[1]
+            down_pad_cols = ((down_cols + 127) // 128) * 128
+            if shared_gu_cols % 128 != 0:
+                return
+
+            packed_in = torch.cat(
+                (
+                    w_shared_gu,
+                    w_down,
+                    w_down.new_zeros((hidden_size, down_pad_cols - down_cols)),
+                ),
+                dim=-1,
+            )
+            self.packed_moe_in_weight = fresh_buffer(packed_in)
+            self._moe_in_shared_cols = shared_gu_cols
+            self._moe_in_down_cols = down_cols
+            self._moe_in_down_pad_cols = down_pad_cols
+
+            packed_out = torch.cat((w_shared_down, w_up_row), dim=0)
+            self.packed_moe_out_weight = fresh_buffer(packed_out)
+            self._moe_out_latent_start = rank * latent_local
+            self._moe_out_latent_end = (rank + 1) * latent_local
+            for layer in (shared_gu, down_proj, shared_down, up_proj):
+                layer.weight.data = torch.empty(
+                    0, dtype=w_shared_gu.dtype, device=w_shared_gu.device
+                )
+
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False
     ) -> torch.Tensor:
@@ -268,9 +368,50 @@ class KimiMoE(nn.Module):
             return self._forward_expert_parallel(hidden_states, sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if (
+            getattr(self, "packed_moe_in_weight", None) is not None
+            and getattr(self, "packed_moe_out_weight", None) is not None
+        ):
+            output = self._forward_packed(hidden_states)
+            return output.view(num_tokens, hidden_size)
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
+
+    def _forward_packed(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits, _ = self.gate(hidden_states)
+        packed_in = hidden_states @ self.packed_moe_in_weight
+        shared_gate_up, routed_down_pad = packed_in.split(
+            [
+                self._moe_in_shared_cols,
+                self._moe_in_down_pad_cols,
+            ],
+            dim=-1,
+        )
+        routed_down_local = routed_down_pad[:, : self._moe_in_down_cols]
+        down_group = getattr(self.routed_expert_down_proj, "_chip_group", None)
+        if down_group is not None:
+            latent = down_group.all_gather(routed_down_local, dim=-1)
+        else:
+            latent = routed_down_local
+        routed = self.experts.routed_experts
+        routed_out = routed.quant_method.apply_monolithic(
+            routed, latent, router_logits
+        )
+        if self.tp_size > 1 or self.use_ep:
+            routed_out = tensor_model_parallel_all_reduce(routed_out)
+        if self.routed_expert_norm is not None:
+            routed_out = self.routed_expert_norm(routed_out)
+        routed_local = routed_out[
+            :, self._moe_out_latent_start : self._moe_out_latent_end
+        ]
+        assert self.shared_experts is not None
+        shared_act = self.shared_experts.act_fn(shared_gate_up)
+        combined_in = torch.cat((shared_act, routed_local), dim=-1)
+        out_partial = combined_in @ self.packed_moe_out_weight
+        if self.tp_size > 1:
+            return tensor_model_parallel_all_reduce(out_partial)
+        return out_partial
 
     def _forward_expert_parallel(
         self, hidden_states: torch.Tensor, sequence_parallel: bool

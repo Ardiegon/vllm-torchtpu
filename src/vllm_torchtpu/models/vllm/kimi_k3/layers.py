@@ -54,6 +54,21 @@ def _build_attention_residual_op(eps: float):
     return op
 
 
+@cache
+def _build_attention_residual_bt_op(eps: float):
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual_bt
+
+    def core(prefix: jax.Array, history_bt: jax.Array, weight: jax.Array) -> jax.Array:
+        return attention_residual_bt(prefix, history_bt, weight, eps=eps)
+
+    suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
+    op = pallas.jax_op(f"pallas::kimi_attention_residual_bt_{suffix}", core)
+    op.register_fake(lambda prefix, history_bt, weight: torch.empty_like(prefix))
+    return op
+
+
 class SituAndMul(nn.Module):
     """Kimi's SITU gated activation.
 
@@ -192,12 +207,49 @@ class AttentionResidual(nn.Module):
         self._prefill_op = (
             _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None
         )
+        self._prefill_bt_op = (
+            _build_attention_residual_bt_op(self.eps)
+            if out.device.type == "tpu"
+            else None
+        )
 
     def forward(
         self,
         prefix_sum: torch.Tensor,
         block_residuals: torch.Tensor,
+        blocks_first: bool = False,
     ) -> torch.Tensor:
+        if blocks_first:
+            if block_residuals.shape[0] == 0:
+                return prefix_sum
+            if self._prefill_bt_op is not None and prefix_sum.shape[0] % 16 == 0:
+                return self._prefill_bt_op(
+                    prefix_sum, block_residuals, self.folded_weight
+                )
+            w = self.folded_weight
+            if prefix_sum.shape[0] == 1:
+                values = torch.cat(
+                    (block_residuals, prefix_sum.unsqueeze(0)), dim=0
+                ).float()  # [K, 1, hidden]
+                inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
+                probabilities = ((values * w).sum(-1) * inv).softmax(dim=0)
+                out = (probabilities.unsqueeze(-1) * values).sum(dim=0)
+                return out.to(block_residuals.dtype)
+            v_blocks = block_residuals.float()
+            v_prefix = prefix_sum.float()
+            inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
+            inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
+            scores = torch.cat(
+                (
+                    (v_blocks * w).sum(-1) * inv_blocks,
+                    ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(0),
+                ),
+                dim=0,
+            )  # [K, T]
+            probabilities = scores.softmax(dim=0)
+            out = (probabilities[:-1].unsqueeze(-1) * v_blocks).sum(dim=0)
+            out = out + probabilities[-1].unsqueeze(-1) * v_prefix
+            return out.to(block_residuals.dtype)
         if block_residuals.shape[1] == 0:
             return prefix_sum
         if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:

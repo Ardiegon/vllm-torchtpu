@@ -665,14 +665,20 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
         if not (
-            isinstance(getattr(self, "prefill_group", None), FusedPrefillCollectives)
-            and self.use_full_rank_gate
-            and self.num_heads == 3
+            self.use_full_rank_gate
+            and self.num_heads > 0
             and self.head_dim == 128
         ):
             return
+        local_proj = self.num_heads * self.head_dim
+        qkv_cols = 3 * local_proj
+        beta_pad_cols = ((self.num_heads + 127) // 128) * 128
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
-        expected = ((7168, 1155), (7168, 384), (7168, 128))
+        expected = (
+            (7168, qkv_cols + self.num_heads),
+            (7168, local_proj),
+            (7168, self.head_dim),
+        )
         weights = []
         for projection, shape in zip(projections, expected):
             weight = getattr(projection, "weight", None)
@@ -684,13 +690,19 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             ):
                 return
             weights.append(weight)
-        # q/k/v occupy 1152 columns; pad the 3 beta columns to an MXU tile.
+        # Pad the beta columns up to an MXU 128-lane tile boundary.
         qkvb, gate, fa = weights
+        pad_cols = beta_pad_cols - self.num_heads
         with torch.no_grad():
-            packed = torch.cat((qkvb, qkvb.new_zeros((7168, 125)), gate, fa), dim=-1)
+            packed = torch.cat(
+                (qkvb, qkvb.new_zeros((7168, pad_cols)), gate, fa), dim=-1
+            )
             # Materialize the layout once, avoiding a lazy cat at every call.
-            self.packed_prefill_weight = torch.empty_like(packed)
-            self.packed_prefill_weight.copy_(packed)
+            self.packed_prefill_weight = fresh_buffer(packed)
+            for projection in projections:
+                projection.weight.data = torch.empty(
+                    0, dtype=qkvb.dtype, device=qkvb.device
+                )
 
     def forward(
         self,
@@ -713,11 +725,16 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)
                 packed = hidden_states @ self.packed_prefill_weight
+            local_proj = getattr(
+                self, "local_projection_size", self.num_heads * self.head_dim
+            )
+            qkv_cols = 3 * local_proj
+            beta_pad_cols = ((self.num_heads + 127) // 128) * 128
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
-                [1152, 128, 384, 128], dim=-1
+                [qkv_cols, beta_pad_cols, local_proj, self.head_dim], dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, : self.local_projection_size]
+            query = mixed_qkv[:, :local_proj]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)

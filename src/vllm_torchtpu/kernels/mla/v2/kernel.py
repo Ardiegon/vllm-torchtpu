@@ -2158,7 +2158,8 @@ def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
     _, actual_num_q_heads, actual_head_dim = q.shape
-    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype))
+    q_packing = get_dtype_packing(q.dtype)
+    num_q_heads = align_to(actual_num_q_heads, max(8, q_packing * 4))
     head_dim = align_to(actual_head_dim, 128)
     q = jnp.pad(
         q,
@@ -2184,7 +2185,8 @@ def prepare_q_nope_inputs(
     Returns: [max_num_tokens, num_q_heads, head_dim]
     """
     actual_num_q_heads, actual_max_num_tokens, actual_head_dim = q.shape
-    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype))
+    q_packing = get_dtype_packing(q.dtype)
+    num_q_heads = align_to(actual_num_q_heads, max(8, q_packing * 4))
     head_dim = align_to(actual_head_dim, 128)
 
     # Align T to sublane_multiple (i.e. dtype_packing * 8).

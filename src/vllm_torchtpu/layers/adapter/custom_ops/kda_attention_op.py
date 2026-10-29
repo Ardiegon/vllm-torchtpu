@@ -551,7 +551,6 @@ def _pooled_kda_core(
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     dense_offsets = None
-    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
     if num_spec_tokens:
         if slot_read_offsets is None or ckpt_indices is None:
             raise ValueError(
@@ -561,6 +560,25 @@ def _pooled_kda_core(
             raise ValueError(
                 "Pooled KDA checkpoint indices must match the verify window"
             )
+    # Bound the static gather/scatter/pad width to the padded token bucket size
+    # (`mixed_qkv.shape[0]`), since at most `mixed_qkv.shape[0]` sequences can
+    # have >= 1 token in this step.
+    active_reqs = max(1, min(num_reqs, mixed_qkv.shape[0]))
+    if active_reqs < num_reqs:
+        num_reqs = active_reqs
+        state_indices = state_indices[:active_reqs]
+        seq_lens = seq_lens[:active_reqs]
+        query_start_loc = query_start_loc[: active_reqs + 1]
+        if slot_read_offsets is not None:
+            slot_read_offsets = slot_read_offsets[:active_reqs]
+        if ckpt_indices is not None:
+            ckpt_indices = ckpt_indices[:active_reqs]
+        distribution = jnp.minimum(distribution, active_reqs)
+        if window_distribution is not None:
+            window_distribution = jnp.minimum(window_distribution, active_reqs)
+    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
+    if num_spec_tokens:
+        assert slot_read_offsets is not None and ckpt_indices is not None
         # Manager blocks need not be contiguous. Keep every checkpoint in a
         # contiguous scratch window, including untouched ragged/prefill tails.
         # TODO: follow #889's is_shared=True path and access the unified pool

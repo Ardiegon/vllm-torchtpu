@@ -28,9 +28,12 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
     load_kmajor_fp4,
+    load_w2_planar_t_mxfp4,
+    load_w13_planar_t_mxfp4,
     prebuild_fused_moe_kernel,
     requant_load_kmajor_fp4,
 )
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
@@ -183,17 +186,34 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight_packed = self._loaded_data(layer.w2_weight_packed).to("tpu")
         w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
 
-        # Convert e8m0 scales to fp32
-        w13_scale = e8m0_to_fp32(w13_weight_scale)
-        w2_scale = e8m0_to_fp32(w2_weight_scale)
-
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        if requant_block is not None:
+        hidden = w13_weight_packed.shape[-1] * 2
+        inter = w2_weight_packed.shape[-1] * 2
+        is_v6e_planar_t_eligible = (
+            requant_block is None
+            and get_chip_version().value == "v6e"
+            and hidden % 512 == 0
+            and inter % 512 == 0
+        )
+
+        if is_v6e_planar_t_eligible:
+            # TPU v6e lacks native FP4 MXU decode; repack into planar_t uint8
+            # nibbles + transposed uint8 E8M0 block-32 scales for in-kernel
+            # float8_e4m3b11fnuz (b11) VMEM unpack and MXU execution.
+            w13_weight, w13_scale_4d = load_w13_planar_t_mxfp4(
+                fresh_buffer(w13_weight_packed),
+                fresh_buffer(w13_weight_scale),
+            )
+            w2_weight, w2_scale_4d = load_w2_planar_t_mxfp4(
+                fresh_buffer(w2_weight_packed),
+                fresh_buffer(w2_weight_scale),
+            )
+        elif requant_block is not None:
+            # Convert e8m0 scales to fp32
+            w13_scale = e8m0_to_fp32(w13_weight_scale)
+            w2_scale = e8m0_to_fp32(w2_weight_scale)
             requant_block = int(requant_block)
 
-            # The last dim of packed weights is K/2. So K is shape[-1] * 2.
-            hidden = w13_weight_packed.shape[-1] * 2
-            inter = w2_weight_packed.shape[-1] * 2
             if hidden % requant_block != 0 or inter % requant_block != 0:
                 raise ValueError(
                     f"W4A8 requantization needs hidden ({hidden}) and inter ({inter}) "
@@ -209,6 +229,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 fresh_buffer(w2_weight_packed), w2_scale, requant_block
             )
         else:
+            # Convert e8m0 scales to fp32
+            w13_scale = e8m0_to_fp32(w13_weight_scale)
+            w2_scale = e8m0_to_fp32(w2_weight_scale)
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
                 # scale shape: [E, N, num_blocks]

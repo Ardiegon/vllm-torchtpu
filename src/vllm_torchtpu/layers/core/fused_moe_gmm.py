@@ -24,6 +24,13 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    can_use_fused_decode_moe_v6e_planar_t_b11,
+    fused_decode_moe_v6e_planar_t_b11,
+    moe_gmm_v6e_planar_t_b11,
+    repack_w2_planar_t,
+    repack_w13_planar_t,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -436,36 +443,53 @@ def moe_gmm(
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
-    group_offset = jnp.array([0], dtype=jnp.int32)
-
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
+    if (
+        w1.dtype == jnp.uint8
+        and w1_scale is not None
+        and w1_scale.dtype == jnp.uint8
+        and rhs_quant_dtype is None
+    ):
+        gmm2_res = moe_gmm_v6e_planar_t_b11(
+            x,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            group_sizes,
+            activation=activation,
+            preferred_element_type=x.dtype,
+        )
+    else:
+        group_offset = jnp.array([0], dtype=jnp.int32)
+
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+
+        gmm2_res = gmm_wrapper(
+            gmm1_res,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
@@ -665,6 +689,32 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if can_use_fused_decode_moe_v6e_planar_t_b11(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        rhs_quant_dtype=rhs_quant_dtype,
+    ):
+        logger.info_once(
+            "Selected fused single-kernel decode MoE (planar_t_b11): tokens=%d",
+            num_tokens,
+        )
+        return fused_decode_moe_v6e_planar_t_b11(
+            hidden_states,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            preferred_element_type=hidden_states.dtype,
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.

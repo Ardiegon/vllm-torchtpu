@@ -1342,29 +1342,166 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         decode_batch_size=1,
         q_split=2,
     ),
+    # Kimi K3 TP8 (12 heads) & TP16 (6 heads) on TPU v6e, unified KDA+MLA BF16 pool (648-token pages).
+    TuningKey(
+        case="mixed",
+        max_num_tokens=1024,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=324,
+        kv_packing=2,
+        max_num_seqs=64,
+        pages_per_seq=13,
+    ): TunableParams(
+        num_kv_pages_per_block=1,
+        num_queries_per_block=256,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    TuningKey(
+        case="mixed",
+        max_num_tokens=4096,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=324,
+        kv_packing=2,
+        max_num_seqs=64,
+        pages_per_seq=13,
+    ): TunableParams(
+        num_kv_pages_per_block=1,
+        num_queries_per_block=256,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    TuningKey(
+        case="mixed",
+        max_num_tokens=8192,
+        actual_num_q_heads=12,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=324,
+        kv_packing=2,
+        max_num_seqs=64,
+        pages_per_seq=13,
+    ): TunableParams(
+        num_kv_pages_per_block=1,
+        num_queries_per_block=256,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    TuningKey(
+        case="mixed",
+        max_num_tokens=1024,
+        actual_num_q_heads=6,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=324,
+        kv_packing=2,
+        max_num_seqs=64,
+        pages_per_seq=13,
+    ): TunableParams(
+        num_kv_pages_per_block=1,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    TuningKey(
+        case="mixed",
+        max_num_tokens=4096,
+        actual_num_q_heads=6,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=324,
+        kv_packing=2,
+        max_num_seqs=64,
+        pages_per_seq=13,
+    ): TunableParams(
+        num_kv_pages_per_block=1,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    TuningKey(
+        case="mixed",
+        max_num_tokens=8192,
+        actual_num_q_heads=6,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="bfloat16",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=324,
+        kv_packing=2,
+        max_num_seqs=64,
+        pages_per_seq=13,
+    ): TunableParams(
+        num_kv_pages_per_block=1,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
 }
 
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
-    else:
-        logger.warning(
-            "No tuned parameters found for the given tuning key: %s, "
-            "using default parameters",
-            tuning_key,
-        )
-        if tuning_key.case == "mixed":
-            return TunableParams(
-                num_kv_pages_per_block=1,
-                num_queries_per_block=16,
-                vmem_limit_bytes=62914560,
-            )
 
-        # decode, batched_decode
+    # Kimi K3 unified KDA+MLA pool geometry (page_size=648 for BF16 or 324/648
+    # for FP8) across arbitrary (max_num_seqs, pages_per_seq) table shapes.
+    if (
+        tuning_key.case == "mixed"
+        and tuning_key.actual_lkv_dim == 512
+        and tuning_key.actual_r_dim == 64
+        and tuning_key.actual_num_q_heads <= 16
+        and tuning_key.page_size_per_kv_packing in (324, 162, 81)
+        and tuning_key.max_num_tokens >= 64
+    ):
+        page_size = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+        max_bq = 256 if tuning_key.actual_num_q_heads > 8 else 512
+        bq = min(max_bq, 1 << (tuning_key.max_num_tokens - 1).bit_length())
+        bkvp = 1 if page_size >= 512 else (4 if tuning_key.max_num_tokens <= 1024 else 8)
         return TunableParams(
-            decode_batch_size=4,
-            num_kv_pages_per_block=3,
-            num_queries_per_block=1,
+            num_kv_pages_per_block=bkvp,
+            num_queries_per_block=bq,
+            vmem_limit_bytes=62914560,
+            decode_batch_size=1,
+            q_split=2,
+        )
+
+    logger.warning(
+        "No tuned parameters found for the given tuning key: %s, "
+        "using default parameters",
+        tuning_key,
+    )
+    if tuning_key.case == "mixed":
+        return TunableParams(
+            num_kv_pages_per_block=1,
+            num_queries_per_block=16,
             vmem_limit_bytes=62914560,
         )
+
+    # decode, batched_decode
+    return TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=3,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    )

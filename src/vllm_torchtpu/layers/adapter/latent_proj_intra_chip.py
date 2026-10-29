@@ -35,6 +35,7 @@ latency would swamp the bandwidth saved.
 from __future__ import annotations
 
 import torch
+from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
@@ -140,6 +141,38 @@ def shard_group_or_none(output_size: int):
     return group
 
 
+def tp_shard_group_or_none(output_size: int):
+    """The TP group to shard ``output_size`` across on single-core-per-chip TPUs.
+
+    On TPU v6e (1 core/chip), ``get_intra_chip_group()`` returns ``None``,
+    leaving ``routed_expert_down_proj`` and ``routed_expert_up_proj`` replicated
+    across all TP ranks. Sharding both column-parallel across ``get_tp_group()``
+    with an ``all_gather(dim=-1)`` cuts per-rank weight HBM and HBM read bytes by
+    ``tp_size`` while keeping the contraction arithmetic bit-identical to
+    ``ReplicatedLinear``.
+    """
+    if not envs.TPU_LATENT_PROJ_TP:
+        return None
+
+    if not parallel_state.model_parallel_is_initialized():
+        return None
+
+    group = parallel_state.get_tp_group()
+    if group is None or group.world_size < 2:
+        return None
+
+    if output_size % group.world_size != 0:
+        _warn_once(
+            "Latent projection output %d does not divide across %d TP ranks; "
+            "leaving it replicated.",
+            output_size,
+            group.world_size,
+        )
+        return None
+
+    return group
+
+
 def make_latent_projection(
     input_size: int,
     output_size: int,
@@ -148,8 +181,10 @@ def make_latent_projection(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> ReplicatedLinear | IntraChipColumnParallelLinear:
-    """The intra-chip sharded projection when it applies, else the replicated one."""
+    """The intra-chip or TP-sharded projection when it applies, else the replicated one."""
     group = shard_group_or_none(output_size)
+    if group is None:
+        group = tp_shard_group_or_none(output_size)
     if group is None:
         return ReplicatedLinear(
             input_size,
@@ -163,7 +198,7 @@ def make_latent_projection(
     # message, so naming the layer would emit 184 near-identical lines per rank
     # instead of one per distinct projection.
     logger.info_once(
-        "Latent MoE projection [%d, %d] sharded across %d cores per chip "
+        "Latent MoE projection [%d, %d] sharded across %d ranks "
         "(%d columns each).",
         output_size,
         input_size,

@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_LATENT_PROJ_TP: bool = True
 
 
 def env_with_choices(
@@ -1130,6 +1131,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    # Shard Kimi K3's latent-MoE down/up projections column-parallel across TP
+    # ranks with an all-gather when there is one core per chip (e.g. TPU v6e).
+    "TPU_LATENT_PROJ_TP": env_bool("TPU_LATENT_PROJ_TP", True),
 }
 
 
