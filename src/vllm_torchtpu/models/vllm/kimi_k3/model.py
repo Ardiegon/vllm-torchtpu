@@ -81,7 +81,7 @@ from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
-from .layers import AttentionResidual, KimiMLP
+from .layers import AttentionResidual, KimiMLP, quantize_linear_layer_w8a16
 from .moe import KimiMoE
 
 logger = init_logger(__name__)
@@ -417,6 +417,91 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 module.prepare_moe_projections()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
+
+        if envs.TPU_KIMI_DENSE_W8A16_B11:
+            from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
+                release_memory_to_os,
+            )
+
+            to_sync: list[torch.Tensor] = []
+            for module in self.modules():
+                if isinstance(module, KimiDecoderLayer):
+                    mlp = getattr(module, "mlp", None)
+                    if isinstance(mlp, KimiMLP):
+                        to_sync.extend(
+                            quantize_linear_layer_w8a16(mlp.gate_up_proj)
+                        )
+                        to_sync.extend(
+                            quantize_linear_layer_w8a16(mlp.down_proj)
+                        )
+                    if isinstance(module.self_attn, KimiDeltaAttention):
+                        to_sync.extend(
+                            quantize_linear_layer_w8a16(module.self_attn.o_proj)
+                        )
+                        if module.self_attn.packed_prefill_weight is not None:
+                            to_sync.append(module.self_attn.packed_prefill_weight)
+                        if module.self_attn.packed_prefill_scale is not None:
+                            to_sync.append(module.self_attn.packed_prefill_scale)
+                    elif isinstance(module.self_attn, MultiHeadLatentAttention):
+                        to_sync.extend(
+                            quantize_linear_layer_w8a16(module.self_attn.o_proj)
+                        )
+                        if (
+                            getattr(module.self_attn.mla_attn, "kimi_preprocess", None)
+                            is None
+                        ):
+                            to_sync.extend(
+                                quantize_linear_layer_w8a16(
+                                    module.self_attn.fused_qkv_a_proj
+                                )
+                            )
+                            to_sync.extend(
+                                quantize_linear_layer_w8a16(module.self_attn.q_b_proj)
+                            )
+                elif isinstance(module, KimiMoE):
+                    if module.packed_moe_in_weight is not None:
+                        to_sync.append(module.packed_moe_in_weight)
+                    if module.packed_moe_in_scale is not None:
+                        to_sync.append(module.packed_moe_in_scale)
+                    if module.packed_moe_out_weight is not None:
+                        to_sync.append(module.packed_moe_out_weight)
+                    if module.packed_moe_out_scale is not None:
+                        to_sync.append(module.packed_moe_out_scale)
+                    if (
+                        module.packed_moe_in_weight is None
+                        or module.packed_moe_out_weight is None
+                    ):
+                        if module.shared_experts is not None:
+                            to_sync.extend(
+                                quantize_linear_layer_w8a16(
+                                    module.shared_experts.gate_up_proj
+                                )
+                            )
+                            to_sync.extend(
+                                quantize_linear_layer_w8a16(
+                                    module.shared_experts.down_proj
+                                )
+                            )
+                        to_sync.extend(
+                            quantize_linear_layer_w8a16(
+                                module.routed_expert_down_proj
+                            )
+                        )
+                        to_sync.extend(
+                            quantize_linear_layer_w8a16(
+                                module.routed_expert_up_proj
+                            )
+                        )
+            if not getattr(self.config, "tie_word_embeddings", False):
+                to_sync.extend(quantize_linear_layer_w8a16(self.lm_head))
+            tpu_tensors = [
+                t
+                for t in to_sync
+                if isinstance(t, torch.Tensor) and t.device.type == "tpu"
+            ]
+            if tpu_tensors:
+                synchronize_tensors(tpu_tensors)
+                release_memory_to_os()
 
     @classmethod
     def get_mamba_state_dtype_from_config(

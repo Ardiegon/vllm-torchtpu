@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     TPU_LATENT_PROJ_TP: bool = True
     TPU_KDA_DIRECT_POOL_STREAMING: bool = True
+    TPU_KIMI_DENSE_W8A16_B11: bool = True
 
 
 def env_with_choices(
@@ -1140,6 +1141,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bypassing external gather_region / scatter_region Pallas calls.
     "TPU_KDA_DIRECT_POOL_STREAMING": env_bool(
         "TPU_KDA_DIRECT_POOL_STREAMING", True
+    ),
+    # Quantize Kimi K3's dense projections (KDA packed_prefill_weight & o_proj,
+    # MLA fused_qkv_a_proj, q_b_proj & o_proj, Layer-0 dense KimiMLP, MoE
+    # packed_moe_in_weight & packed_moe_out_weight, and lm_head) to weight-only
+    # W8A16 per-output-channel symmetric quantization (quantize_activation=False).
+    "TPU_KIMI_DENSE_W8A16_B11": env_bool(
+        "TPU_KIMI_DENSE_W8A16_B11", True
     ),
 }
 

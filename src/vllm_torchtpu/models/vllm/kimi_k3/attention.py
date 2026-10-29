@@ -64,6 +64,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
+from .layers import quantize_weight_w8a16, w8a16_matmul
 
 logger = init_logger(__name__)
 
@@ -575,6 +576,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
         )
         self.register_buffer("packed_prefill_weight", None, persistent=False)
+        self.register_buffer("packed_prefill_scale", None, persistent=False)
         self.kv_cache = None
         # The dispatched op owns the short convolution as well: the fused
         # kernel does the convolution itself, so it cannot be fed by a separate
@@ -662,8 +664,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self._pack_prefill_projection()
 
     def _pack_prefill_projection(self):
-        """Cache BF16 KDA input weights after the normal checkpoint loaders."""
+        """Cache BF16 or W8A16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
+        self.packed_prefill_scale = None
         if not (
             self.use_full_rank_gate
             and self.num_heads > 0
@@ -693,15 +696,23 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # Pad the beta columns up to an MXU 128-lane tile boundary.
         qkvb, gate, fa = weights
         pad_cols = beta_pad_cols - self.num_heads
+        empty_dtype = qkvb.dtype
+        empty_device = qkvb.device
         with torch.no_grad():
             packed = torch.cat(
                 (qkvb, qkvb.new_zeros((7168, pad_cols)), gate, fa), dim=-1
             )
-            # Materialize the layout once, avoiding a lazy cat at every call.
-            self.packed_prefill_weight = fresh_buffer(packed)
+            if envs.TPU_KIMI_DENSE_W8A16_B11 and packed.device.type == "tpu":
+                w_q, w_s = quantize_weight_w8a16(packed)
+                self.packed_prefill_weight = w_q
+                self.packed_prefill_scale = w_s
+            else:
+                # Materialize the layout once, avoiding a lazy cat at every call.
+                self.packed_prefill_weight = fresh_buffer(packed)
+            del packed
             for projection in projections:
                 projection.weight.data = torch.empty(
-                    0, dtype=qkvb.dtype, device=qkvb.device
+                    0, dtype=empty_dtype, device=empty_device
                 )
 
     def forward(
@@ -719,12 +730,23 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
-            if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+            if (
+                sequence_parallel
+                and isinstance(group, FusedPrefillCollectives)
+                and self.packed_prefill_scale is None
+            ):
                 packed = group.gather_project(hidden_states, self.packed_prefill_weight)
             else:
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)
-                packed = hidden_states @ self.packed_prefill_weight
+                if self.packed_prefill_scale is not None:
+                    packed = w8a16_matmul(
+                        hidden_states,
+                        self.packed_prefill_weight,
+                        self.packed_prefill_scale,
+                    )
+                else:
+                    packed = hidden_states @ self.packed_prefill_weight
             local_proj = getattr(
                 self, "local_projection_size", self.num_heads * self.head_dim
             )
