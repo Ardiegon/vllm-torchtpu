@@ -6765,6 +6765,7 @@ def fused_decode_moe_v6e_planar_t_b11(
     *,
     activation: str,
     preferred_element_type: jax.typing.DTypeLike | None = None,
+    vmem_limit_bytes: int | None = 48 * 1024 * 1024,
 ) -> jax.Array:
   """Single-kernel fused decode MoE on TPU v6e for small token batches (M <= 64).
 
@@ -6833,6 +6834,7 @@ def fused_decode_moe_v6e_planar_t_b11(
   plane_rows = chunk // 2
   scale_rows = chunk // SCALE_GROUP
   depth_w13 = 2
+  depth_w2 = 1 if n >= 3072 else 2
 
   w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
   w13_scales_5d = w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
@@ -6879,13 +6881,13 @@ def fused_decode_moe_v6e_planar_t_b11(
           ),
       )
 
-    def copy_w2_expert(g):
+    def copy_w2_expert(g, slot=0):
       return (
           pltpu.make_async_copy(
-              w2_p_ref.at[g], w2_pbuf.at[0], w2_psem.at[0]
+              w2_p_ref.at[g], w2_pbuf.at[slot], w2_psem.at[slot]
           ),
           pltpu.make_async_copy(
-              w2_s_ref.at[g], w2_sbuf.at[0], w2_ssem.at[0]
+              w2_s_ref.at[g], w2_sbuf.at[slot], w2_ssem.at[slot]
           ),
       )
 
@@ -6894,15 +6896,27 @@ def fused_decode_moe_v6e_planar_t_b11(
       g0 = active_ids_ref[0]
       for c in copy_w13_expert(g0, 0):
         c.start()
+      if depth_w2 >= 2:
+        for c2 in copy_w2_expert(g0, 0):
+          c2.start()
 
     def visit_expert(j, carry):
       g = active_ids_ref[j]
       slot = lax.rem(j, depth_w13)
       next_slot = lax.rem(j + 1, depth_w13)
+      slot2 = lax.rem(j, depth_w2)
+      next_slot2 = lax.rem(j + 1, depth_w2)
       w_g = w_expert_ref[g]
 
-      for c2 in copy_w2_expert(g):
-        c2.start()
+      if depth_w2 == 1:
+        for c2 in copy_w2_expert(g, 0):
+          c2.start()
+      else:
+        @pl.when(j + 1 < nat_ref[0])
+        def _prefetch_next_w2():
+          g_next = active_ids_ref[j + 1]
+          for c2 in copy_w2_expert(g_next, next_slot2):
+            c2.start()
 
       @pl.when(j + 1 < nat_ref[0])
       def _prefetch_next():
@@ -6951,7 +6965,7 @@ def fused_decode_moe_v6e_planar_t_b11(
         ).astype(out_dtype)
         h_buf[:, sl] = h_tile
 
-      for c2 in copy_w2_expert(g):
+      for c2 in copy_w2_expert(g, slot2):
         c2.wait()
 
       h_full = h_buf[...]
@@ -6962,7 +6976,7 @@ def fused_decode_moe_v6e_planar_t_b11(
         for cs in range(steps_2):
           h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
           codes2, wscale2 = fold_chunk(
-              w2_pbuf[0, cs, :, sl2], w2_sbuf[0, cs, :, sl2]
+              w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
           )
           w2_acc[...] += (
               lax.dot_general(
@@ -6984,8 +6998,8 @@ def fused_decode_moe_v6e_planar_t_b11(
   scratch_shapes = [
       pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
       pltpu.VMEM((depth_w13, 2, steps_13, scale_rows, n), jnp.uint8),
-      pltpu.VMEM((1, steps_2, plane_rows, k), jnp.uint8),
-      pltpu.VMEM((1, steps_2, scale_rows, k), jnp.uint8),
+      pltpu.VMEM((depth_w2, steps_2, plane_rows, k), jnp.uint8),
+      pltpu.VMEM((depth_w2, steps_2, scale_rows, k), jnp.uint8),
       pltpu.VMEM((padded_m, tn13), jnp.float32),
       pltpu.VMEM((padded_m, tn13), jnp.float32),
       pltpu.VMEM((padded_m, tn2), jnp.float32),
@@ -6993,9 +7007,15 @@ def fused_decode_moe_v6e_planar_t_b11(
       pltpu.VMEM((padded_m, k), jnp.float32),
       pltpu.SemaphoreType.DMA((depth_w13,)),
       pltpu.SemaphoreType.DMA((depth_w13,)),
-      pltpu.SemaphoreType.DMA((1,)),
-      pltpu.SemaphoreType.DMA((1,)),
+      pltpu.SemaphoreType.DMA((depth_w2,)),
+      pltpu.SemaphoreType.DMA((depth_w2,)),
   ]
+
+  compiler_params = (
+      pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes)
+      if vmem_limit_bytes is not None
+      else pltpu.CompilerParams()
+  )
 
   out = pl.pallas_call(
       kernel,
@@ -7013,6 +7033,7 @@ def fused_decode_moe_v6e_planar_t_b11(
       out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
       out_shape=jax.ShapeDtypeStruct((padded_m, k), out_dtype),
       scratch_shapes=scratch_shapes,
+      compiler_params=compiler_params,
       name=f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}",
   )(
       active_ids,

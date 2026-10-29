@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     TPU_LATENT_PROJ_TP: bool = True
+    TPU_KDA_DIRECT_POOL_STREAMING: bool = True
 
 
 def env_with_choices(
@@ -1134,6 +1135,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Shard Kimi K3's latent-MoE down/up projections column-parallel across TP
     # ranks with an all-gather when there is one core per chip (e.g. TPU v6e).
     "TPU_LATENT_PROJ_TP": env_bool("TPU_LATENT_PROJ_TP", True),
+    # Stream Kimi K3's pooled KDA conv and recurrent states directly between the
+    # unified KV pool in HBM and VMEM inside fused_conv1d_gdn via StateSourcePlan,
+    # bypassing external gather_region / scatter_region Pallas calls.
+    "TPU_KDA_DIRECT_POOL_STREAMING": env_bool(
+        "TPU_KDA_DIRECT_POOL_STREAMING", True
+    ),
 }
 
 

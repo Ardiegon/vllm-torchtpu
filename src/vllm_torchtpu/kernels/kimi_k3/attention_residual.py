@@ -68,11 +68,12 @@ def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=Fa
     )(prefix, history, folded_weight)
 
 
-def _mix_kernel_bt(prefix, weight, *blocks_and_output, eps):
-    *blocks, output = blocks_and_output
+def _mix_kernel_bt(prefix, weight, history_ref, output, *, eps):
     p = prefix[...].astype(jnp.float32)
     w = weight[...].astype(jnp.float32)
-    bs = [b[...].astype(jnp.float32) for b in blocks] + [p]
+    bs = [
+        history_ref[b].astype(jnp.float32) for b in range(history_ref.shape[0])
+    ] + [p]
     scores = []
     for v in bs:
         inv_norm = jax.lax.rsqrt(jnp.mean(v * v, axis=-1, keepdims=True) + eps)
@@ -98,8 +99,9 @@ def attention_residual_bt(
     """Mix [tokens, hidden] prefix and [blocks, tokens, hidden] saved blocks.
 
     Storing history with `blocks` on the leading axis and loading each block as
-    a 2D `(None, bm, hidden)` VMEM tile avoids TPU v6e 8-sublane padding on
-    `blocks` when `blocks < 8`.
+    a 2D `(bm, hidden)` slice (`history_ref[b]`) from a single
+    `(num_blocks, bm, hidden)` VMEM tile avoids TPU v6e 8-sublane padding on
+    `blocks` when `blocks < 8` while passing `history_bt` only once.
     """
     tokens, hidden = prefix.shape
     num_blocks = history_bt.shape[0]
@@ -113,13 +115,10 @@ def attention_residual_bt(
         return prefix
     if tokens % 16:
         raise ValueError("Fused Attention Residual requires 16-token tiles")
-    bm = min(128, tokens)
+    max_bm = 64 if num_blocks >= 6 else 128
+    bm = min(max_bm, tokens)
     if tokens % bm != 0:
         bm = 16
-    block_specs = tuple(
-        pl.BlockSpec((None, bm, hidden), lambda i, b=b: (b, i, 0))
-        for b in range(num_blocks)
-    )
     return pl.pallas_call(
         functools.partial(_mix_kernel_bt, eps=eps),
         out_shape=jax.ShapeDtypeStruct(prefix.shape, prefix.dtype),
@@ -127,11 +126,11 @@ def attention_residual_bt(
         in_specs=(
             pl.BlockSpec((bm, hidden), lambda i: (i, 0)),
             pl.BlockSpec((hidden,), lambda i: (0,)),
-            *block_specs,
+            pl.BlockSpec((num_blocks, bm, hidden), lambda i: (0, i, 0)),
         ),
         out_specs=pl.BlockSpec((bm, hidden), lambda i: (i, 0)),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=63 * 1024**2),
         interpret=interpret,
         name=f"kimi_attnres_bt_m{bm}",
-    )(prefix, folded_weight, *tuple(history_bt for _ in range(num_blocks)))
+    )(prefix, folded_weight, history_bt)
 

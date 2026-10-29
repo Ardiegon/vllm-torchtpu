@@ -579,18 +579,43 @@ def v3_state_source(
         split,
         block_size,
     )
-    assert (kernel_size - 1) * conv_dim % lanes == 0, (kernel_size, conv_dim, lanes)
-    # The kernel regroups conv rows into (kernel_size - 1, conv_dim) via
-    # 128-aligned lane concat, which needs whole rows per conv row.
-    assert conv_dim % lanes == 0, (conv_dim, lanes)
-    conv_rows = (kernel_size - 1) * conv_dim // lanes
-    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (
-        conv_rows,
-        conv_ntok,
-        tok_bytes,
-    )
+    if conv_dim % lanes == 0:
+        assert (kernel_size - 1) * conv_dim % lanes == 0, (
+            kernel_size,
+            conv_dim,
+            lanes,
+        )
+        conv_lane_split = 1
+        conv_out_lanes = lanes
+        conv_view_dtype = jnp.dtype(jnp.bfloat16)
+        conv_rows = (kernel_size - 1) * conv_dim // lanes
+        assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (
+            conv_rows,
+            conv_ntok,
+            tok_bytes,
+        )
+    else:
+        assert lanes % d_v == 0, (lanes, d_v)
+        assert conv_dim % d_v == 0, (conv_dim, d_v)
+        conv_lane_split = lanes // d_v
+        conv_out_lanes = d_v
+        conv_bf16_rows = (kernel_size - 1) * conv_dim // conv_out_lanes
+        assert conv_bf16_rows % 2 == 0, conv_bf16_rows
+        assert conv_bf16_rows * 2 * conv_out_lanes <= conv_ntok * tok_bytes, (
+            conv_bf16_rows,
+            conv_ntok,
+            tok_bytes,
+        )
+        # When conv_lane_split > 1 on a 4D MLA pool (nb, block_size, 2, lanes),
+        # viewing VMEM as uint32 collapses the payload dim (2 -> 1) before the
+        # lane_split reshape so Mosaic lowers a tile-aligned 2D reshape, and
+        # load_state_region / store_state_region unpacks/packs 2 bf16 per uint32
+        # on the full tile-aligned VREG array.
+        conv_view_dtype = jnp.dtype(jnp.uint32)
+        conv_rows = conv_bf16_rows // 2
     conv_rows_perm = None
     if qk_pair_layout:
+        assert conv_lane_split == 1, conv_lane_split
         conv_rows_perm = _conv_qk_pair_rows_perm(
             kernel_size - 1, conv_dim, n_v, d_v, lanes
         )
@@ -599,8 +624,8 @@ def v3_state_source(
         nblocks=1,
         row0=row0,
         nrows=conv_ntok,
-        view_dtype=jnp.dtype(jnp.bfloat16),
-        lane_split=1,
+        view_dtype=conv_view_dtype,
+        lane_split=conv_lane_split,
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,
     )

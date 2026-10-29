@@ -630,22 +630,6 @@ def _pooled_kda_core(
             f"{layout.required_tokens} > {manager_rows}"
         )
 
-    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
-    # per typed row, so the leading H * D rows are exactly the state.
-    ssm_gathered = pool_adapters.gather_region(
-        pool,
-        state_indices,
-        tok0=0,
-        ntok=layout.ssm_tokens,
-        out_dtype=jnp.float32,
-        out_lanes=head_dim,
-        split=split,
-    )
-    ssm_rows = num_heads * head_dim
-    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
-        num_reqs, num_heads, head_dim, head_dim
-    )
-
     # Stage-3 stores whole, padded prefill-head shards in rank order. Each
     # shard keeps the source's BF16 lane packing, so Raiden can concatenate
     # aligned byte ranges without half-word scatter/gather. Restore logical
@@ -663,6 +647,88 @@ def _pooled_kda_core(
     )
     if shard_elems > padded_shard_elems:
         raise ValueError("KDA conv shard exceeds its padded pool region")
+
+    # Direct in-kernel pool streaming via StateSourcePlan: streams SSM and Conv
+    # states directly between `pool` in HBM and VMEM inside `fused_conv1d_gdn`,
+    # bypassing all 4 external `gather_region` / `scatter_region` Pallas calls
+    # and all intermediate HBM `jnp.concatenate` / `slice` / `jnp.pad` copies.
+    if (
+        tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING
+        and conv_shards == 1
+        and num_spec_tokens == 0
+    ):
+        num_tokens = mixed_qkv.shape[0]
+        conv_dim = 3 * num_heads * head_dim
+        plan = pool_adapters.v3_state_source(
+            pool,
+            ssm_ntok=layout.ssm_tokens,
+            conv_tok0=layout.ssm_tokens,
+            conv_ntok=layout.conv_tokens,
+            split=split,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            conv_dim=conv_dim,
+            kernel_size=kernel_size,
+            recurrent_state_dtype=jnp.float32,
+            qk_pair_layout=False,
+        )
+        conv_weight_flat = conv_weight.reshape(kernel_size, -1)
+        conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+        dist = distribution if window_distribution is None else window_distribution
+
+        def _run_direct(batched_only: bool = False, prefill_only: bool = False):
+            return gdn_wrapper.fused_conv1d_gdn(
+                qkv=mixed_qkv,
+                b=beta,
+                a=raw_gate,
+                conv_state=None,
+                recurrent_state=None,
+                conv_weight=conv_weight_flat,
+                conv_bias=None,
+                a_log=a_log,
+                dt_bias=dt_bias.reshape(num_heads, head_dim),
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                distribution=dist,
+                seq_lens=seq_lens,
+                read_offsets=None,
+                n_kq=num_heads,
+                n_v=num_heads,
+                d_k=head_dim,
+                d_v=head_dim,
+                kernel_size=kernel_size,
+                attention_mode=gdn_config.AttentionMode.KDA,
+                gate_lower_bound=lower_bound,
+                num_spec_tokens=0,
+                batched_only=batched_only,
+                prefill_only=prefill_only,
+                state_source=pool,
+                state_plan=plan,
+            )
+
+        new_pool, out = _run_direct(batched_only=False, prefill_only=False)
+        output = out.reshape(num_tokens, num_heads, head_dim)
+        output = _gated_output_norm(
+            output, output_gate, norm_weight, eps, mixed_qkv.dtype
+        )
+        return output, new_pool
+
+    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
+    # per typed row, so the leading H * D rows are exactly the state.
+    ssm_gathered = pool_adapters.gather_region(
+        pool,
+        state_indices,
+        tok0=0,
+        ntok=layout.ssm_tokens,
+        out_dtype=jnp.float32,
+        out_lanes=head_dim,
+        split=split,
+    )
+    ssm_rows = num_heads * head_dim
+    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
+        num_reqs, num_heads, head_dim, head_dim
+    )
     conv_gathered = pool_adapters.gather_region(
         pool,
         state_indices,
@@ -834,6 +900,8 @@ def build_kimi_pooled_kda_op(
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
     op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+    if tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING:
+        op_name += "_direct_pool"
     if num_spec_tokens:
         op_name += f"_window{num_spec_tokens + 1}"
     if conv_shard_heads is not None:

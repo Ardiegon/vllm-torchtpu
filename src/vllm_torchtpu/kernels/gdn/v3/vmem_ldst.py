@@ -127,12 +127,19 @@ def load_state_region(
         for j in range(region.nblocks)
     ]
     arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
-    arr = arr[: region.rows_used]
     # When a bfloat16 state uses a uint32 VMEM view (2 bf16 elements per
-    # uint32 word), unpack back to bfloat16 before reshaping to `shape`.
-    if region.view_dtype == jnp.uint32 and math.prod(shape) == arr.size * 2:
+    # uint32 word), unpack on the full tile-aligned (rows_capacity, out_lanes)
+    # VREG array before slicing to rows_used * 2 so Mosaic never sees a
+    # sub-8-sublane bitcast (e.g., 54 rows = 6*8 + 6).
+    if (
+        region.view_dtype == jnp.uint32
+        and math.prod(shape) == region.rows_used * arr.shape[-1] * 2
+    ):
         assert region.rows_perm is None
         arr = pltpu.bitcast(arr, jnp.bfloat16)
+        arr = arr[: region.rows_used * 2]
+    else:
+        arr = arr[: region.rows_used]
     if region.rows_perm is not None:
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
@@ -149,22 +156,27 @@ def store_state_region(
     region has deterministic bytes when copied out.
     """
     rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
+    capacity = region.nblocks * rows_pb
     if region.view_dtype == jnp.uint32 and values.dtype == jnp.float32:
         assert region.rows_perm is None
-        arr = pltpu.bitcast(values.astype(jnp.bfloat16), jnp.uint32)
+        bf16_arr = values.astype(jnp.bfloat16).reshape(-1, out_lanes)
+        bf16_cap = capacity * 2
+        if bf16_arr.shape[0] < bf16_cap:
+            bf16_arr = jnp.pad(
+                bf16_arr, ((0, bf16_cap - bf16_arr.shape[0]), (0, 0))
+            )
+        arr = pltpu.bitcast(bf16_arr, jnp.uint32)
     else:
-        arr = values.astype(region.view_dtype)
-    arr = arr.reshape(-1, out_lanes)
-    if region.rows_perm is not None:
-        # Inverse of the load-side gather: logical row i is stored at
-        # typed row rows_perm[i].
-        inverse = [0] * len(region.rows_perm)
-        for logical, stored in enumerate(region.rows_perm):
-            inverse[stored] = logical
-        arr = jnp.concat([arr[i][None] for i in inverse], axis=0)
-    capacity = region.nblocks * rows_pb
-    if region.rows_used < capacity:
-        arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
+        arr = values.astype(region.view_dtype).reshape(-1, out_lanes)
+        if region.rows_perm is not None:
+            # Inverse of the load-side gather: logical row i is stored at
+            # typed row rows_perm[i].
+            inverse = [0] * len(region.rows_perm)
+            for logical, stored in enumerate(region.rows_perm):
+                inverse[stored] = logical
+            arr = jnp.concat([arr[i][None] for i in inverse], axis=0)
+        if region.rows_used < capacity:
+            arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
     for j in range(region.nblocks):
         typed_ldst.store_typed(
             slot_ref.at[j],
