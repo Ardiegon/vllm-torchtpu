@@ -109,8 +109,13 @@ class KimiMoE(nn.Module):
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
+        # Keep the routing correction bias in f32 (checkpoint dtype). Created
+        # under the model's default dtype it would be stored as bf16, which
+        # rounds the bias (|err| up to ~2.4e-4 on real K3 layer-1 values,
+        # comparable to the gaps between neighbouring expert scores) and
+        # changes top-k selection relative to the HF reference.
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(config.num_experts)
+            torch.zeros(config.num_experts, dtype=torch.float32)
         )
 
         # Replicated by default; sharded across a chip's cores under
