@@ -112,8 +112,13 @@ def _make_runner(
     # The staging-tensor fence is recorded by execute_model; these tests
     # call _prepare_inputs directly, so the wait must find an empty fence.
     runner._input_staging_fence = None
+    runner._host_upload_keepalive = []
+    runner._fenced_host_upload_keepalive = []
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
+    )
+    runner._upload_host_temporary = types.MethodType(
+        TPUModelRunner._upload_host_temporary, runner
     )
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None

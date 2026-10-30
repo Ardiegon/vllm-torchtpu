@@ -114,6 +114,7 @@ def _make_self(
         device="cpu",
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
+        _host_upload_keepalive=[],
         input_batch=input_batch,
     )
     # Padding/expansion/source-selection helpers the collector calls on
@@ -126,6 +127,7 @@ def _make_self(
         "_expand_pool_split",
         "_spec_seed_sources",
         "_copy_mamba_state_blocks",
+        "_upload_host_temporary",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws

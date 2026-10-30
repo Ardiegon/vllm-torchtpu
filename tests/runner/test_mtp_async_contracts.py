@@ -340,6 +340,7 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
+    runner._host_upload_keepalive = []
     drafts = torch.tensor(
         [list(range(101, 101 + k)), list(range(201, 201 + k))],
         dtype=torch.int32,

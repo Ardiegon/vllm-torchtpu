@@ -37,6 +37,7 @@ def _runner_with_raw_tensors(raw_tensors):
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
     runner._install_spec_token_room_guard = lambda: None
+    runner._host_upload_keepalive = []
     return runner
 
 
@@ -141,7 +142,9 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         device="cpu",
         mamba_slot_read_offsets=None,
         bm_pool_layout=None,
+        _host_upload_keepalive=[],
     )
+    fake._upload_host_temporary = TPUModelRunner._upload_host_temporary.__get__(fake)
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )
@@ -219,7 +222,9 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
         bm_pool_layout=None,
+        _host_upload_keepalive=[],
     )
+    fake._upload_host_temporary = TPUModelRunner._upload_host_temporary.__get__(fake)
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )

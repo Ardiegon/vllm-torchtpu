@@ -47,6 +47,10 @@ def test_substitution_disabled_by_default():
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
+        _host_upload_keepalive=[],
+    )
+    runner._upload_host_temporary = TPUModelRunner._upload_host_temporary.__get__(
+        runner
     )
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)

@@ -2132,8 +2132,14 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_ckpt_window = ckpt_window
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
-        for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+        for name in (
+            "_pad_dev_to_bucket",
+            "_expand_pool_split",
+            "_spec_seed_sources",
+            "_upload_host_temporary",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        runner._host_upload_keepalive = []
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
         # size; with cp=1 the two coincide here.
@@ -2443,6 +2449,15 @@ class _FakeTpuEvent:
         self.synchronized += 1
 
 
+def _staging_fence_runner():
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        _input_staging_fence=None,
+        _host_upload_keepalive=[],
+        _fenced_host_upload_keepalive=[],
+    )
+
+
 class TestInputStagingFence:
     """A chunk records a fence after uploading from the reusable host staging
     tensors; the next chunk synchronizes on it before rewriting them, once."""
@@ -2452,7 +2467,7 @@ class TestInputStagingFence:
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = _staging_fence_runner()
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
         assert fence is _FakeTpuEvent.instances[-1]
@@ -2467,9 +2482,39 @@ class TestInputStagingFence:
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = _staging_fence_runner()
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None
+
+    def test_host_temporary_lives_until_a_later_fence_completes(self, monkeypatch):
+        """torch_tpu keeps no reference to the source of a non-blocking H2D, so
+        a freed temporary could be reused by the allocator before the transfer
+        read it (wrong-row prefill logits from a corrupted `logits_indices`).
+        `_upload_host_temporary` holds the host tensor until a fence recorded
+        after the upload has been waited on, and no longer."""
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = _staging_fence_runner()
+
+        def upload_temporary():
+            host = torch.arange(4, dtype=torch.int32) - 1
+            ref = weakref.ref(host)
+            TPUModelRunner._upload_host_temporary(runner, host)
+            return ref
+
+        before_fence = upload_temporary()
+        TPUModelRunner._wait_input_staging_fence(runner)  # no fence yet
+        assert before_fence() is not None
+        TPUModelRunner._record_input_staging_fence(runner)
+        after_fence = upload_temporary()  # e.g. post-forward sampling params
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert before_fence() is None
+        assert after_fence() is not None
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert after_fence() is None
 
 
 class TestAsyncSpecDecodeTokenAccounting:

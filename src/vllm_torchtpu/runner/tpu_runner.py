@@ -997,6 +997,12 @@ class TPUModelRunner(GPUModelRunner):
         # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
         # waits on it before rewriting them.
         self._input_staging_fence: Any = None
+        # Host tensors that only live for one non-blocking upload (see
+        # `_upload_host_temporary`). torch_tpu does not keep the source of a
+        # non-blocking H2D alive, so they are held here until a fence recorded
+        # after their upload has been waited on.
+        self._host_upload_keepalive: list[torch.Tensor] = []
+        self._fenced_host_upload_keepalive: list[torch.Tensor] = []
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -2038,11 +2044,11 @@ class TPUModelRunner(GPUModelRunner):
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
-            src_t = torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            src_t = self._upload_host_temporary(
+                torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32)
             )
-            dst_t = torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            dst_t = self._upload_host_temporary(
+                torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32)
             )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
@@ -2182,11 +2188,11 @@ class TPUModelRunner(GPUModelRunner):
             for j in range(split)
         ]
         pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-        src_t = torch.tensor([src for src, _ in pairs], dtype=torch.int32).to(
-            self.device, non_blocking=True
+        src_t = self._upload_host_temporary(
+            torch.tensor([src for src, _ in pairs], dtype=torch.int32)
         )
-        dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
-            self.device, non_blocking=True
+        dst_t = self._upload_host_temporary(
+            torch.tensor([dst for _, dst in pairs], dtype=torch.int32)
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
@@ -2411,12 +2417,12 @@ class TPUModelRunner(GPUModelRunner):
                     constant_values=-1,
                 )
 
-                cur_input_indices = torch.from_numpy(
-                    padded_token_in_tpu_cur_input_indices
-                ).to(self.device, non_blocking=True)
-                pre_next_tokens_indices = torch.from_numpy(
-                    padded_token_in_tpu_pre_next_tokens_indices
-                ).to(self.device, non_blocking=True)
+                cur_input_indices = self._upload_host_temporary(
+                    torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+                )
+                pre_next_tokens_indices = self._upload_host_temporary(
+                    torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+                )
                 self._cached_subst_key = subst_key
                 self._cached_cur_input_indices = cur_input_indices
                 self._cached_pre_next_tokens_indices = pre_next_tokens_indices
@@ -2436,12 +2442,12 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1,
             )
 
-            cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices
-            ).to(self.device, non_blocking=True)
-            pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices
-            ).to(self.device, non_blocking=True)
+            cur_input_indices = self._upload_host_temporary(
+                torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+            )
+            pre_next_tokens_indices = self._upload_host_temporary(
+                torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+            )
 
         return _substitute_placeholder_token(
             input_ids,
@@ -3258,9 +3264,9 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = (
+                logits_indices = self._upload_host_temporary(
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
-                ).to(self.device, non_blocking=True)
+                )
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
@@ -3408,12 +3414,35 @@ class TPUModelRunner(GPUModelRunner):
         fence = torch.tpu.Event()
         fence.record()
         self._input_staging_fence = fence
+        # The fence covers every upload issued so far, including those of the
+        # host temporaries collected since the previous fence.
+        self._fenced_host_upload_keepalive.extend(self._host_upload_keepalive)
+        self._host_upload_keepalive = []
 
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
+            self._fenced_host_upload_keepalive = []
+
+    def _upload_host_temporary(
+        self, host: torch.Tensor, device: torch.device | None = None
+    ) -> torch.Tensor:
+        """`host.to(device, non_blocking=True)` for a host tensor that nothing
+        else keeps alive (an expression result or a local array).
+
+        torch_tpu hands PJRT the host pointer with
+        kImmutableUntilTransferCompletes and keeps no reference to the source,
+        so a temporary freed right after `.to()` returns can be reused by the
+        allocator (whose free-list pointers then land in the upload) before
+        the transfer has read it. That corrupted e.g. `logits_indices` on one
+        TP rank in ~2% of prefills. The tensor is held until a fence recorded
+        after this upload has completed (`_wait_input_staging_fence`).
+        """
+        host = host.contiguous()
+        self._host_upload_keepalive.append(host)
+        return host.to(self.device if device is None else device, non_blocking=True)
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
@@ -7743,9 +7772,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            self._upload_host_temporary(temps_cpu.unsqueeze(1), logits.device),
+            self._upload_host_temporary(top_k_cpu.unsqueeze(1), logits.device),
+            self._upload_host_temporary(top_p_cpu.unsqueeze(1), logits.device),
         )
 
     def _topk_candidate_blocks(self) -> int:
