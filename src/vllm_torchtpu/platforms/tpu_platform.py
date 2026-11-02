@@ -514,6 +514,27 @@ class TpuPlatform(Platform):
         return cls.dist_backend
 
     @classmethod
+    def _export_torch_tpu_dp_env(
+        cls, parallel_config, master_addr: str, master_port: int
+    ) -> None:
+        """Export the DP env TPUWorker.init_device reads when DP > 1.
+
+        Values the user already exported win over master_addr/master_port.
+        """
+        # vLLM may pass per-engine ParallelConfig objects to workers with
+        # data_parallel_size collapsed to 1. Preserve the original DP size
+        # for TorchTPU rank/env setup.
+        os.environ["TORCH_TPU_DP_SIZE"] = str(parallel_config.data_parallel_size)
+        os.environ.setdefault("TORCH_TPU_DP_MASTER_ADDR", master_addr)
+        os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT", str(master_port))
+        if parallel_config.enable_expert_parallel:
+            # EP's expert-combine collective genuinely spans every DP*TP
+            # worker, so torch_tpu needs one shared slice across all of
+            # them; the worker spawn shim exposes a DP-adjusted chip ordinal
+            # to TorchTPU for physical binding.
+            cls.device_control_env_var = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+
+    @classmethod
     def _prepare_singlehost_tpu_env(cls, world_size: int) -> None:
         """Set TORCH_TPU_* env vars needed by PjRt initialization.
 
@@ -904,6 +925,16 @@ class TpuPlatform(Platform):
             )
 
             prepare_mp_multihost_env(parallel_config)
+            if parallel_config.data_parallel_size > 1:
+                # DP replicas whose TP group spans hosts: every host must
+                # agree on the DP master without coordinating, so derive it
+                # from --master-addr/--master-port. master_port + 1 is the
+                # rendezvous above.
+                cls._export_torch_tpu_dp_env(
+                    parallel_config,
+                    parallel_config.master_addr,
+                    parallel_config.master_port + 2,
+                )
             logger.info(
                 "Force using TpuMultiprocExecutor for TPU multi-host "
                 "(nnodes=%d, node_rank=%d).",
@@ -927,23 +958,11 @@ class TpuPlatform(Platform):
                 # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
                 # chip/PjRt binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
-                os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
-                os.environ.setdefault(
-                    "TORCH_TPU_DP_MASTER_ADDR",
+                cls._export_torch_tpu_dp_env(
+                    parallel_config,
                     parallel_config.data_parallel_master_ip or "localhost",
+                    portpicker.pick_unused_port(),
                 )
-                os.environ.setdefault(
-                    "TORCH_TPU_DP_MASTER_PORT", str(portpicker.pick_unused_port())
-                )
-                if parallel_config.enable_expert_parallel:
-                    # EP's expert-combine collective genuinely spans every
-                    # DP*TP worker, so torch_tpu needs one shared slice
-                    # across all of them; the worker spawn shim exposes a
-                    # DP-adjusted chip ordinal to TorchTPU for physical
-                    # binding.
-                    cls.device_control_env_var = (
-                        "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
-                    )
                 # Genuine multi-host DP (this host only owns a slice of the
                 # DP ranks) needs a TCPStore rendezvous across hosts instead
                 # of the single-host localhost/PCI-scan bootstrap below.

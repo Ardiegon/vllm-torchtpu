@@ -242,7 +242,15 @@ class TPUWorker(WorkerBase):
                 pc.data_parallel_rank_local = 0
 
             master_addr = os.environ.get("TORCH_TPU_DP_MASTER_ADDR", "localhost")
-            master_port = os.environ["TORCH_TPU_DP_MASTER_PORT"]
+            master_port = os.environ.get("TORCH_TPU_DP_MASTER_PORT")
+            if master_port is None:
+                raise RuntimeError(
+                    f"TPU DP worker (dp_size={dp_size}) needs "
+                    "TORCH_TPU_DP_MASTER_PORT, which TpuPlatform."
+                    "check_and_update_config exports before spawning workers. "
+                    "Export TORCH_TPU_DP_MASTER_ADDR/PORT (same values on "
+                    "every host) if this launch path does not."
+                )
             os.environ.update(binding.as_env())
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
