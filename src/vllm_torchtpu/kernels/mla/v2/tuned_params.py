@@ -1464,6 +1464,24 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
 
+    # Kimi K3 batched decode on the unified KDA+MLA pool (same geometry as the
+    # mixed rule below). These are the parameters every Kimi K3 decode
+    # benchmark so far ran with (they were reached through the default branch);
+    # a decode tile sweep can refine them here.
+    if (
+        tuning_key.case == "batched_decode"
+        and tuning_key.actual_lkv_dim == 512
+        and tuning_key.actual_r_dim == 64
+        and tuning_key.actual_num_q_heads <= 24
+        and tuning_key.page_size_per_kv_packing in (648, 647, 324, 162, 81)
+    ):
+        return TunableParams(
+            decode_batch_size=4,
+            num_kv_pages_per_block=3,
+            num_queries_per_block=1,
+            vmem_limit_bytes=62914560,
+        )
+
     # Kimi K3 unified KDA+MLA pool geometry (page_size=1296/1294/648/324 for BF16 or
     # FP8 across TP=4/8/16) across arbitrary (max_num_seqs, pages_per_seq) table shapes.
     if (
