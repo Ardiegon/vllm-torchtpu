@@ -190,6 +190,7 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
         get_pcp_world_size() > 1
         or get_dcp_world_size() > 1
         or envs.MOE_FUSED_EP_SORTED_GATHER
+        or envs.TPU_KIMI_OPT_2D_EP_MESH
     ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
@@ -332,3 +333,13 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+from vllm_torchtpu.distributed.kimi_dma_mesh import (  # noqa: E402, F401
+    DP_AXIS_NAME,
+    KIMI_2D_MESH_AXES,
+    TP_AXIS_NAME,
+    build_ep_2d_mesh,
+    reset_ep_2d_mesh,
+    validate_ep_2d_group_ranks,
+)

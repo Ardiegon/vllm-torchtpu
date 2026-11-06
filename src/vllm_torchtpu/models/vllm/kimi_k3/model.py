@@ -255,6 +255,7 @@ class KimiModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self._ep_2d_canary_op = None
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,
@@ -286,6 +287,8 @@ class KimiModel(nn.Module):
             hidden_states = hidden_states.reshape(
                 self.sp_group.world_size, -1, hidden_states.shape[-1]
             )[self.sp_group.rank_in_group].contiguous()
+        elif self._ep_2d_canary_op is not None:
+            hidden_states = self._ep_2d_canary_op(hidden_states)
         # A view avoids passing a symbolic local token count to TorchTPU's
         # concrete-size allocation kernel during the dynamic trace.
         block_residuals = (
@@ -417,6 +420,19 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 module.prepare_moe_projections()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
+
+        if envs.TPU_KIMI_OPT_2D_EP_MESH and torch.distributed.is_initialized():
+            from vllm_torchtpu.distributed.kimi_dma_mesh import build_ep_2d_mesh
+            from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
+                build_pallas_2d_identity_canary_op,
+            )
+
+            mesh_2d = build_ep_2d_mesh()
+            self.model._ep_2d_canary_op = build_pallas_2d_identity_canary_op(
+                mesh_2d,
+                spec_mode="dp_replicated",
+                variant_tag="opt2d_1",
+            )
 
         if envs.TPU_KIMI_DENSE_W8A16_B11:
             from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (

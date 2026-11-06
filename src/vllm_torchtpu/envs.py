@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     TPU_LATENT_PROJ_TP: bool = True
     TPU_KDA_DIRECT_POOL_STREAMING: bool = True
     TPU_KIMI_DENSE_W8A16_B11: bool = False
+    TPU_KIMI_OPT_2D_EP_MESH: bool = False
 
 
 def env_with_choices(
@@ -1151,6 +1152,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weights at checkpoint precision); set TPU_KIMI_DENSE_W8A16_B11=1 to opt in.
     "TPU_KIMI_DENSE_W8A16_B11": env_bool(
         "TPU_KIMI_DENSE_W8A16_B11", False
+    ),
+    # Build and validate a PyTorch-rank-ordered 2D ('dp', 'tp') JAX mesh for
+    # Kimi K3 Pallas remote-DMA collectives and keep EP mesh DeviceAssignment in
+    # rank order across all multi-device @jax_op kernels in the compiled graph.
+    "TPU_KIMI_OPT_2D_EP_MESH": env_bool(
+        "TPU_KIMI_OPT_2D_EP_MESH", False
     ),
 }
 
