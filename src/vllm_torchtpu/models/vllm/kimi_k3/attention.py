@@ -421,11 +421,12 @@ class MultiHeadLatentAttention(nn.Module):
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return self.mla_attn(positions, hidden_states, prefill_group=group)
         output = self.mla_attn(positions, hidden_states)
-        return (
-            group.reduce_scatter(output, dim=0)
-            if sequence_parallel
-            else group.all_reduce(output)
-        )
+        if sequence_parallel:
+            return group.reduce_scatter(output, dim=0)
+        tp_exit_psum_op = getattr(self, "_tp_exit_psum_op", None)
+        if tp_exit_psum_op is not None:
+            return tp_exit_psum_op(output)
+        return group.all_reduce(output)
 
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -831,11 +832,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return group.project_reduce_scatter(output, self.o_proj)
         output, _ = self.o_proj(output)
-        return (
-            group.reduce_scatter(output, dim=0)
-            if sequence_parallel
-            else group.all_reduce(output)
-        )
+        if sequence_parallel:
+            return group.reduce_scatter(output, dim=0)
+        tp_exit_psum_op = getattr(self, "_tp_exit_psum_op", None)
+        if tp_exit_psum_op is not None:
+            return tp_exit_psum_op(output)
+        return group.all_reduce(output)
 
     def _core_attention_pooled(
         self,

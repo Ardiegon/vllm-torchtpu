@@ -421,18 +421,40 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
 
-        if envs.TPU_KIMI_OPT_2D_EP_MESH and torch.distributed.is_initialized():
-            from vllm_torchtpu.distributed.kimi_dma_mesh import build_ep_2d_mesh
+        from vllm_torchtpu.distributed.kimi_dma_mesh import (
+            build_ep_2d_mesh,
+            kimi_use_2d_ep_mesh,
+        )
+
+        if kimi_use_2d_ep_mesh() and torch.distributed.is_initialized():
+            from vllm_torchtpu.kernels.kimi_k3.latency_collectives import (
+                build_kimi_o2_collectives,
+            )
             from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
                 build_pallas_2d_identity_canary_op,
             )
 
             mesh_2d = build_ep_2d_mesh()
-            self.model._ep_2d_canary_op = build_pallas_2d_identity_canary_op(
-                mesh_2d,
-                spec_mode="dp_replicated",
-                variant_tag="opt2d_1",
-            )
+            o2_collectives = build_kimi_o2_collectives(mesh_2d)
+            if o2_collectives.has_any_op:
+                # Real O2 2D Pallas DMA collectives are armed; disable the O1
+                # identity canary so zero extra custom-op overhead runs in O2.
+                self.model._ep_2d_canary_op = None
+                for module in self.modules():
+                    if isinstance(module, KimiMoE):
+                        o2_collectives.attach_to_moe(module)
+                    elif isinstance(
+                        module, (MultiHeadLatentAttention, KimiDeltaAttention)
+                    ):
+                        o2_collectives.attach_to_attn(module)
+                    elif isinstance(module, KimiMLP):
+                        o2_collectives.attach_to_mlp(module)
+            elif envs.TPU_KIMI_OPT_2D_EP_MESH:
+                self.model._ep_2d_canary_op = build_pallas_2d_identity_canary_op(
+                    mesh_2d,
+                    spec_mode="dp_replicated",
+                    variant_tag=o2_collectives.variant_tag,
+                )
 
         if envs.TPU_KIMI_DENSE_W8A16_B11:
             from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (

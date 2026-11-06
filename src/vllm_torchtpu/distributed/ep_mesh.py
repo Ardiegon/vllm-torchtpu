@@ -185,12 +185,14 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
+    from vllm_torchtpu.distributed.kimi_dma_mesh import kimi_use_2d_ep_mesh
+
     ep_ranks = range(len(device_ids))
     if (
         get_pcp_world_size() > 1
         or get_dcp_world_size() > 1
         or envs.MOE_FUSED_EP_SORTED_GATHER
-        or envs.TPU_KIMI_OPT_2D_EP_MESH
+        or kimi_use_2d_ep_mesh()
     ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))

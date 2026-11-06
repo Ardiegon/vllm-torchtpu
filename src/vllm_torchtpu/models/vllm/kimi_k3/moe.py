@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
+    get_dp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -34,7 +35,13 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+from vllm_torchtpu.kernels.kimi_k3.latency_collectives import (
+    _pack_dispatch_metadata,
+    _pack_dp_dispatch,
+    _unpack_dp_dispatch,
+)
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -426,28 +433,137 @@ class KimiMoE(nn.Module):
         )
         routed_down_local = routed_down_pad[:, : self._moe_in_down_cols]
         down_group = getattr(self.routed_expert_down_proj, "_chip_group", None)
-        if down_group is not None:
-            latent = down_group.all_gather(routed_down_local, dim=-1)
-        else:
-            latent = routed_down_local
         routed = self.experts.routed_experts
-        if self.use_ep and routed.moe_config.dp_size > 1:
-            topk_weights, topk_ids = moe_routing.route(routed, latent, router_logits)
-            routed_out = routed.quant_method.apply_with_routing(
+        dp_size = routed.moe_config.dp_size if self.use_ep else 1
+        pcp_size = get_pcp_world_size() if self.use_ep else 1
+        world_dispatch_op = getattr(self, "_o2_world_dispatch_op", None)
+        tp_latent_ag_op = getattr(self, "_o2_tp_latent_ag_op", None)
+        dp_packed_ag_op = getattr(self, "_o2_dp_packed_ag_op", None)
+        dp_combine_rs_op = getattr(self, "_o2_dp_combine_rs_op", None)
+        tp_routed_psum_op = getattr(self, "_o2_tp_routed_psum_op", None)
+        tp_moe_exit_psum_op = getattr(self, "_o2_tp_moe_exit_psum_op", None)
+        use_packed_dp = bool(
+            self.use_ep
+            and dp_size > 1
+            and pcp_size == 1
+            and envs.TPU_KIMI_OPT_PACKED_DP_AG
+        )
+
+        if world_dispatch_op is not None and self.use_ep and pcp_size == 1:
+            # Flat 1-shot world = dp * tp gather (cid=1): hoist routing above AG (D89).
+            topk_weights, topk_ids = moe_routing.route(
+                routed, hidden_states, router_logits
+            )
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights, is_local_tensor=True
+            )
+            packed_meta = _pack_dispatch_metadata(topk_ids, topk_weights)
+            assert self._o2_tp_rank_buf is not None
+            gathered_world = world_dispatch_op(
+                routed_down_local, packed_meta, self._o2_tp_rank_buf
+            )
+            latent_dim = (
+                self._moe_in_down_cols * self.tp_size
+                if down_group is not None
+                else self._moe_in_down_cols
+            )
+            ag_latent, ag_ids, ag_weights = _unpack_dp_dispatch(
+                gathered_world, latent_dim, topk_ids.shape[-1]
+            )
+            moe_out = routed.quant_method.apply_with_routing(
                 routed,
-                latent,
-                topk_weights,
-                topk_ids,
-                pipelined=True,
+                ag_latent,
+                ag_weights,
+                ag_ids,
+                pipelined=False,
+                mask_padding=False,
             )
-            if self.tp_size > 1:
-                routed_out = tensor_model_parallel_all_reduce(routed_out)
+            if dp_size > 1:
+                routed_out = (
+                    dp_combine_rs_op(moe_out)
+                    if dp_combine_rs_op is not None
+                    else get_dp_group().reduce_scatter(moe_out, dim=0)
+                )
+            else:
+                routed_out = moe_out
+            if self.tp_size > 1 or (dp_size == 1 and self.use_ep):
+                routed_out = (
+                    tp_routed_psum_op(routed_out)
+                    if (tp_routed_psum_op is not None and self.tp_size > 1)
+                    else tensor_model_parallel_all_reduce(routed_out)
+                )
         else:
-            routed_out = routed.quant_method.apply_monolithic(
-                routed, latent, router_logits
-            )
-            if self.tp_size > 1 or self.use_ep:
-                routed_out = tensor_model_parallel_all_reduce(routed_out)
+            # Hoist moe_routing.route above routed_down AG (D89): route() only
+            # inspects its 2nd tensor argument for .dtype (bfloat16).
+            if self.use_ep and dp_size > 1:
+                topk_weights, topk_ids = moe_routing.route(
+                    routed, hidden_states, router_logits
+                )
+            if down_group is not None:
+                latent = (
+                    tp_latent_ag_op(routed_down_local)
+                    if tp_latent_ag_op is not None
+                    else down_group.all_gather(routed_down_local, dim=-1)
+                )
+            else:
+                latent = routed_down_local
+
+            if use_packed_dp:
+                topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights, is_local_tensor=True
+                )
+                packed_payload = _pack_dp_dispatch(latent, topk_ids, topk_weights)
+                gathered_payload = (
+                    dp_packed_ag_op(packed_payload)
+                    if dp_packed_ag_op is not None
+                    else get_dp_group().all_gather(packed_payload, dim=0)
+                )
+                ag_latent, ag_ids, ag_weights = _unpack_dp_dispatch(
+                    gathered_payload, latent.shape[-1], topk_ids.shape[-1]
+                )
+                moe_out = routed.quant_method.apply_with_routing(
+                    routed,
+                    ag_latent,
+                    ag_weights,
+                    ag_ids,
+                    pipelined=False,
+                    mask_padding=False,
+                )
+                routed_out = (
+                    dp_combine_rs_op(moe_out)
+                    if dp_combine_rs_op is not None
+                    else get_dp_group().reduce_scatter(moe_out, dim=0)
+                )
+                if self.tp_size > 1:
+                    routed_out = (
+                        tp_routed_psum_op(routed_out)
+                        if tp_routed_psum_op is not None
+                        else tensor_model_parallel_all_reduce(routed_out)
+                    )
+            elif self.use_ep and dp_size > 1:
+                routed_out = routed.quant_method.apply_with_routing(
+                    routed,
+                    latent,
+                    topk_weights,
+                    topk_ids,
+                    pipelined=True,
+                )
+                if self.tp_size > 1:
+                    routed_out = (
+                        tp_routed_psum_op(routed_out)
+                        if tp_routed_psum_op is not None
+                        else tensor_model_parallel_all_reduce(routed_out)
+                    )
+            else:
+                routed_out = routed.quant_method.apply_monolithic(
+                    routed, latent, router_logits
+                )
+                if self.tp_size > 1 or self.use_ep:
+                    routed_out = (
+                        tp_routed_psum_op(routed_out)
+                        if (tp_routed_psum_op is not None and self.tp_size > 1)
+                        else tensor_model_parallel_all_reduce(routed_out)
+                    )
         if self.routed_expert_norm is not None:
             routed_out = self.routed_expert_norm(routed_out)
         routed_local = routed_out[
@@ -465,6 +581,8 @@ class KimiMoE(nn.Module):
         else:
             out_partial = combined_in @ self.packed_moe_out_weight
         if self.tp_size > 1:
+            if tp_moe_exit_psum_op is not None:
+                return tp_moe_exit_psum_op(out_partial)
             return tensor_model_parallel_all_reduce(out_partial)
         return out_partial
 

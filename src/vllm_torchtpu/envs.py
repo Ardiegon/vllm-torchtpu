@@ -196,6 +196,10 @@ if TYPE_CHECKING:
     TPU_KDA_DIRECT_POOL_STREAMING: bool = True
     TPU_KIMI_DENSE_W8A16_B11: bool = False
     TPU_KIMI_OPT_2D_EP_MESH: bool = False
+    TPU_KIMI_OPT_PACKED_DP_AG: bool = False
+    TPU_KIMI_OPT_LATENCY_COLLECTIVES: bool = False
+    TPU_KIMI_OPT_WORLD_LATENT_AG: bool = False
+    TPU_KIMI_OPT_LATENCY_TP_PSUM: str = "off"
 
 
 def env_with_choices(
@@ -1159,6 +1163,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_2D_EP_MESH": env_bool(
         "TPU_KIMI_OPT_2D_EP_MESH", False
     ),
+    # Coalesce Kimi K3's 3 per-layer DP all_gather calls (latent, topk_ids,
+    # topk_weights) into 1 packed [B_dp, latent_dim + 3*K] bfloat16 tensor
+    # (works with both XLA dp_group.all_gather and 1-shot Pallas latency_all_gather_rows).
+    "TPU_KIMI_OPT_PACKED_DP_AG": env_bool(
+        "TPU_KIMI_OPT_PACKED_DP_AG", False
+    ),
+    # Replace Kimi K3 decode (T_padded <= 64 inside @jax_op, XLA fallback > 64)
+    # narrow TP latent all_gather (cid=0), DP dispatch all_gather (cid=1), and
+    # DP post-MoE combine reduce_scatter (cid=2) with 1-shot Pallas remote-DMA ops.
+    "TPU_KIMI_OPT_LATENCY_COLLECTIVES": env_bool(
+        "TPU_KIMI_OPT_LATENCY_COLLECTIVES", False
+    ),
+    # Optional flat world = dp * tp 1-shot latency_all_gather_rows (cid=1) for
+    # A/B comparison against the 2-stage (tp latent AG -> pack -> dp AG) dispatch.
+    "TPU_KIMI_OPT_WORLD_LATENT_AG": env_bool(
+        "TPU_KIMI_OPT_WORLD_LATENT_AG", False
+    ),
+    # Wire 1-shot deterministic Pallas latency_psum (cid=3, 4, 5) into Kimi K3
+    # row-parallel TP exits ("off", "tp16"/"auto", "routed_only", "all", or an
+    # integer max_dma_tokens threshold string such as "8").
+    "TPU_KIMI_OPT_LATENCY_TP_PSUM": lambda: os.getenv(
+        "TPU_KIMI_OPT_LATENCY_TP_PSUM", "off"
+    ).strip(),
 }
 
 

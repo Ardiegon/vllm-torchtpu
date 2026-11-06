@@ -372,6 +372,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         topk_ids: torch.Tensor,
         *,
         pipelined: bool,
+        mask_padding: bool = True,
     ) -> torch.Tensor:
         """Run the unquantized GMM kernel on pre-routed (x, topk_weights, topk_ids)."""
         layer = cast("TpuRoutedExperts", layer)
@@ -381,9 +382,10 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         )
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
-        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids, topk_weights, is_local_tensor=pipelined
-        )
+        if mask_padding:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights, is_local_tensor=pipelined
+            )
 
         kwargs = {
             "hidden_states": x,

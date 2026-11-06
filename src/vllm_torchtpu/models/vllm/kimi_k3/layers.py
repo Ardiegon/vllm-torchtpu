@@ -271,6 +271,13 @@ class KimiMLP(nn.Module):
                 return group.reduce_scatter(hidden_states, dim=0)
             assert self.tp_group is not None
             return self.tp_group.all_reduce(hidden_states)
+        tp_exit_psum_op = getattr(self, "_tp_exit_psum_op", None)
+        if tp_exit_psum_op is not None:
+            assert self.down_proj.quant_method is not None
+            hidden_states = self.down_proj.quant_method.apply(
+                self.down_proj, hidden_states, None
+            )
+            return tp_exit_psum_op(hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 

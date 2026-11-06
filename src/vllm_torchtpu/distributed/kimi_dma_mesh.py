@@ -53,6 +53,20 @@ def reset_ep_2d_mesh() -> None:
     _MESH_2D_CACHE.clear()
 
 
+def kimi_use_2d_ep_mesh() -> bool:
+    """True when any Kimi K3 2D ``('dp', 'tp')`` mesh / Pallas DMA opt-in flag is active."""
+    from vllm_torchtpu import envs
+
+    tp_psum_raw = (envs.TPU_KIMI_OPT_LATENCY_TP_PSUM or "off").strip().lower()
+    tp_psum_active = tp_psum_raw not in ("", "0", "false", "no", "off", "none")
+    return bool(
+        envs.TPU_KIMI_OPT_2D_EP_MESH
+        or envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES
+        or envs.TPU_KIMI_OPT_WORLD_LATENT_AG
+        or tp_psum_active
+    )
+
+
 def _resolve_vllm_dp_tp_groups() -> tuple[
     int, int, tuple[int, ...] | None, tuple[int, ...] | None
 ]:
