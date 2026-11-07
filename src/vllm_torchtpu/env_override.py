@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
+import re
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
@@ -20,6 +22,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_existing_tier2_cache = os.environ.get("TORCH_TPU_TIER2_COMPILATION_CACHE")
 
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
@@ -201,6 +205,147 @@ def set_libtpu_flag_default(flag_name: str, value: str) -> None:
     logger.info("Appended default flag to LIBTPU_INIT_ARGS: %s", new_args)
 
 
+# Cycle 1 Phase O3 empirically verified presets on v6e (msa_r12 + async_coll
+# cuts exposed DMA wait by 34-47% and wins decode + T=4096 TTFT with 0 HBM
+# overhead and OG-1 cos >= 0.999983; SparseCore collective offload remains off
+# by default because SC staging adds +141-276 MiB stackReservedBytes and
+# +372-524 us TensorCore DMA wait on v6e decode).
+_DEFAULT_KIMI_XLA_OVERLAP_PRESET = "msa_r12+async_coll"
+_DEFAULT_KIMI_SC_OFFLOAD_PRESET = "off"
+
+_MSA_RATIO_RE = re.compile(r"^msa_r(\d+)$")
+_SC_FULL_RE = re.compile(r"^(?:full_|min_)?(\d+)$")
+_SC_AR_ONLY_RE = re.compile(r"^ar_(\d+)$")
+_SC_THRESH_ONLY_RE = re.compile(r"^thresh_(\d+)$")
+
+
+def resolve_kimi_o3_libtpu_flags(
+    xla_overlap_raw: str | None = None,
+    sc_offload_raw: str | None = None,
+) -> tuple[list[tuple[str, str]], dict[str, int], bool]:
+    """Resolve Kimi K3 Phase O3 opt-in knobs into LIBTPU_INIT_ARGS flag pairs.
+
+    Returns ``(extra_flag_pairs, sc_threshold_overrides, is_active)`` where:
+      - ``extra_flag_pairs`` is an ordered list of ``(flag_name, value)`` pairs
+        without duplicate flag names.
+      - ``sc_threshold_overrides`` maps SparseCore ``*_min_size_in_bytes`` flag
+        names to explicit byte thresholds that override the default per-TC VMEM
+        cap (`128 MiB` on `v6e`).
+      - ``is_active`` is ``True`` iff any non-baseline O3 setting is active.
+    """
+    if xla_overlap_raw is None:
+        xla_overlap_raw = envs.TPU_KIMI_OPT_XLA_OVERLAP
+    if sc_offload_raw is None:
+        sc_offload_raw = envs.TPU_KIMI_OPT_SC_OFFLOAD
+
+    flag_map: dict[str, str] = {}
+    sc_thresholds: dict[str, int] = {}
+    active = False
+
+    ov_norm = xla_overlap_raw.strip().lower()
+    if ov_norm not in ("", "0", "off", "false", "none"):
+        expanded_tokens: list[str] = []
+        for tok in ov_norm.split("+"):
+            tok = tok.strip()
+            if not tok or tok in ("0", "off", "false", "none"):
+                continue
+            if tok in ("1", "true", "auto", "c1"):
+                preset = _DEFAULT_KIMI_XLA_OVERLAP_PRESET.strip().lower()
+                if preset not in ("", "0", "off", "false", "none"):
+                    expanded_tokens.extend(preset.split("+"))
+            else:
+                expanded_tokens.append(tok)
+
+        for tok in expanded_tokens:
+            m_msa = _MSA_RATIO_RE.match(tok)
+            if m_msa:
+                ratio = int(m_msa.group(1))
+                if not (1 <= ratio <= 31):
+                    raise ValueError(
+                        f"TPU_KIMI_OPT_XLA_OVERLAP={xla_overlap_raw!r}: MSA "
+                        f"overlap ratio {ratio} must be in 1..31 (32 hits the "
+                        "v6e VMEM prefetch capacity cliff)."
+                    )
+                flag_map["--xla_msa_preferred_overlap_to_async_copy_ratio"] = str(
+                    ratio
+                )
+                active = True
+            elif tok == "async_coll":
+                flag_map["--xla_tpu_enable_async_collective_fusion"] = "true"
+                flag_map[
+                    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather"
+                ] = "true"
+                active = True
+            elif tok == "cpp_256":
+                flag_map["--xla_msa_max_cross_program_prefetches"] = "256"
+                active = True
+            else:
+                raise ValueError(
+                    f"Unsupported TPU_KIMI_OPT_XLA_OVERLAP token {tok!r} in "
+                    f"{xla_overlap_raw!r}; expected 'off', 'auto'/'c1'/'1', "
+                    "'msa_r<1..31>', 'async_coll', 'cpp_256', or '+'-joined "
+                    "combinations."
+                )
+
+    sc_norm = sc_offload_raw.strip().lower()
+    if sc_norm in ("1", "true"):
+        sc_norm = "8192"
+    elif sc_norm in ("auto", "c1"):
+        sc_norm = _DEFAULT_KIMI_SC_OFFLOAD_PRESET.strip().lower()
+
+    if sc_norm not in ("", "0", "off", "false", "none"):
+        m_full = _SC_FULL_RE.match(sc_norm)
+        m_ar = _SC_AR_ONLY_RE.match(sc_norm)
+        m_th = _SC_THRESH_ONLY_RE.match(sc_norm)
+        if m_full:
+            min_bytes = int(m_full.group(1))
+            flag_map[
+                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"
+            ] = "true"
+            flag_map[
+                "--xla_tpu_enable_sparse_core_collective_offload_all_gather"
+            ] = "true"
+            flag_map["--xla_tpu_enable_concurrent_sparse_core_offloading"] = (
+                "true"
+            )
+            sc_thresholds[
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+            ] = min_bytes
+            sc_thresholds[
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
+            ] = min_bytes
+            active = True
+        elif m_ar:
+            min_bytes = int(m_ar.group(1))
+            flag_map[
+                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"
+            ] = "true"
+            flag_map["--xla_tpu_enable_concurrent_sparse_core_offloading"] = (
+                "true"
+            )
+            sc_thresholds[
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+            ] = min_bytes
+            active = True
+        elif m_th:
+            min_bytes = int(m_th.group(1))
+            sc_thresholds[
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+            ] = min_bytes
+            sc_thresholds[
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
+            ] = min_bytes
+            active = True
+        else:
+            raise ValueError(
+                f"Unsupported TPU_KIMI_OPT_SC_OFFLOAD={sc_offload_raw!r}; "
+                "expected 'off'/'0', '1'/'auto'/'c1', '<bytes>'/'min_<bytes>', "
+                "'ar_<bytes>', or 'thresh_<bytes>'."
+            )
+
+    return list(flag_map.items()), sc_thresholds, active
+
+
 _libtpu_extra_args: list[str] = []
 
 # --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
@@ -209,26 +354,52 @@ _libtpu_extra_args: list[str] = []
 if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
 
+_kimi_o3_flags, _kimi_o3_sc_thresholds, _kimi_o3_active = (
+    resolve_kimi_o3_libtpu_flags()
+)
+for _o3_flag_name, _o3_flag_val in _kimi_o3_flags:
+    if not _user_has_flag(_o3_flag_name):
+        _libtpu_extra_args.append(f"{_o3_flag_name}={_o3_flag_val}")
+
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
-# offloaded to SparseCore. The chip family is detected from
-# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
-# each flag is added only if the user hasn't supplied it explicitly.
+# offloaded to SparseCore, unless TPU_KIMI_OPT_SC_OFFLOAD overrides a threshold.
+# The chip family is detected from TPU_ACCELERATOR_TYPE / GCE metadata and
+# mapped to a VMEM constant above; each flag is added only if the user hasn't
+# supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
-if _sc_offload_bytes is not None:
-    for _flag_name in (
-        "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
-        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
-    ):
-        if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+for _flag_name in (
+    "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+):
+    _target_bytes = (
+        _kimi_o3_sc_thresholds[_flag_name]
+        if _flag_name in _kimi_o3_sc_thresholds
+        else _sc_offload_bytes
+    )
+    if _target_bytes is not None and not _user_has_flag(_flag_name):
+        _libtpu_extra_args.append(f"{_flag_name}={_target_bytes}")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:
         _assembled = _assembled + " " + _existing_libtpu_args
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
+
+# D87 Tier-2 cache isolation: torch_tpu's /dev/shm/torch_tpu_cache/<name> keys
+# compiled executables by HLO + PjRt version without LIBTPU_INIT_ARGS. When O3
+# LIBTPU_INIT_ARGS overrides are active and the caller has not explicitly pinned
+# TORCH_TPU_TIER2_COMPILATION_CACHE, namespace the Tier-2 directory by the
+# resolved LIBTPU_INIT_ARGS digest so distinct O3 flag sweeps cannot reuse a
+# stale executable across processes on the same host.
+if _kimi_o3_active and not _existing_tier2_cache:
+    _o3_t2_digest = hashlib.sha256(
+        os.environ.get("LIBTPU_INIT_ARGS", "").encode()
+    ).hexdigest()[:8]
+    _o3_t2_name = f"tpu_tier2_o3_{_o3_t2_digest}"
+    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = _o3_t2_name
+    os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _o3_t2_name
 
 
 def _patch_jax_pallas_fori_lowering() -> None:

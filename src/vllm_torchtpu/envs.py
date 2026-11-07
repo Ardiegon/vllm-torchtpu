@@ -200,6 +200,8 @@ if TYPE_CHECKING:
     TPU_KIMI_OPT_LATENCY_COLLECTIVES: bool = False
     TPU_KIMI_OPT_WORLD_LATENT_AG: bool = False
     TPU_KIMI_OPT_LATENCY_TP_PSUM: str = "off"
+    TPU_KIMI_OPT_XLA_OVERLAP: str = "off"
+    TPU_KIMI_OPT_SC_OFFLOAD: str = "off"
 
 
 def env_with_choices(
@@ -1185,6 +1187,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # integer max_dma_tokens threshold string such as "8").
     "TPU_KIMI_OPT_LATENCY_TP_PSUM": lambda: os.getenv(
         "TPU_KIMI_OPT_LATENCY_TP_PSUM", "off"
+    ).strip(),
+    # Kimi K3 Phase O3 XLA async-copy / collective overlap presets in
+    # LIBTPU_INIT_ARGS ("off"/"0" default; "msa_r8", "msa_r12", "msa_r16",
+    # "async_coll", "+"-joined combinations like "msa_r12+async_coll", or
+    # "1"/"auto"/"c1" for the Cycle-1 verified preset "msa_r12+async_coll").
+    # Must be set before PjRt client initialization.
+    "TPU_KIMI_OPT_XLA_OVERLAP": lambda: os.getenv(
+        "TPU_KIMI_OPT_XLA_OVERLAP", "off"
+    ).strip(),
+    # Kimi K3 Phase O3 SparseCore collective offload control in
+    # LIBTPU_INIT_ARGS ("off"/"0" default keeps the chip VMEM threshold cap;
+    # "<bytes>" / "min_<bytes>" enables v6e SC AR+AG offload above <bytes>;
+    # "ar_<bytes>" enables v6e SC AR-only offload above <bytes>;
+    # "thresh_<bytes>" lowers only min_size_in_bytes thresholds; "1" -> "8192";
+    # "auto"/"c1" -> Cycle-1 verified setting "off").
+    "TPU_KIMI_OPT_SC_OFFLOAD": lambda: os.getenv(
+        "TPU_KIMI_OPT_SC_OFFLOAD", "off"
     ).strip(),
 }
 
