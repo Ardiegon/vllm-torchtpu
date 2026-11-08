@@ -59,11 +59,14 @@ def kimi_use_2d_ep_mesh() -> bool:
 
     tp_psum_raw = (envs.TPU_KIMI_OPT_LATENCY_TP_PSUM or "off").strip().lower()
     tp_psum_active = tp_psum_raw not in ("", "0", "false", "no", "off", "none")
+    exit_fold_raw = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
+    exit_fold_active = exit_fold_raw not in ("", "0", "false", "no", "off", "none")
     return bool(
         envs.TPU_KIMI_OPT_2D_EP_MESH
         or envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES
         or envs.TPU_KIMI_OPT_WORLD_LATENT_AG
         or tp_psum_active
+        or exit_fold_active
     )
 
 

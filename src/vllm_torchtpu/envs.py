@@ -202,6 +202,7 @@ if TYPE_CHECKING:
     TPU_KIMI_OPT_LATENCY_TP_PSUM: str = "off"
     TPU_KIMI_OPT_XLA_OVERLAP: str = "off"
     TPU_KIMI_OPT_SC_OFFLOAD: str = "off"
+    TPU_KIMI_OPT_EXIT_FOLD: str = "off"
 
 
 def env_with_choices(
@@ -1204,6 +1205,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "auto"/"c1" -> Cycle-1 verified setting "off").
     "TPU_KIMI_OPT_SC_OFFLOAD": lambda: os.getenv(
         "TPU_KIMI_OPT_SC_OFFLOAD", "off"
+    ).strip(),
+    # Kimi K3 Phase O4 unified-@jax_op async EP DMA overlap + exact
+    # routed_expert_norm exit-fold mode ("off"/"0" default retains O3's
+    # packed_moe_in_weight path; "o4a" runs world owner-combine + exact local
+    # RMSNorm + TP seam_exit_split cid=6; "o4b" runs DP psum_scatter cid=2 +
+    # guarded TP latency_psum cid=3 + fused RMSNorm + slice; "o4a_sync" /
+    # "o4b_sync" disable async w_shared_gu overlap for ablation; "c2"/"auto"/"1"
+    # selects the Cycle-2 verified policy).
+    "TPU_KIMI_OPT_EXIT_FOLD": lambda: os.getenv(
+        "TPU_KIMI_OPT_EXIT_FOLD", "off"
     ).strip(),
 }
 

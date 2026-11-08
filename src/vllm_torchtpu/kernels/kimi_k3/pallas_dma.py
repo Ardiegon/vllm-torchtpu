@@ -658,6 +658,17 @@ def seam_pieces_unpack(out: jax.Array, rows: int, orig_lanes: int) -> jax.Array:
     return out[:, :rows, :orig_lanes]
 
 
+def seam_pieces_tile(
+    axis_size: int, rows: int, lanes: int, dtype: Any
+) -> jax.ShapeDtypeStruct:
+    """Return the static packed shape produced by ``seam_pieces_pack``."""
+    packed = jax.eval_shape(
+        functools.partial(seam_pieces_pack, axis_size=axis_size),
+        jax.ShapeDtypeStruct((axis_size, rows, lanes), dtype),
+    )
+    return jax.ShapeDtypeStruct(packed.shape, packed.dtype)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=[

@@ -389,11 +389,40 @@ if _libtpu_extra_args:
 
 # D87 Tier-2 cache isolation: torch_tpu's /dev/shm/torch_tpu_cache/<name> keys
 # compiled executables by HLO + PjRt version without LIBTPU_INIT_ARGS. When O3
-# LIBTPU_INIT_ARGS overrides are active and the caller has not explicitly pinned
-# TORCH_TPU_TIER2_COMPILATION_CACHE, namespace the Tier-2 directory by the
-# resolved LIBTPU_INIT_ARGS digest so distinct O3 flag sweeps cannot reuse a
-# stale executable across processes on the same host.
-if _kimi_o3_active and not _existing_tier2_cache:
+# LIBTPU_INIT_ARGS overrides or O4 TPU_KIMI_OPT_EXIT_FOLD modes are active and
+# the caller has not explicitly pinned TORCH_TPU_TIER2_COMPILATION_CACHE,
+# namespace the Tier-2 directory so distinct O3/O4 sweeps cannot reuse a stale
+# executable across processes on the same host.
+def _normalize_kimi_o4_exit_fold_env(raw: str | None) -> str:
+    val = (raw or "off").strip().lower()
+    if val in ("", "0", "false", "no", "off", "none"):
+        return "off"
+    if val in ("o4a", "o4b", "o4a_sync", "o4b_sync"):
+        return val
+    if val in ("1", "true", "yes", "auto", "c2"):
+        return "c2"
+    raise ValueError(
+        f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4a', 'o4b', "
+        "'o4a_sync', 'o4b_sync', or 'c2'/'auto'/'1'."
+    )
+
+
+_kimi_o4_exit_fold_mode = _normalize_kimi_o4_exit_fold_env(
+    os.environ.get("TPU_KIMI_OPT_EXIT_FOLD")
+)
+
+if _kimi_o4_exit_fold_mode != "off" and not _existing_tier2_cache:
+    _o4_t2_digest = hashlib.sha256(
+        (
+            os.environ.get("LIBTPU_INIT_ARGS", "")
+            + "|exit_fold="
+            + _kimi_o4_exit_fold_mode
+        ).encode()
+    ).hexdigest()[:8]
+    _o4_t2_name = f"tpu_tier2_o4_{_kimi_o4_exit_fold_mode}_{_o4_t2_digest}"
+    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = _o4_t2_name
+    os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _o4_t2_name
+elif _kimi_o3_active and not _existing_tier2_cache:
     _o3_t2_digest = hashlib.sha256(
         os.environ.get("LIBTPU_INIT_ARGS", "").encode()
     ).hexdigest()[:8]

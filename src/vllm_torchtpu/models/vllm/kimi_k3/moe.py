@@ -36,6 +36,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+from vllm_torchtpu.kernels.kimi_k3.exit_fold import is_exit_fold_active
 from vllm_torchtpu.kernels.kimi_k3.latency_collectives import (
     _pack_dispatch_metadata,
     _pack_dp_dispatch,
@@ -169,6 +170,8 @@ class KimiMoE(nn.Module):
         self.register_buffer("packed_moe_in_scale", None, persistent=False)
         self.register_buffer("packed_moe_out_weight", None, persistent=False)
         self.register_buffer("packed_moe_out_scale", None, persistent=False)
+        self.register_buffer("w_routed_down_tp", None, persistent=False)
+        self.register_buffer("w_shared_gu", None, persistent=False)
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
@@ -298,6 +301,8 @@ class KimiMoE(nn.Module):
         self.packed_moe_in_scale = None
         self.packed_moe_out_weight = None
         self.packed_moe_out_scale = None
+        self.w_routed_down_tp = None
+        self.w_shared_gu = None
         if (
             self.shared_group is not None
             or self.shared_experts is None
@@ -364,14 +369,6 @@ class KimiMoE(nn.Module):
             if shared_gu_cols % 128 != 0:
                 return
 
-            packed_in = torch.cat(
-                (
-                    w_shared_gu,
-                    w_down,
-                    w_down.new_zeros((hidden_size, down_pad_cols - down_cols)),
-                ),
-                dim=-1,
-            )
             self._moe_in_shared_cols = shared_gu_cols
             self._moe_in_down_cols = down_cols
             self._moe_in_down_pad_cols = down_pad_cols
@@ -381,17 +378,51 @@ class KimiMoE(nn.Module):
             self._moe_out_latent_end = (rank + 1) * latent_local
             empty_dtype = w_shared_gu.dtype
             empty_device = w_shared_gu.device
-            if envs.TPU_KIMI_DENSE_W8A16_B11:
-                in_q, in_s = quantize_weight_w8a16(packed_in)
-                out_q, out_s = quantize_weight_w8a16(packed_out)
-                self.packed_moe_in_weight = in_q
-                self.packed_moe_in_scale = in_s
-                self.packed_moe_out_weight = out_q
-                self.packed_moe_out_scale = out_s
-            else:
-                self.packed_moe_in_weight = fresh_buffer(packed_in)
+
+            down_group = getattr(down_proj, "_chip_group", None)
+            can_split_down_tp = (
+                (down_group is not None and down_group.world_size == self.tp_size and down_cols == latent_local)
+                or (down_group is None and down_cols == latent_dim)
+            )
+            use_o4_split = (
+                is_exit_fold_active()
+                and self.use_ep
+                and get_pcp_world_size() == 1
+                and not envs.TPU_KIMI_DENSE_W8A16_B11
+                and hierarchical_split_or_none() is None
+                and can_split_down_tp
+            )
+            if use_o4_split:
+                w_down_tp = (
+                    w_down.contiguous()
+                    if down_cols == latent_local
+                    else w_down[:, rank * latent_local : (rank + 1) * latent_local].contiguous()
+                )
+                self._moe_in_down_cols = latent_local
+                self.w_routed_down_tp = fresh_buffer(w_down_tp)
+                self.w_shared_gu = fresh_buffer(w_shared_gu.contiguous())
                 self.packed_moe_out_weight = fresh_buffer(packed_out)
-            del packed_in, packed_out, w_up_row, full_w_up
+                del w_down_tp, packed_out, w_up_row, full_w_up
+            else:
+                packed_in = torch.cat(
+                    (
+                        w_shared_gu,
+                        w_down,
+                        w_down.new_zeros((hidden_size, down_pad_cols - down_cols)),
+                    ),
+                    dim=-1,
+                )
+                if envs.TPU_KIMI_DENSE_W8A16_B11:
+                    in_q, in_s = quantize_weight_w8a16(packed_in)
+                    out_q, out_s = quantize_weight_w8a16(packed_out)
+                    self.packed_moe_in_weight = in_q
+                    self.packed_moe_in_scale = in_s
+                    self.packed_moe_out_weight = out_q
+                    self.packed_moe_out_scale = out_s
+                else:
+                    self.packed_moe_in_weight = fresh_buffer(packed_in)
+                    self.packed_moe_out_weight = fresh_buffer(packed_out)
+                del packed_in, packed_out, w_up_row, full_w_up
             for layer in (shared_gu, down_proj, shared_down, up_proj):
                 layer.weight.data = torch.empty(
                     0, dtype=empty_dtype, device=empty_device
@@ -405,6 +436,14 @@ class KimiMoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if (
+            getattr(self, "w_routed_down_tp", None) is not None
+            and getattr(self, "w_shared_gu", None) is not None
+            and getattr(self, "packed_moe_out_weight", None) is not None
+            and getattr(self, "_o4_ep_overlap_op", None) is not None
+        ):
+            output = self._forward_async_ep_unified(hidden_states)
+            return output.view(num_tokens, hidden_size)
+        if (
             getattr(self, "packed_moe_in_weight", None) is not None
             and getattr(self, "packed_moe_out_weight", None) is not None
         ):
@@ -413,6 +452,33 @@ class KimiMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
+
+    def _forward_async_ep_unified(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits, _ = self.gate(hidden_states)
+        routed = self.experts.routed_experts
+        topk_weights, topk_ids = moe_routing.route(
+            routed, hidden_states, router_logits
+        )
+        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+            topk_ids, topk_weights, is_local_tensor=True
+        )
+        packed_meta = _pack_dispatch_metadata(topk_ids, topk_weights)
+        assert self.w_routed_down_tp is not None
+        assert self.packed_moe_out_weight is not None
+        routed_down_local = hidden_states @ self.w_routed_down_tp
+        combined_in = self._o4_ep_overlap_op(  # type: ignore[misc]
+            hidden_states,
+            routed_down_local,
+            packed_meta,
+            self,
+        )
+        out_partial = combined_in @ self.packed_moe_out_weight
+        if self.tp_size > 1:
+            tp_moe_exit_psum_op = getattr(self, "_o2_tp_moe_exit_psum_op", None)
+            if tp_moe_exit_psum_op is not None:
+                return tp_moe_exit_psum_op(out_partial)
+            return tensor_model_parallel_all_reduce(out_partial)
+        return out_partial
 
     def _forward_packed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
