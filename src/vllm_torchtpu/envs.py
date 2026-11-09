@@ -1206,13 +1206,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_SC_OFFLOAD": lambda: os.getenv(
         "TPU_KIMI_OPT_SC_OFFLOAD", "off"
     ).strip(),
-    # Kimi K3 Phase O4 unified-@jax_op async EP DMA overlap + exact
+    # Kimi K3 Phase O4/O4d unified-@jax_op async EP DMA overlap + exact
     # routed_expert_norm exit-fold mode ("off"/"0" default retains O3's
     # packed_moe_in_weight path; "o4a" runs world owner-combine + exact local
-    # RMSNorm + TP seam_exit_split cid=6; "o4b" runs DP psum_scatter cid=2 +
-    # guarded TP latency_psum cid=3 + fused RMSNorm + slice; "o4a_sync" /
-    # "o4b_sync" disable async w_shared_gu overlap for ablation; "c2"/"auto"/"1"
-    # selects the Cycle-2 verified policy).
+    # RMSNorm + TP seam_exit_split cid=6; "o4b" runs flat world async dispatch +
+    # DP psum_scatter cid=2 + guarded TP latency_psum cid=3 + fused RMSNorm +
+    # slice; "o4d"/"c2b" runs 2-stage axial TP->DP async dispatch cid=0+cid1 +
+    # O4-B hierarchical combine cid=2+cid3 + 1D axial prefill fallback;
+    # "o4a_sync" / "o4b_sync" / "o4d_sync" disable async w_shared_gu overlap for
+    # ablation; "c2"/"auto"/"1" selects the Cycle-2b verified axial policy "o4d").
     "TPU_KIMI_OPT_EXIT_FOLD": lambda: os.getenv(
         "TPU_KIMI_OPT_EXIT_FOLD", "off"
     ).strip(),

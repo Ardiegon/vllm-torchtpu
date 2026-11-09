@@ -397,13 +397,15 @@ def _normalize_kimi_o4_exit_fold_env(raw: str | None) -> str:
     val = (raw or "off").strip().lower()
     if val in ("", "0", "false", "no", "off", "none"):
         return "off"
-    if val in ("o4a", "o4b", "o4a_sync", "o4b_sync"):
+    if val == "c2b":
+        return "o4d"
+    if val in ("o4a", "o4b", "o4d", "o4a_sync", "o4b_sync", "o4d_sync"):
         return val
     if val in ("1", "true", "yes", "auto", "c2"):
         return "c2"
     raise ValueError(
         f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4a', 'o4b', "
-        "'o4a_sync', 'o4b_sync', or 'c2'/'auto'/'1'."
+        "'o4d'/'c2b', 'o4a_sync', 'o4b_sync', 'o4d_sync', or 'c2'/'auto'/'1'."
     )
 
 
@@ -488,6 +490,11 @@ def _normalize_kimi_o5_compute_polish_env(
 _kimi_o4_exit_fold_mode = _normalize_kimi_o4_exit_fold_env(
     os.environ.get("TPU_KIMI_OPT_EXIT_FOLD")
 )
+_kimi_o4_t2_impl_salt = (
+    "|impl=o4d_axial_v1"
+    if _kimi_o4_exit_fold_mode in ("c2", "o4d", "o4d_sync")
+    else ""
+)
 _kimi_o5_polish_tag, _ = _normalize_kimi_o5_compute_polish_env(
     os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH")
 )
@@ -498,6 +505,7 @@ if _kimi_o5_polish_tag != "off" and not _existing_tier2_cache:
             os.environ.get("LIBTPU_INIT_ARGS", "")
             + "|exit_fold="
             + _kimi_o4_exit_fold_mode
+            + _kimi_o4_t2_impl_salt
             + "|polish="
             + _kimi_o5_polish_tag
         ).encode()
@@ -511,6 +519,7 @@ elif _kimi_o4_exit_fold_mode != "off" and not _existing_tier2_cache:
             os.environ.get("LIBTPU_INIT_ARGS", "")
             + "|exit_fold="
             + _kimi_o4_exit_fold_mode
+            + _kimi_o4_t2_impl_salt
         ).encode()
     ).hexdigest()[:8]
     _o4_t2_name = f"tpu_tier2_o4_{_kimi_o4_exit_fold_mode}_{_o4_t2_digest}"
