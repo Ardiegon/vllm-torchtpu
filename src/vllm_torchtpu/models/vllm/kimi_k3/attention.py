@@ -51,6 +51,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cw_f32, use_kda_glue
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
@@ -540,6 +541,19 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             torch.empty(self.conv_size, 3, self.num_heads, self.head_dim),
             persistent=False,
         )
+        self.register_buffer("conv_weight_f32", None, persistent=False)
+        self._kda_glue_enabled = bool(
+            use_kda_glue()
+            and envs.TPU_KDA_DIRECT_POOL_STREAMING
+            and not (
+                envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                and envs.TPU_RAIDEN_KIMIK3_ADMISSION
+            )
+            and self.num_spec_tokens == 0
+        )
+        self._kda_cw_f32_enabled = bool(
+            self._kda_glue_enabled and use_kda_cw_f32()
+        )
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
             self.projection_size,
@@ -662,6 +676,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # lazy chain so PJRT ships a plain row-major buffer.
         out = fresh_buffer(fused)
         self.conv_weight_fused = out
+        if self._kda_cw_f32_enabled:
+            self.conv_weight_f32 = fresh_buffer(
+                out.to(torch.float32).reshape(
+                    self.conv_size, 1, 3 * self.local_projection_size
+                )
+            )
+        else:
+            self.conv_weight_f32 = None
         self._pack_prefill_projection()
 
     def _pack_prefill_projection(self):
@@ -726,8 +748,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         group = self.prefill_group if sequence_parallel else get_tp_group()
         assert group is not None
         output_gate: torch.Tensor | None = None
+        beta_pad: torch.Tensor | None = None
+        beta: torch.Tensor | None = None
+        query: torch.Tensor | None = None
         # Set and read only on the low-rank gate path.
         gate_input: torch.Tensor | None = None
+        local_proj = getattr(
+            self, "local_projection_size", self.num_heads * self.head_dim
+        )
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
@@ -748,16 +776,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                     )
                 else:
                     packed = hidden_states @ self.packed_prefill_weight
-            local_proj = getattr(
-                self, "local_projection_size", self.num_heads * self.head_dim
-            )
             qkv_cols = 3 * local_proj
             beta_pad_cols = ((self.num_heads + 127) // 128) * 128
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
                 [qkv_cols, beta_pad_cols, local_proj, self.head_dim], dim=-1
             )
-            beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, :local_proj]
+            if not self._kda_glue_enabled:
+                beta = beta_pad[:, : self.num_heads]
+                query = mixed_qkv[:, :local_proj]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
@@ -785,20 +811,34 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
-            output = torch.zeros_like(query)
+            q_ref = query if query is not None else mixed_qkv[:, :local_proj]
+            output = torch.zeros_like(q_ref)
         elif len(self.kv_cache) == 1:
             # Unified pool: the single attention-shaped buffer carries both
             # KDA state regions.
+            pooled_beta = (
+                beta_pad
+                if (self._kda_glue_enabled and beta_pad is not None)
+                else cast(
+                    torch.Tensor,
+                    beta if beta is not None else cast(torch.Tensor, beta_pad)[:, : self.num_heads],
+                )
+            )
             output = self._core_attention_pooled(
                 mixed_qkv,
                 raw_gate,
-                beta,
+                pooled_beta,
                 output_gate,
                 self.kv_cache[0],
                 metadata,
             ).flatten(1)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
+            dense_beta = (
+                beta
+                if beta is not None
+                else cast(torch.Tensor, beta_pad)[:, : self.num_heads]
+            )
             window_distribution = metadata.mamba_request_distribution
             if window_distribution is None:
                 window_distribution = metadata.request_distribution
@@ -813,7 +853,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = self.dispatched_kda_op(
                 mixed_qkv,
                 raw_gate,
-                beta,
+                dense_beta,
                 output_gate,
                 sconv_cache,
                 recurrent_cache,
@@ -866,13 +906,18 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
         ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
+        conv_weight = (
+            self.conv_weight_f32
+            if (self._kda_glue_enabled and self.conv_weight_f32 is not None)
+            else self.conv_weight_fused
+        )
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
             beta,
             output_gate,
             pool,
-            self.conv_weight_fused,
+            conv_weight,
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,

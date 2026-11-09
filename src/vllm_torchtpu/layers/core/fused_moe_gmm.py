@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.kimi_k3.polish import active_trays_mode, use_copy_opt
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     can_use_fused_decode_moe_v6e_planar_t_b11,
@@ -601,18 +602,6 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "topk",
-        "activation",
-        "use_ep",
-        "use_sparse_core",
-        "onehot_moe_permute_threshold",
-        "rhs_quant_dtype",
-        "skip_padded_tokens",
-    ),
-)
 def fused_moe_func(
     hidden_states: jax.Array,
     w1: jax.Array,
@@ -631,6 +620,72 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    token_trays_mode: str | None = None,
+    rank3_scales: bool | None = None,
+) -> jax.Array:
+    resolved_trays = (
+        active_trays_mode() if token_trays_mode is None else token_trays_mode
+    )
+    resolved_rank3 = (
+        use_copy_opt() if rank3_scales is None else bool(rank3_scales)
+    )
+    return _fused_moe_func_jitted(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+        token_trays_mode=resolved_trays,
+        rank3_scales=resolved_rank3,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "use_ep",
+        "use_sparse_core",
+        "onehot_moe_permute_threshold",
+        "rhs_quant_dtype",
+        "skip_padded_tokens",
+        "token_trays_mode",
+        "rank3_scales",
+    ),
+)
+def _fused_moe_func_jitted(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+    token_trays_mode: str = "off",
+    rank3_scales: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -714,6 +769,8 @@ def fused_moe_func(
             topk_ids,
             activation=activation,
             preferred_element_type=hidden_states.dtype,
+            token_trays_mode=token_trays_mode,
+            rank3_scales=rank3_scales,
         )
 
     # Decode services also compile large prefill buckets. Apply the token

@@ -407,11 +407,105 @@ def _normalize_kimi_o4_exit_fold_env(raw: str | None) -> str:
     )
 
 
+_DEFAULT_KIMI_COMPUTE_POLISH_C2_TOKENS: tuple[str, ...] = (
+    "vmem_chain",
+)
+_ALL_KIMI_COMPUTE_POLISH_TOKENS: tuple[str, ...] = (
+    "trays",
+    "vmem_chain",
+    "kda_glue",
+    "copy_opt",
+)
+_KIMI_O5_TRAY_TOKENS: frozenset[str] = frozenset({"trays", "trays2", "trays32"})
+_KIMI_O5_VMEM_TOKENS: frozenset[str] = frozenset({"vmem_chain", "vmem_src"})
+_KIMI_O5_OFF_TOKENS: frozenset[str] = frozenset(
+    {"", "0", "false", "no", "off", "none"}
+)
+
+
+def _normalize_kimi_o5_compute_polish_env(
+    raw: str | None = None,
+) -> tuple[str, frozenset[str]]:
+    if raw is None:
+        raw = os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH", "off")
+    val = (raw or "off").strip().lower()
+    if val in _KIMI_O5_OFF_TOKENS:
+        return "off", frozenset()
+
+    tokens: set[str] = set()
+    for part in val.split("+"):
+        tok = part.strip()
+        if tok in _KIMI_O5_OFF_TOKENS:
+            continue
+        if tok in ("trays", "trays4"):
+            tokens.add("trays")
+        elif tok in (
+            "trays2",
+            "trays32",
+            "vmem_chain",
+            "vmem_src",
+            "kda_glue",
+            "kda_cond",
+            "kda_cw_f32",
+            "copy_opt",
+        ):
+            tokens.add(tok)
+        elif tok == "all":
+            tokens.update(_ALL_KIMI_COMPUTE_POLISH_TOKENS)
+        elif tok in ("c2", "auto", "1", "true", "yes"):
+            tokens.update(_DEFAULT_KIMI_COMPUTE_POLISH_C2_TOKENS)
+        else:
+            raise ValueError(
+                f"Invalid TPU_KIMI_OPT_COMPUTE_POLISH token {tok!r} in {raw!r}; "
+                "expected 'off', 'trays'/'trays4', 'trays2', 'trays32', "
+                "'vmem_chain', 'vmem_src', 'kda_glue', 'kda_cond', 'kda_cw_f32', "
+                "'copy_opt', 'all', 'c2'/'auto'/'1', or '+'-joined combinations."
+            )
+
+    active_trays = tokens & _KIMI_O5_TRAY_TOKENS
+    if len(active_trays) > 1:
+        raise ValueError(
+            f"Conflicting tray modes {sorted(active_trays)} in "
+            f"TPU_KIMI_OPT_COMPUTE_POLISH={raw!r}; choose at most one of "
+            "'trays'/'trays4', 'trays2', or 'trays32'."
+        )
+
+    active_vmem = tokens & _KIMI_O5_VMEM_TOKENS
+    if len(active_vmem) > 1:
+        raise ValueError(
+            f"Conflicting VMEM chaining modes {sorted(active_vmem)} in "
+            f"TPU_KIMI_OPT_COMPUTE_POLISH={raw!r}; choose at most one of "
+            "'vmem_chain' or 'vmem_src'."
+        )
+
+    if not tokens:
+        return "off", frozenset()
+
+    frozen = frozenset(tokens)
+    return "_".join(sorted(frozen)), frozen
+
+
 _kimi_o4_exit_fold_mode = _normalize_kimi_o4_exit_fold_env(
     os.environ.get("TPU_KIMI_OPT_EXIT_FOLD")
 )
+_kimi_o5_polish_tag, _ = _normalize_kimi_o5_compute_polish_env(
+    os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH")
+)
 
-if _kimi_o4_exit_fold_mode != "off" and not _existing_tier2_cache:
+if _kimi_o5_polish_tag != "off" and not _existing_tier2_cache:
+    _o5_t2_digest = hashlib.sha256(
+        (
+            os.environ.get("LIBTPU_INIT_ARGS", "")
+            + "|exit_fold="
+            + _kimi_o4_exit_fold_mode
+            + "|polish="
+            + _kimi_o5_polish_tag
+        ).encode()
+    ).hexdigest()[:8]
+    _o5_t2_name = f"tpu_tier2_o5_{_kimi_o5_polish_tag[:24]}_{_o5_t2_digest}"
+    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = _o5_t2_name
+    os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _o5_t2_name
+elif _kimi_o4_exit_fold_mode != "off" and not _existing_tier2_cache:
     _o4_t2_digest = hashlib.sha256(
         (
             os.environ.get("LIBTPU_INIT_ARGS", "")

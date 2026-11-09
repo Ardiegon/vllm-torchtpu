@@ -126,6 +126,8 @@ def _color_dma_operands(
     tree: Any,
     *,
     vmem_dense_recv: bool = False,
+    vmem_all_data: bool = False,
+    vmem_field_names: Sequence[str] = (),
 ) -> Any:
     """Pin HBM/VMEM operands explicitly on ``pl.ANY`` DMA kernel inputs/inout.
 
@@ -133,6 +135,7 @@ def _color_dma_operands(
     ``TpuCustomCallMemorySpacePolicy`` can stage ``pl.ANY`` operands through
     temporary VMEM copies while remote DMAs are still in flight.
     """
+    vmem_names_set = frozenset(vmem_field_names)
 
     def _pin(path: tuple[Any, ...], x: Any) -> Any:
         if not isinstance(x, jax.Array) or not x.shape:
@@ -144,7 +147,10 @@ def _color_dma_operands(
         is_dense_recv = any(
             getattr(entry, "name", None) == "x_recv" for entry in path
         )
-        if vmem_dense_recv and is_dense_recv:
+        is_named_vmem = bool(vmem_names_set) and any(
+            getattr(entry, "name", None) in vmem_names_set for entry in path
+        )
+        if vmem_all_data or (vmem_dense_recv and is_dense_recv) or is_named_vmem:
             space = pltpu.MemorySpace.VMEM
         else:
             space = pltpu.MemorySpace.HBM
@@ -164,6 +170,9 @@ def call_kernel(
     compiler_params: Any = None,
     allow_pin: bool = True,
     vmem_dense_recv: bool = False,
+    vmem_args: bool = False,
+    vmem_inout_all: bool = False,
+    vmem_inout_fields: Sequence[str] = (),
     **kwargs: Any,
 ) -> Any:
     """Invoke a Pallas kernel with explicit memory-space coloring and I/O aliasing."""
@@ -176,8 +185,17 @@ def call_kernel(
         allow_collective_id_without_custom_barrier=True,
     )
     if allow_pin:
-        args = _color_dma_operands(args, vmem_dense_recv=vmem_dense_recv)
-        inout = _color_dma_operands(inout, vmem_dense_recv=vmem_dense_recv)
+        args = _color_dma_operands(
+            args,
+            vmem_dense_recv=vmem_dense_recv,
+            vmem_all_data=vmem_args,
+        )
+        inout = _color_dma_operands(
+            inout,
+            vmem_dense_recv=vmem_dense_recv,
+            vmem_all_data=vmem_inout_all,
+            vmem_field_names=vmem_inout_fields,
+        )
         any_args = _color_dma_operands(any_args, vmem_dense_recv=vmem_dense_recv)
 
     in_specs = jax.tree.map(
@@ -255,13 +273,14 @@ def barrier_and_allocate(
     axis_name: str | Sequence[str],
     order_dep: jax.Array | None = None,
     allow_pin: bool = True,
+    order_dep_vmem: bool = False,
 ) -> Any:
     """Signal the hardware barrier semaphore across ``axis_name`` and allocate buffers.
 
     Under ``torch_tpu``'s ``jax_op`` SPMD export bridge, XLA's SPMD partitioner
     rejects zero-operand custom calls marked ``has_side_effects=True``
     (``Side-effect HLO must have sharding``). Passing ``order_dep`` (colored
-    ``pltpu.HBM`` on ``pl.ANY``, unread inside the kernel) keeps
+    ``pltpu.HBM`` or ``pltpu.VMEM`` on ``pl.ANY``, unread inside the kernel) keeps
     ``has_side_effects=False`` safe against both HLO CSE and out-of-order
     scheduling across consecutive collectives sharing ``collective_id``, while
     ``to_alloc``'s dataflow into ``run_dense_a2a`` prevents DCE.
@@ -270,8 +289,11 @@ def barrier_and_allocate(
     in_args: tuple[Any, ...] = ()
     in_specs: Any = ()
     if order_dep is not None:
+        dep_space = (
+            pltpu.MemorySpace.VMEM if order_dep_vmem else pltpu.MemorySpace.HBM
+        )
         dep = (
-            pltpu.with_memory_space_constraint(order_dep, pltpu.MemorySpace.HBM)
+            pltpu.with_memory_space_constraint(order_dep, dep_space)
             if allow_pin
             else order_dep
         )
@@ -1061,6 +1083,7 @@ def kimi_guarded_psum(
     collective_id: int,
     recv_memory_space: str = "auto",
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
+    vmem_max_tokens: int = DEFAULT_VMEM_MAX_TOKENS,
 ) -> jax.Array:
     """JAX-internal width-guarded all-reduce (1-shot Pallas for ``<= max_dma_tokens``)."""
     axis_key = _normalize_axis_name(axis_name)
@@ -1074,6 +1097,7 @@ def kimi_guarded_psum(
             axis_size,
             x.dtype,
             allow_vmem_auto=True,
+            vmem_max_tokens=vmem_max_tokens,
         )
         return latency_psum(
             x,
@@ -1091,6 +1115,7 @@ def kimi_guarded_psum_scatter_rows(
     collective_id: int,
     recv_memory_space: str = "auto",
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
+    vmem_max_tokens: int = DEFAULT_VMEM_MAX_TOKENS,
 ) -> jax.Array:
     """JAX-internal width-guarded row reduce-scatter (1-shot Pallas for ``<= max_dma_tokens``)."""
     axis_key = _normalize_axis_name(axis_name)
@@ -1104,6 +1129,7 @@ def kimi_guarded_psum_scatter_rows(
             axis_size,
             x.dtype,
             allow_vmem_auto=True,
+            vmem_max_tokens=vmem_max_tokens,
         )
         return latency_psum_scatter_rows(
             x,

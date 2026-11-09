@@ -64,6 +64,7 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
     COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
     DEFAULT_MAX_DMA_TOKENS,
+    DEFAULT_VMEM_MAX_TOKENS,
     _REGISTERED_TORCH_OPS,
     _mesh_shape_and_ids,
     _normalize_axis_name,
@@ -77,6 +78,11 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     seam_pieces_pack,
     seam_pieces_tile,
     seam_pieces_unpack,
+)
+from vllm_torchtpu.kernels.kimi_k3.polish import (
+    active_trays_mode,
+    use_copy_opt,
+    vmem_chain_mode,
 )
 
 Ref = Any
@@ -317,6 +323,7 @@ def async_ep_dispatch_wait(
     rows: int,
     orig_lanes: int,
     collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+    zero_extra_copy: bool = False,
 ) -> jax.Array:
     """Wait on in-flight async EP dispatch DMAs, drain sends (`0` leak), and unpack."""
     axis_key = _normalize_axis_name(axis_name)
@@ -326,6 +333,41 @@ def async_ep_dispatch_wait(
         return state
 
     assert isinstance(state, AsyncDispatchState)
+    if zero_extra_copy:
+        def _wait_kernel_inplace(
+            wait_tok_ref: Any,
+            state_ref: AsyncDispatchState,
+        ) -> None:
+            _ = wait_tok_ref[0]
+            with jax.named_scope("wait_remote_dispatch_recv"):
+                recv_slice = state_ref.x_recv.at[pl.ds(0, world_size - 1)]
+                pltpu.make_async_copy(
+                    src_ref=recv_slice,
+                    dst_ref=recv_slice,
+                    sem=state_ref.data_recv_sem,
+                ).wait()
+            with jax.named_scope("drain_remote_dispatch_sends"):
+                for _ in range(world_size - 1):
+                    pltpu.make_async_copy(
+                        src_ref=state_ref.x_send,
+                        dst_ref=state_ref.x_send,
+                        sem=state_ref.data_send_sem,
+                    ).wait()
+
+        with xla_metadata.set_xla_metadata(
+            async_type="collective-done",
+            latency_metadata="300000",
+        ):
+            (state_done,) = call_kernel(
+                _wait_kernel_inplace,
+                args=(wait_tok,),
+                inout=(state,),
+                compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+                allow_pin=True,
+                name="kimi_ep_dispatch_wait_inplace",
+            )
+        return seam_pieces_unpack(state_done.x_recv, rows, orig_lanes)
+
     recv_shape = state.x_recv.shape
     recv_dtype = state.x_recv.dtype
 
@@ -389,17 +431,24 @@ def _unpack_world_gathered(
     d_local: int,
     m_per_tp: int,
     topk: int,
+    copy_opt: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Unpack `[world_size, b_dp, d_local + m_per_tp]` -> `(ag_latent, ag_ids, ag_weights)`."""
-    gathered_4d = gathered_3d.reshape(dp_size, tp_size, b_dp, d_local + m_per_tp)
-    lat_4d = gathered_4d[..., :d_local]
-    meta_4d = gathered_4d[..., d_local:]
-    ag_latent = jnp.swapaxes(lat_4d, 1, 2).reshape(
-        dp_size * b_dp, tp_size * d_local
-    )
-    ag_meta_padded = jnp.swapaxes(meta_4d, 1, 2).reshape(
-        dp_size * b_dp, tp_size * m_per_tp
-    )
+    if copy_opt and b_dp == 1:
+        ag_latent = gathered_3d[..., :d_local].reshape(dp_size, tp_size * d_local)
+        ag_meta_padded = gathered_3d[..., d_local:].reshape(
+            dp_size, tp_size * m_per_tp
+        )
+    else:
+        gathered_4d = gathered_3d.reshape(dp_size, tp_size, b_dp, d_local + m_per_tp)
+        lat_4d = gathered_4d[..., :d_local]
+        meta_4d = gathered_4d[..., d_local:]
+        ag_latent = jnp.swapaxes(lat_4d, 1, 2).reshape(
+            dp_size * b_dp, tp_size * d_local
+        )
+        ag_meta_padded = jnp.swapaxes(meta_4d, 1, 2).reshape(
+            dp_size * b_dp, tp_size * m_per_tp
+        )
     ag_meta = ag_meta_padded[:, : 3 * topk]
     low_i32 = ag_meta[:, :topk].astype(jnp.int32)
     high_i32 = ag_meta[:, topk : 2 * topk].astype(jnp.int32)
@@ -445,6 +494,7 @@ def o4a_owner_combine_rms_seam_split(
     rms_eps: float,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
     collective_id: int = COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
+    vmem_mode: str = "off",
 ) -> jax.Array:
     """Option `O4-A`: `world` owner combine + exact local `RMSNorm(latent_dim)` + `'tp'` `seam_exit_split`."""
     latent_local = latent_dim // tp_size
@@ -565,17 +615,25 @@ def o4a_owner_combine_rms_seam_split(
     seam_tile = seam_pieces_tile(tp_size, slots_per_tp, latent_local, moe_out.dtype)
     seam_shape = seam_tile.shape
 
+    use_vmem_src = vmem_mode in ("vmem_chain", "vmem_src")
+    use_vmem_recv = vmem_mode == "vmem_chain"
+    recv_ctor = pltpu.VMEM if use_vmem_recv else pltpu.HBM
+    vmem_fields: tuple[str, ...] = (
+        ("combine_recv", "seam_exit_recv") if use_vmem_recv else ()
+    )
+
     init_state = barrier_and_allocate(
         O4ACombineSeamState(
-            combine_recv=pltpu.HBM(shape=moe_packed.shape, dtype=moe_packed.dtype),
+            combine_recv=recv_ctor(shape=moe_packed.shape, dtype=moe_packed.dtype),
             combine_recv_sem=pltpu.SemaphoreType.DMA,
-            seam_exit_recv=pltpu.HBM(shape=seam_shape, dtype=moe_out.dtype),
+            seam_exit_recv=recv_ctor(shape=seam_shape, dtype=moe_out.dtype),
             seam_exit_recv_sem=pltpu.SemaphoreType.DMA,
         ),
         collective_id=collective_id,
         axis_name=world_axis,
         order_dep=moe_packed,
         allow_pin=True,
+        order_dep_vmem=use_vmem_src,
     )
 
     def _owner_combine_kernel(
@@ -623,17 +681,25 @@ def o4a_owner_combine_rms_seam_split(
                 src_ref=wait_ref, dst_ref=wait_ref, sem=send_sem
             ).wait()
 
+    owner_scoped: dict[str, Any] = {
+        "send_sem": pltpu.SemaphoreType.DMA,
+        "local_sem": pltpu.SemaphoreType.DMA,
+    }
+
     (state_after_combine,) = call_kernel(
         _owner_combine_kernel,
         args=(moe_packed,),
         inout=(init_state,),
-        scoped={
-            "send_sem": pltpu.SemaphoreType.DMA,
-            "local_sem": pltpu.SemaphoreType.DMA,
-        },
+        scoped=owner_scoped,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
         allow_pin=True,
-        name="kimi_o4a_owner_combine",
+        vmem_args=use_vmem_src,
+        vmem_inout_fields=vmem_fields,
+        name=(
+            f"kimi_o4a_owner_combine_{vmem_mode}"
+            if use_vmem_src
+            else "kimi_o4a_owner_combine"
+        ),
     )
 
     # Extract only `seam_exit_recv` + `seam_exit_recv_sem` so `combine_recv` dies right after sum!
@@ -652,6 +718,69 @@ def o4a_owner_combine_rms_seam_split(
         owned_norm.reshape(slots_per_tp, tp_size, latent_local), 0, 1
     )
     pieces_packed = seam_pieces_pack(pieces, tp_size)
+
+    if use_vmem_src:
+        def _seam_exit_split_inplace_kernel(
+            pieces_ref: Any,
+            seam_recv_ref: Any,
+            seam_sem_ref: Any,
+            *,
+            send_sem: Any,
+            local_sem: Any,
+        ) -> None:
+            my_tp = jnp.uint32(jax.lax.axis_index(TP_AXIS_NAME))
+            with jax.named_scope("seam_send_pieces"):
+                for p in range(tp_size):
+
+                    @pl.when(p != my_tp)
+                    def _(p: int = p) -> None:
+                        pltpu.make_async_remote_copy(
+                            src_ref=pieces_ref.at[pl.ds(p, 1)],
+                            dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
+                            send_sem=send_sem,
+                            recv_sem=seam_sem_ref,
+                            device_id={TP_AXIS_NAME: p},
+                        ).start()
+
+            with jax.named_scope("seam_local_piece_copy"):
+                pltpu.make_async_copy(
+                    src_ref=pieces_ref.at[pl.ds(my_tp, 1)],
+                    dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
+                    sem=local_sem,
+                ).start()
+                pltpu.make_async_copy(
+                    src_ref=pieces_ref.at[pl.ds(my_tp, 1)],
+                    dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
+                    sem=local_sem,
+                ).wait()
+
+            with jax.named_scope("seam_wait_pieces"):
+                wait_tp_ref = pieces_ref.at[pl.ds(0, tp_size - 1)]
+                pltpu.make_async_copy(
+                    src_ref=wait_tp_ref, dst_ref=wait_tp_ref, sem=seam_sem_ref
+                ).wait()
+                pltpu.make_async_copy(
+                    src_ref=wait_tp_ref, dst_ref=wait_tp_ref, sem=send_sem
+                ).wait()
+
+        seam_scoped: dict[str, Any] = {
+            "send_sem": pltpu.SemaphoreType.DMA,
+            "local_sem": pltpu.SemaphoreType.DMA,
+        }
+
+        seam_out_raw, _ = call_kernel(
+            _seam_exit_split_inplace_kernel,
+            args=(pieces_packed,),
+            inout=(seam_exit_recv, seam_exit_recv_sem),
+            scoped=seam_scoped,
+            compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+            allow_pin=True,
+            vmem_args=True,
+            vmem_inout_all=use_vmem_recv,
+            name=f"kimi_o4a_seam_exit_split_{vmem_mode}",
+        )
+        recv_pieces = seam_pieces_unpack(seam_out_raw, slots_per_tp, latent_local)
+        return recv_pieces.reshape(tp_size * slots_per_tp, latent_local)[:b_dp, :]
 
     def _seam_exit_split_kernel(
         pieces_ref: Any,
@@ -735,9 +864,15 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
     use_norm: bool,
     rms_eps: float,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
+    vmem_mode: str = "off",
 ) -> jax.Array:
     """Option `O4-B`: 1-shot `'dp'` RS (`cid=2`) + guarded `'tp'` `psum` (`cid=3`) + fused `RMSNorm` + slice."""
     latent_local = latent_dim // tp_size
+    vmax = (
+        max_dma_tokens
+        if vmem_mode in ("vmem_chain", "vmem_src")
+        else DEFAULT_VMEM_MAX_TOKENS
+    )
     if dp_size > 1:
         routed_dp = kimi_guarded_psum_scatter_rows(
             moe_out,
@@ -745,6 +880,7 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
             collective_id=COLLECTIVE_ID_MOE_DP_COMBINE_RS,
             recv_memory_space="auto",
             max_dma_tokens=max_dma_tokens,
+            vmem_max_tokens=vmax,
         )
     else:
         routed_dp = moe_out
@@ -760,6 +896,7 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
             collective_id=COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
             recv_memory_space="auto",
             max_dma_tokens=tp_psum_cap,
+            vmem_max_tokens=vmax,
         )
     else:
         routed_full = routed_dp
@@ -859,6 +996,9 @@ def _make_moe_ep_overlap_jax_fn(
     use_sparse_core = bool(cfg["use_sparse_core"])
     onehot_thresh = int(cfg["onehot_thresh"])
     skip_padded = bool(cfg["skip_padded"])
+    polish_trays = active_trays_mode()
+    polish_vmem = vmem_chain_mode()
+    polish_copy = use_copy_opt()
 
     world_axis: str | tuple[str, str] = (
         TP_AXIS_NAME if dp_size == 1 else (DP_AXIS_NAME, TP_AXIS_NAME)
@@ -980,6 +1120,7 @@ def _make_moe_ep_overlap_jax_fn(
                     rows=b_dp,
                     orig_lanes=orig_lanes,
                     collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+                    zero_extra_copy=(polish_vmem in ("vmem_chain", "vmem_src")),
                 )
             elif b_global <= max_dma_tokens:
                 # Synchronous dispatch ablation (`o4a_sync` / `o4b_sync`) or 1-rank edge case:
@@ -1026,6 +1167,7 @@ def _make_moe_ep_overlap_jax_fn(
                 d_local=d_local,
                 m_per_tp=m_per_tp,
                 topk=topk,
+                copy_opt=polish_copy,
             )
 
             # 2. Routed MoE Compute (`fused_decode_moe_v6e_planar_t_b11` for <=64, `moe_gmm` >64)
@@ -1047,6 +1189,8 @@ def _make_moe_ep_overlap_jax_fn(
                 onehot_moe_permute_threshold=onehot_thresh,
                 rhs_quant_dtype=None,
                 skip_padded_tokens=skip_padded,
+                token_trays_mode=polish_trays,
+                rank3_scales=polish_copy,
             )
 
             # 3. Mathematically Exact Combine + `RMSNorm(latent_dim)` + `[latent_local]` Exit-Fold
@@ -1063,6 +1207,7 @@ def _make_moe_ep_overlap_jax_fn(
                     rms_eps=rms_eps,
                     max_dma_tokens=max_dma_tokens,
                     collective_id=COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
+                    vmem_mode=polish_vmem,
                 )
             elif combine_kind == "o4b":
                 routed_local = o4b_dp_rs_tp_psum_fused_rms_slice(
@@ -1075,6 +1220,7 @@ def _make_moe_ep_overlap_jax_fn(
                     use_norm=use_norm,
                     rms_eps=rms_eps,
                     max_dma_tokens=max_dma_tokens,
+                    vmem_mode=polish_vmem,
                 )
             else:
                 raise ValueError(f"Unknown combine_kind={combine_kind!r}")

@@ -6766,6 +6766,8 @@ def fused_decode_moe_v6e_planar_t_b11(
     activation: str,
     preferred_element_type: jax.typing.DTypeLike | None = None,
     vmem_limit_bytes: int | None = 48 * 1024 * 1024,
+    token_trays_mode: str = "off",
+    rank3_scales: bool = False,
 ) -> jax.Array:
   """Single-kernel fused decode MoE on TPU v6e for small token batches (M <= 64).
 
@@ -6794,7 +6796,38 @@ def fused_decode_moe_v6e_planar_t_b11(
 
   situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
-  padded_m = max(16, ((orig_m + 7) // 8) * 8)
+  trays_norm = (token_trays_mode or "off").strip().lower()
+  if trays_norm in ("", "0", "off", "false", "none"):
+    use_trays = False
+    padded_m = max(16, ((orig_m + 7) // 8) * 8)
+    tray_m = padded_m
+    num_trays = 1
+  elif trays_norm in ("trays", "trays4"):
+    use_trays = True
+    padded_m = max(16, ((orig_m + 15) // 16) * 16)
+    tray_m = 16
+    num_trays = padded_m // tray_m
+  elif trays_norm == "trays2":
+    use_trays = True
+    padded_m = max(16, ((orig_m + 15) // 16) * 16)
+    tray_m = 32 if padded_m >= 64 else 16
+    num_trays = padded_m // tray_m
+  elif trays_norm == "trays32":
+    if orig_m <= 16:
+      use_trays = False
+      padded_m = 16
+      tray_m = 16
+      num_trays = 1
+    else:
+      use_trays = True
+      padded_m = ((orig_m + 15) // 16) * 16
+      tray_m = 16
+      num_trays = padded_m // tray_m
+  else:
+    raise ValueError(
+        f"Invalid token_trays_mode={token_trays_mode!r}; expected 'off', "
+        "'trays'/'trays4', 'trays2', or 'trays32'."
+    )
   if padded_m != orig_m:
     lhs = jnp.pad(hidden_states, ((0, padded_m - orig_m), (0, 0)))
     topk_w = jnp.pad(topk_weights, ((0, padded_m - orig_m), (0, 0)))
@@ -6836,10 +6869,31 @@ def fused_decode_moe_v6e_planar_t_b11(
   depth_w13 = 2
   depth_w2 = 1 if n >= 3072 else 2
 
+  use_rank3_w13 = bool(rank3_scales and (w13_sc_3d.shape[1] % 32 == 0))
+  use_rank3_w2 = bool(rank3_scales and (w2_sc_3d.shape[1] % 32 == 0))
+
   w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
-  w13_scales_5d = w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
+  w13_scales_in = (
+      w13_sc_3d
+      if use_rank3_w13
+      else w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
+  )
   w2_packed_4d = w2_pt.reshape(num_groups, steps_2, plane_rows, k)
-  w2_scales_4d = w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
+  w2_scales_in = (
+      w2_sc_3d
+      if use_rank3_w2
+      else w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
+  )
+  w13_sbuf_shape = (
+      (depth_w13, w13_sc_3d.shape[1], n)
+      if use_rank3_w13
+      else (depth_w13, 2, steps_13, scale_rows, n)
+  )
+  w2_sbuf_shape = (
+      (depth_w2, w2_sc_3d.shape[1], k)
+      if use_rank3_w2
+      else (depth_w2, steps_2, scale_rows, k)
+  )
 
   fold_chunk = _planar_t_fold_chunk(DEQUANT_PLANAR_T_B11)
   dims = (((1,), (0,)), ((), ()))
@@ -6868,8 +6922,35 @@ def fused_decode_moe_v6e_planar_t_b11(
       w2_psem,
       w2_ssem,
   ):
-    out_acc[...] = jnp.zeros_like(out_acc)
-    lhs_tile = lhs_ref[...]
+    if use_trays:
+      for tr in range(num_trays):
+        r_sl = pl.ds(tr * tray_m, tray_m)
+        for t2_init in range(tiles_n2):
+          out_acc[r_sl, pl.ds(t2_init * tn2, tn2)] = jnp.zeros(
+              (tray_m, tn2), jnp.float32
+          )
+      lhs_tile = None
+    else:
+      out_acc[...] = jnp.zeros_like(out_acc)
+      lhs_tile = lhs_ref[...]
+
+    def get_w13_scale(slot, gate_or_up, cs, sl):
+      if use_rank3_w13:
+        r0 = (gate_or_up * steps_13 + cs) * scale_rows
+        tile_r0 = (r0 // 32) * 32
+        sub_r0 = r0 - tile_r0
+        tile32 = w13_sbuf[slot, pl.ds(tile_r0, 32), sl]
+        return tile32[sub_r0 : sub_r0 + scale_rows, :]
+      return w13_sbuf[slot, gate_or_up, cs, :, sl]
+
+    def get_w2_scale(slot2, cs, sl2):
+      if use_rank3_w2:
+        r0 = cs * scale_rows
+        tile_r0 = (r0 // 32) * 32
+        sub_r0 = r0 - tile_r0
+        tile32 = w2_sbuf[slot2, pl.ds(tile_r0, 32), sl2]
+        return tile32[sub_r0 : sub_r0 + scale_rows, :]
+      return w2_sbuf[slot2, cs, :, sl2]
 
     def copy_w13_expert(g, slot):
       return (
@@ -6906,7 +6987,6 @@ def fused_decode_moe_v6e_planar_t_b11(
       next_slot = lax.rem(j + 1, depth_w13)
       slot2 = lax.rem(j, depth_w2)
       next_slot2 = lax.rem(j + 1, depth_w2)
-      w_g = w_expert_ref[g]
 
       if depth_w2 == 1:
         for c2 in copy_w2_expert(g, 0):
@@ -6927,79 +7007,169 @@ def fused_decode_moe_v6e_planar_t_b11(
       for c in copy_w13_expert(g, slot):
         c.wait()
 
-      for t in range(tiles_n13):
-        sl = pl.ds(t * tn13, tn13)
-        gate_acc[...] = jnp.zeros_like(gate_acc)
-        up_acc[...] = jnp.zeros_like(up_acc)
-        for cs in range(steps_13):
-          lhs_chunk = lhs_tile[:, cs * chunk : (cs + 1) * chunk]
-          g_codes, g_wscale = fold_chunk(
-              w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
-          )
-          gate_acc[...] += (
-              lax.dot_general(
-                  lhs_chunk,
-                  g_codes,
-                  dimension_numbers=dims,
-                  preferred_element_type=jnp.float32,
+      if use_trays:
+        for t in range(tiles_n13):
+          sl = pl.ds(t * tn13, tn13)
+          for tr in range(num_trays):
+            r_sl = pl.ds(tr * tray_m, tray_m)
+            gate_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
+            up_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
+          for cs in range(steps_13):
+            k_sl = pl.ds(cs * chunk, chunk)
+            # Hoist b11 weight unpack outside token_trays loop (1 unpack/chunk):
+            g_codes, g_wscale = fold_chunk(
+                w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
+            )
+            for tr in range(num_trays):
+              r_sl = pl.ds(tr * tray_m, tray_m)
+              lhs_tr = lhs_ref[r_sl, k_sl]
+              gate_acc[r_sl, :] += (
+                  lax.dot_general(
+                      lhs_tr,
+                      g_codes,
+                      dimension_numbers=dims,
+                      preferred_element_type=jnp.float32,
+                  )
+                  * g_wscale
               )
-              * g_wscale
-          )
-          u_codes, u_wscale = fold_chunk(
-              w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
-          )
-          up_acc[...] += (
-              lax.dot_general(
-                  lhs_chunk,
-                  u_codes,
-                  dimension_numbers=dims,
-                  preferred_element_type=jnp.float32,
+            u_codes, u_wscale = fold_chunk(
+                w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
+            )
+            for tr in range(num_trays):
+              r_sl = pl.ds(tr * tray_m, tray_m)
+              lhs_tr = lhs_ref[r_sl, k_sl]
+              up_acc[r_sl, :] += (
+                  lax.dot_general(
+                      lhs_tr,
+                      u_codes,
+                      dimension_numbers=dims,
+                      preferred_element_type=jnp.float32,
+                  )
+                  * u_wscale
               )
-              * u_wscale
-          )
-        h_tile = _situ_f32(
-            gate_acc[...],
-            up_acc[...],
-            beta=situ_beta,
-            linear_beta=situ_linear_beta,
-        ).astype(out_dtype)
-        h_buf[:, sl] = h_tile
+          for tr in range(num_trays):
+            r_sl = pl.ds(tr * tray_m, tray_m)
+            h_buf[r_sl, sl] = _situ_f32(
+                gate_acc[r_sl, :],
+                up_acc[r_sl, :],
+                beta=situ_beta,
+                linear_beta=situ_linear_beta,
+            ).astype(out_dtype)
 
-      for c2 in copy_w2_expert(g, slot2):
-        c2.wait()
+        for c2 in copy_w2_expert(g, slot2):
+          c2.wait()
 
-      h_full = h_buf[...]
-      w_g_tile = jnp.tile(w_g, (1, tn2 // _LANES))
-      for t2 in range(tiles_n2):
-        sl2 = pl.ds(t2 * tn2, tn2)
-        w2_acc[...] = jnp.zeros_like(w2_acc)
-        for cs in range(steps_2):
-          h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
-          codes2, wscale2 = fold_chunk(
-              w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
-          )
-          w2_acc[...] += (
-              lax.dot_general(
-                  h_chunk,
-                  codes2,
-                  dimension_numbers=dims,
-                  preferred_element_type=jnp.float32,
+        for t2 in range(tiles_n2):
+          sl2 = pl.ds(t2 * tn2, tn2)
+          for tr in range(num_trays):
+            w2_acc[pl.ds(tr * tray_m, tray_m), :] = jnp.zeros(
+                (tray_m, tn2), jnp.float32
+            )
+          for cs in range(steps_2):
+            n_sl = pl.ds(cs * chunk, chunk)
+            # Hoist w2 b11 weight unpack outside token_trays loop (1 unpack/chunk):
+            codes2, wscale2 = fold_chunk(
+                w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
+            )
+            for tr in range(num_trays):
+              r_sl = pl.ds(tr * tray_m, tray_m)
+              h_tr = h_buf[r_sl, n_sl]
+              w2_acc[r_sl, :] += (
+                  lax.dot_general(
+                      h_tr,
+                      codes2,
+                      dimension_numbers=dims,
+                      preferred_element_type=jnp.float32,
+                  )
+                  * wscale2
               )
-              * wscale2
-          )
-        down_bf16 = w2_acc[...].astype(out_dtype).astype(jnp.float32)
-        out_acc[:, sl2] += down_bf16 * w_g_tile
+          for tr in range(num_trays):
+            r_sl = pl.ds(tr * tray_m, tray_m)
+            down_bf16 = w2_acc[r_sl, :].astype(out_dtype).astype(jnp.float32)
+            w_g_tr = jnp.tile(w_expert_ref[g, r_sl, :], (1, tn2 // _LANES))
+            out_acc[r_sl, sl2] += down_bf16 * w_g_tr
+      else:
+        w_g = w_expert_ref[g]
+        for t in range(tiles_n13):
+          sl = pl.ds(t * tn13, tn13)
+          gate_acc[...] = jnp.zeros_like(gate_acc)
+          up_acc[...] = jnp.zeros_like(up_acc)
+          for cs in range(steps_13):
+            lhs_chunk = lhs_tile[:, cs * chunk : (cs + 1) * chunk]
+            g_codes, g_wscale = fold_chunk(
+                w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
+            )
+            gate_acc[...] += (
+                lax.dot_general(
+                    lhs_chunk,
+                    g_codes,
+                    dimension_numbers=dims,
+                    preferred_element_type=jnp.float32,
+                )
+                * g_wscale
+            )
+            u_codes, u_wscale = fold_chunk(
+                w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
+            )
+            up_acc[...] += (
+                lax.dot_general(
+                    lhs_chunk,
+                    u_codes,
+                    dimension_numbers=dims,
+                    preferred_element_type=jnp.float32,
+                )
+                * u_wscale
+            )
+          h_tile = _situ_f32(
+              gate_acc[...],
+              up_acc[...],
+              beta=situ_beta,
+              linear_beta=situ_linear_beta,
+          ).astype(out_dtype)
+          h_buf[:, sl] = h_tile
+
+        for c2 in copy_w2_expert(g, slot2):
+          c2.wait()
+
+        h_full = h_buf[...]
+        w_g_tile = jnp.tile(w_g, (1, tn2 // _LANES))
+        for t2 in range(tiles_n2):
+          sl2 = pl.ds(t2 * tn2, tn2)
+          w2_acc[...] = jnp.zeros_like(w2_acc)
+          for cs in range(steps_2):
+            h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
+            codes2, wscale2 = fold_chunk(
+                w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
+            )
+            w2_acc[...] += (
+                lax.dot_general(
+                    h_chunk,
+                    codes2,
+                    dimension_numbers=dims,
+                    preferred_element_type=jnp.float32,
+                )
+                * wscale2
+            )
+          down_bf16 = w2_acc[...].astype(out_dtype).astype(jnp.float32)
+          out_acc[:, sl2] += down_bf16 * w_g_tile
 
       return carry
 
     lax.fori_loop(0, nat_ref[0], visit_expert, 0)
-    out_ref[...] = out_acc[...].astype(out_dtype)
+    if use_trays:
+      for tr in range(num_trays):
+        r_sl = pl.ds(tr * tray_m, tray_m)
+        for t2_ep in range(tiles_n2):
+          sl2_ep = pl.ds(t2_ep * tn2, tn2)
+          out_ref[r_sl, sl2_ep] = out_acc[r_sl, sl2_ep].astype(out_dtype)
+    else:
+      out_ref[...] = out_acc[...].astype(out_dtype)
 
   scratch_shapes = [
       pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
-      pltpu.VMEM((depth_w13, 2, steps_13, scale_rows, n), jnp.uint8),
+      pltpu.VMEM(w13_sbuf_shape, jnp.uint8),
       pltpu.VMEM((depth_w2, steps_2, plane_rows, k), jnp.uint8),
-      pltpu.VMEM((depth_w2, steps_2, scale_rows, k), jnp.uint8),
+      pltpu.VMEM(w2_sbuf_shape, jnp.uint8),
       pltpu.VMEM((padded_m, tn13), jnp.float32),
       pltpu.VMEM((padded_m, tn13), jnp.float32),
       pltpu.VMEM((padded_m, tn2), jnp.float32),
@@ -7016,6 +7186,12 @@ def fused_decode_moe_v6e_planar_t_b11(
       if vmem_limit_bytes is not None
       else pltpu.CompilerParams()
   )
+
+  kname = f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}"
+  if use_trays:
+    kname += f"_trays{num_trays}x{tray_m}"
+  if use_rank3_w13 or use_rank3_w2:
+    kname += "_s3d"
 
   out = pl.pallas_call(
       kernel,
@@ -7034,16 +7210,16 @@ def fused_decode_moe_v6e_planar_t_b11(
       out_shape=jax.ShapeDtypeStruct((padded_m, k), out_dtype),
       scratch_shapes=scratch_shapes,
       compiler_params=compiler_params,
-      name=f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}",
+      name=kname,
   )(
       active_ids,
       num_active,
       lhs,
       w_expert,
       w13_packed_5d,
-      w13_scales_5d,
+      w13_scales_in,
       w2_packed_4d,
-      w2_scales_4d,
+      w2_scales_in,
   )
   return out[:orig_m]
 

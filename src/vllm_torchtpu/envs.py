@@ -1216,6 +1216,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_EXIT_FOLD": lambda: os.getenv(
         "TPU_KIMI_OPT_EXIT_FOLD", "off"
     ).strip(),
+    # Kimi K3 Phase O5 compute & VMEM polish sub-knobs ("off"/"0" default is
+    # 100% invariant with O4; supports '+'-joined tokens "trays"/"trays4",
+    # "trays2", "trays32", "vmem_chain", "vmem_src", "kda_glue", "kda_cond",
+    # "kda_cw_f32", "copy_opt", "all", or "c2"/"auto"/"1" for the Cycle-2
+    # verified strictly-positive set ("vmem_chain",)).
+    "TPU_KIMI_OPT_COMPUTE_POLISH": lambda: (
+        os.getenv("TPU_KIMI_OPT_COMPUTE_POLISH", "off").strip() or "off"
+    ),
 }
 
 

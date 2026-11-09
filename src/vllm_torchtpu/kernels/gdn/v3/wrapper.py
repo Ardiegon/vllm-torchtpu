@@ -364,6 +364,8 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "conv_weight_is_kernel_layout",
+        "skip_empty_per_seq",
     ),
 )
 def fused_conv1d_gdn(
@@ -400,6 +402,8 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    conv_weight_is_kernel_layout: bool = False,
+    skip_empty_per_seq: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -522,7 +526,10 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    if conv_weight_is_kernel_layout:
+        assert conv_weight.shape == (kernel_size, 1, dim)
+    else:
+        assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -614,14 +621,18 @@ def fused_conv1d_gdn(
         decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
-    num_v_padding_size = aligned_num_v_heads - n_v
+    assert b.shape[0] == batch_size and b.shape[1] in (n_v, aligned_num_v_heads)
+    num_v_padding_size = aligned_num_v_heads - b.shape[1]
     # KDA's gate carries d_k channels per value head, so it pads out to a
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+    if batch_padding_size:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if batch_padding_size or num_v_padding_size:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+    if batch_padding_size or gate_padding_size:
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
     qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
@@ -633,7 +644,11 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = cast(jax.Array, conv_state).shape
         conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    if conv_weight_is_kernel_layout:
+        if conv_weight.dtype != jnp.float32:
+            conv_weight = conv_weight.astype(jnp.float32)
+    else:
+        conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
@@ -778,9 +793,19 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
-            out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
-            )
+            if skip_empty_per_seq and out_act is not None:
+                out_act, out_source, _ = jax.lax.cond(
+                    distribution[0] < distribution[-1],
+                    lambda op: call_kernel(
+                        op[1], None, op[0], config.GDNMode.PER_SEQ
+                    ),
+                    lambda op: (op[0], op[1], None),
+                    (out_act, out_source),
+                )
+            else:
+                out_act, out_source, _ = call_kernel(
+                    out_source, None, out_act, config.GDNMode.PER_SEQ
+                )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 

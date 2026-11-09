@@ -13,6 +13,7 @@
 # limitations under the License.
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
+import functools
 import math
 from collections.abc import Callable
 from typing import TypeVar
@@ -20,6 +21,8 @@ from typing import TypeVar
 import jax
 import jax.numpy as jnp
 import torch
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 
@@ -32,6 +35,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
+from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cond, use_kda_glue
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -257,6 +261,79 @@ def _gated_output_norm(
     output *= jax.lax.rsqrt(jnp.mean(output * output, axis=-1, keepdims=True) + eps)
     output = (output * norm_weight.astype(jnp.float32)).astype(activation_dtype)
     return output * jax.nn.sigmoid(output_gate.reshape(output.shape))
+
+
+def _gated_output_norm_2d_kernel(
+    x_ref: jax.Ref,
+    g_ref: jax.Ref,
+    w_ref: jax.Ref,
+    o_ref: jax.Ref,
+    *,
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+) -> None:
+    w = w_ref[...].astype(jnp.float32)
+    for h in range(num_heads):
+        sl = slice(h * head_dim, (h + 1) * head_dim)
+        x = x_ref[:, sl].astype(jnp.float32)
+        inv_rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+        y = (x * inv_rms * w).astype(o_ref.dtype)
+        o_ref[:, sl] = y * jax.nn.sigmoid(g_ref[:, sl].astype(o_ref.dtype))
+
+
+def _pallas_gated_output_norm_2d(
+    out_2d: jax.Array,  # [num_rows, H * D]
+    output_gate: jax.Array,  # [num_rows, H * D]
+    norm_weight: jax.Array,  # [D]
+    eps: float,
+    activation_dtype,
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> jax.Array:
+    """Sublane-preserving 2D Pallas ``o_norm`` + sigmoid gate (`O5-3` `kda_glue`).
+
+    Keeps ``num_rows`` on sublanes and ``head_dim`` (128) on lanes so XLA never
+    emits ``2D <-> 3D`` sublane relayout transposes before or after ``o_norm``.
+    """
+    num_rows, total_dim = out_2d.shape
+    if head_dim % 128 != 0:
+        return _gated_output_norm(
+            out_2d.reshape(num_rows, num_heads, head_dim),
+            output_gate,
+            norm_weight,
+            eps,
+            activation_dtype,
+        ).reshape(num_rows, total_dim)
+
+    x_in = out_2d.astype(activation_dtype)
+    g_in = output_gate.astype(activation_dtype)
+    padded_rows = max(8, ((num_rows + 7) // 8) * 8)
+    pad_rows = padded_rows - num_rows
+    if pad_rows > 0:
+        x_in = jnp.pad(x_in, ((0, pad_rows), (0, 0)))
+        g_in = jnp.pad(g_in, ((0, pad_rows), (0, 0)))
+
+    block_rows = math.gcd(padded_rows, 256)
+    row_block = pl.BlockSpec((block_rows, total_dim), lambda i: (i, 0))
+    weight_block = pl.BlockSpec((1, head_dim), lambda i: (0, 0))
+    out_spec = jax.ShapeDtypeStruct((padded_rows, total_dim), activation_dtype)
+    res = pl.pallas_call(
+        functools.partial(
+            _gated_output_norm_2d_kernel,
+            eps=eps,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        ),
+        grid=(padded_rows // block_rows,),
+        in_specs=[row_block, row_block, weight_block],
+        out_specs=row_block,
+        out_shape=out_spec,
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name=f"kimi_kda_gated_output_norm_2d_h{num_heads}_d{head_dim}",
+    )(x_in, g_in, norm_weight.reshape(1, head_dim))
+    return res[:num_rows] if pad_rows > 0 else res
 
 
 def _check_kda_abi(
@@ -547,7 +624,11 @@ def _pooled_kda_core(
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
+    kda_glue: bool | None = None,
+    kda_cond: bool | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    resolved_kda_glue = use_kda_glue() if kda_glue is None else bool(kda_glue)
+    resolved_kda_cond = use_kda_cond() if kda_cond is None else bool(kda_cond)
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     dense_offsets = None
@@ -673,8 +754,23 @@ def _pooled_kda_core(
             recurrent_state_dtype=jnp.float32,
             qk_pair_layout=False,
         )
-        conv_weight_flat = conv_weight.reshape(kernel_size, -1)
-        conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+        if resolved_kda_glue:
+            # Zero-copy reshape of bf16[K, 3, H, D] -> bf16[K, 1, 3*H*D] (or
+            # direct f32[K, 1, 3*H*D] under kda_cw_f32), skipping the round-trip
+            # transpose -> swapaxes(0, 2) copy with zero extra HBM weight bytes.
+            conv_weight_arg = (
+                conv_weight
+                if (
+                    conv_weight.ndim == 3
+                    and conv_weight.shape == (kernel_size, 1, conv_dim)
+                )
+                else conv_weight.reshape(kernel_size, 1, conv_dim)
+            )
+            is_kernel_conv_w = True
+        else:
+            conv_weight_flat = conv_weight.reshape(kernel_size, -1)
+            conv_weight_arg = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+            is_kernel_conv_w = False
         dist = distribution if window_distribution is None else window_distribution
 
         def _run_direct(batched_only: bool = False, prefill_only: bool = False):
@@ -684,7 +780,7 @@ def _pooled_kda_core(
                 a=raw_gate,
                 conv_state=None,
                 recurrent_state=None,
-                conv_weight=conv_weight_flat,
+                conv_weight=conv_weight_arg,
                 conv_bias=None,
                 a_log=a_log,
                 dt_bias=dt_bias.reshape(num_heads, head_dim),
@@ -705,13 +801,26 @@ def _pooled_kda_core(
                 prefill_only=prefill_only,
                 state_source=pool,
                 state_plan=plan,
+                conv_weight_is_kernel_layout=is_kernel_conv_w,
+                skip_empty_per_seq=resolved_kda_cond,
             )
 
         new_pool, out = _run_direct(batched_only=False, prefill_only=False)
-        output = out.reshape(num_tokens, num_heads, head_dim)
-        output = _gated_output_norm(
-            output, output_gate, norm_weight, eps, mixed_qkv.dtype
-        )
+        if resolved_kda_glue:
+            output = _pallas_gated_output_norm_2d(
+                out,
+                output_gate,
+                norm_weight,
+                eps,
+                mixed_qkv.dtype,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+        else:
+            output = out.reshape(num_tokens, num_heads, head_dim)
+            output = _gated_output_norm(
+                output, output_gate, norm_weight, eps, mixed_qkv.dtype
+            )
         return output, new_pool
 
     # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
@@ -758,14 +867,20 @@ def _pooled_kda_core(
     # kernel gates their state DMAs to zero size rather than redirecting them
     # to the null slot.
     fused_core = _build_fused_core(lower_bound, eps, num_spec_tokens)
+    beta_for_core = beta[:, :num_heads] if beta.shape[1] > num_heads else beta
+    conv_w_for_core = (
+        conv_weight.astype(mixed_qkv.dtype).reshape(kernel_size, 3, num_heads, head_dim)
+        if conv_weight.ndim == 3
+        else conv_weight
+    )
     output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,
-        beta,
+        beta_for_core,
         output_gate,
         conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
         ssm_buf,
-        conv_weight,
+        conv_w_for_core,
         a_log,
         dt_bias,
         norm_weight,
@@ -850,6 +965,19 @@ def build_kimi_pooled_kda_op(
             raise ValueError("KDA conv source TP must divide num_heads")
         conv_shard_heads = total_heads // source_tp
 
+    kda_glue_active = bool(
+        use_kda_glue()
+        and tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING
+        and conv_shard_heads is None
+        and num_spec_tokens == 0
+    )
+    kda_cond_active = bool(
+        use_kda_cond()
+        and tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING
+        and conv_shard_heads is None
+        and num_spec_tokens == 0
+    )
+
     def pooled_core(
         mixed_qkv: jax.Array,
         raw_gate: jax.Array,
@@ -892,6 +1020,8 @@ def build_kimi_pooled_kda_op(
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
+            kda_glue=kda_glue_active,
+            kda_cond=kda_cond_active,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op
@@ -908,6 +1038,10 @@ def build_kimi_pooled_kda_op(
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.
         op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
+    if kda_glue_active:
+        op_name += "_kdaglue"
+    if kda_cond_active:
+        op_name += "_kdacond"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
 
     def _fake_pooled(
@@ -923,8 +1057,13 @@ def build_kimi_pooled_kda_op(
         *args,
         **kwargs,
     ):
+        out_shape = (
+            (mixed_qkv.size(0), a_log.shape[0] * norm_weight.shape[0])
+            if kda_glue_active
+            else (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0])
+        )
         output = torch.empty(
-            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
+            out_shape,
             dtype=mixed_qkv.dtype,
             device=mixed_qkv.device,
         )

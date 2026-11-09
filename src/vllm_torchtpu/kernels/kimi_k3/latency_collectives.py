@@ -55,6 +55,7 @@ from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
     build_kimi_moe_ep_overlap_op,
     normalize_exit_fold_mode,
 )
+from vllm_torchtpu.kernels.kimi_k3.polish import normalize_compute_polish_mode
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
@@ -118,10 +119,11 @@ def normalize_latency_tp_psum_mode(raw: str | None) -> str:
 
 
 def kimi_o2_variant_tag() -> str:
-    """Return a cache-safe variant tag encoding all active O2/O4 env flags (`D87`)."""
+    """Return a cache-safe variant tag encoding all active O2/O4/O5 env flags (`D87`)."""
     tp_mode = normalize_latency_tp_psum_mode(envs.TPU_KIMI_OPT_LATENCY_TP_PSUM)
     raw_ef = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
     ef_mode = normalize_exit_fold_mode(raw_ef)
+    polish_tag, _ = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
     base = (
         f"o2_m{int(bool(envs.TPU_KIMI_OPT_2D_EP_MESH))}"
         f"_p{int(bool(envs.TPU_KIMI_OPT_PACKED_DP_AG))}"
@@ -130,11 +132,16 @@ def kimi_o2_variant_tag() -> str:
         f"_tp_{tp_mode}"
     )
     if ef_mode == "off":
-        return base
-    raw_ef_tok = _sanitize_tag(raw_ef)
-    if raw_ef_tok == ef_mode:
-        return f"{base}_ef_{ef_mode}"
-    return f"{base}_ef_{ef_mode}_{raw_ef_tok}"
+        tag = base
+    else:
+        raw_ef_tok = _sanitize_tag(raw_ef)
+        if raw_ef_tok == ef_mode:
+            tag = f"{base}_ef_{ef_mode}"
+        else:
+            tag = f"{base}_ef_{ef_mode}_{raw_ef_tok}"
+    if polish_tag == "off":
+        return tag
+    return f"{tag}_cp_{polish_tag}"
 
 
 def _pack_dispatch_metadata(
