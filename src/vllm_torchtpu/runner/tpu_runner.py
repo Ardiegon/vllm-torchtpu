@@ -441,6 +441,30 @@ def _spec_warmup_all_token_ids(
     }
 
 
+def _spec_warmup_num_output_tokens(
+    runner: Any, req_ids: list[str], fallback_counts: list[int]
+) -> list[int]:
+    """Match vLLM V1 Scheduler's CachedRequestData.num_output_tokens contract.
+
+    Under async scheduling, the scheduler sends
+    ``req.num_output_tokens + req.num_output_placeholders``
+    (``len(self.requests[rid].output_token_ids)``). Passing ``[t + 1]`` without
+    the in-flight ``1 + K`` placeholders causes ``GPUModelRunner._update_states``
+    to truncate ``output_token_ids`` and reset ``num_tokens_no_spec`` before
+    ``sample_tokens()._modify_prev_results()`` subtracts ``1 + K``, underflowing
+    ``start_idx`` on short prompts (e.g. ``P = 4, K = 7``).
+    """
+    if not getattr(runner, "use_async_scheduling", False):
+        return list(fallback_counts)
+    reqs = getattr(runner, "requests", None) or {}
+    out: list[int] = []
+    for rid, fb in zip(req_ids, fallback_counts):
+        rs = reqs.get(rid)
+        n_cur = len(rs.output_token_ids) if rs is not None else 0
+        out.append(max(int(fb), n_cur))
+    return out
+
+
 @contextmanager
 def _suspend_kv_transfer_group() -> Iterator[None]:
     """Hide the process-global connector during worker-local warmup."""
@@ -7130,7 +7154,13 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         drafter = self.drafter
         block = int(getattr(drafter, "block_size", K + 1))
-        max_reqs = int(self.max_num_reqs)
+        pad_max_reqs = int(self.max_num_reqs)
+        sched_max_reqs = (
+            int(self.scheduler_config.max_num_seqs)
+            if getattr(self, "scheduler_config", None) is not None
+            else pad_max_reqs
+        )
+        max_reqs = min(pad_max_reqs, sched_max_reqs)
         budget = int(self.max_num_tokens)
         pads = list(self.num_tokens_paddings)
 
@@ -7145,7 +7175,7 @@ class TPUModelRunner(GPUModelRunner):
                 keys.append(
                     (
                         "decode",
-                        _get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                        _get_padded_num_reqs_with_upper_limit(R, pad_max_reqs),
                         tok_bucket(R * (1 + K)),
                         tok_bucket(R * block),
                     )
@@ -7154,7 +7184,7 @@ class TPUModelRunner(GPUModelRunner):
                 keys.append(
                     (
                         "mixed",
-                        _get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                        _get_padded_num_reqs_with_upper_limit(R + 1, pad_max_reqs),
                         tok_bucket(R * (1 + K) + 1),
                         tok_bucket((R + 1) * block),
                     )
@@ -7163,6 +7193,8 @@ class TPUModelRunner(GPUModelRunner):
             if new:
                 seen.update(new)
                 grid.append(R)
+        if max_reqs >= 1 and max_reqs not in grid and budget >= max_reqs * (1 + K):
+            grid.append(max_reqs)
         return grid
 
     def _warmup_spec_batch(
@@ -7188,6 +7220,13 @@ class TPUModelRunner(GPUModelRunner):
 
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
+        sched_max_reqs = (
+            int(self.scheduler_config.max_num_seqs)
+            if getattr(self, "scheduler_config", None) is not None
+            else int(self.max_num_reqs)
+        )
+        if R > sched_max_reqs:
+            return
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
@@ -7257,7 +7296,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=[t + 1] * R,
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self, rids, [t + 1] * R
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -7270,7 +7311,7 @@ class TPUModelRunner(GPUModelRunner):
                 nct = [x + 1 for x in nct]
             if (
                 mixed
-                and self.max_num_reqs >= R + 1
+                and min(int(self.max_num_reqs), sched_max_reqs) >= R + 1
                 and int(self.max_num_tokens) - R * (1 + K) >= P
             ):
                 # Mixed verify+prefill steps at the full step budget: R verify
@@ -7289,7 +7330,10 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 mix_nblk = max(mix_nblks)
                 variants = [[P_mix]]
-                if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
+                if (
+                    min(int(self.max_num_reqs), sched_max_reqs) >= R + 2
+                    and P_mix >= 2 * P
+                ):
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk
@@ -7322,7 +7366,9 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=[n_decode + 1 + vi] * R,
+                        num_output_tokens=_spec_warmup_num_output_tokens(
+                            self, rids, [n_decode + 1 + vi] * R
+                        ),
                     )
                     so = SchedulerOutput.make_empty()
                     so.scheduled_new_reqs = extras
@@ -7427,7 +7473,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=[t + 1],
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self, [rid], [t + 1]
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq

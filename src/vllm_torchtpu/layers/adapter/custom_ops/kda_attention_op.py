@@ -1431,7 +1431,8 @@ def kimi_pooled_kda_commit(
         kernel_size=kernel_size,
     )
     num_reqs = state_indices.shape[0]
-    active_reqs = max(1, min(num_reqs, cache_qkv.shape[0]))
+    window = max(1, num_spec_tokens + 1)
+    active_reqs = max(1, min(num_reqs, cache_qkv.shape[0] // window))
     if active_reqs < num_reqs:
         state_indices = state_indices[:active_reqs]
         seq_lens = seq_lens[:active_reqs]
