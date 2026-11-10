@@ -516,6 +516,24 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
     def _unit(self) -> int:
         return self.region.nblocks
 
+    def _num_written(self, p_id, idx):
+        """Checkpoints copy_out writes for row `idx` of tile `p_id`.
+
+        `state_write == "all"` writes one per valid window position (`r_size`
+        never exceeds `window_size` for windowed sequences; the clamp is for
+        PER_SEQ tiles, which hold many tokens but keep only the final state).
+        `"none"` writes nothing and `"last"` writes the single window
+        position `window_size - 1` of every non-empty row.
+        """
+        is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+        r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+        if self.cfg.state_write == "none":
+            return jnp.int32(0)
+        if self.cfg.state_write == "last":
+            return jnp.where(jnp.logical_and(is_last_tile, r_size > 0), 1, 0)
+        num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+        return jnp.where(is_last_tile, num_ckpts, 0)
+
     def _copy_out_compact(self, grid_indices: tuple[int | jax.Array]):
         """PCP fused kernel: one compact update per sequence.
 
@@ -548,6 +566,8 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         if self.compact_output_ref is not None:
             return self._copy_out_compact(grid_indices)
+        if self.cfg.state_write != "all":
+            return self._copy_out_masked_commit(dst_ref, grid_indices)
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
@@ -583,6 +603,17 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
+        if self.cfg.state_write != "all":
+            if self.cfg.state_write == "none":
+                # Side-effect-free verify: copy_out issued no DMA at all.
+                return
+            dma_size = 0
+            for idx in range(self.cfg.seq_tile_size):
+                dma_size += self._num_written(p_id, idx)
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            return
+
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
@@ -596,6 +627,38 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         # ExternalStateInBufferedRef.wait_in).
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+    def _copy_out_masked_commit(
+        self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]
+    ):
+        """copy_out for `state_write` "none" (verify) and "last" (commit).
+
+        "none" issues no DMA: the external source keeps its committed bytes.
+        "last" writes window position `window_size - 1` — the state after the
+        row's last real token, since masked tail tokens are exact no-ops —
+        to the sequence's own state block (checkpoint 0).
+        """
+        if self.cfg.state_write == "none":
+            return
+        assert self.cfg.state_write == "last", self.cfg.state_write
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        p_id = grid_indices[0]
+        last = self.cfg.window_size - 1
+
+        for idx in range(self.cfg.seq_tile_size):
+            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            should_write = self._num_written(p_id, idx) > 0
+            nblocks = jnp.where(should_write, self.region.nblocks, 0)
+            state_idx = self._ckpt_state_idx(s_idx, 0)
+            pltpu.make_async_copy(
+                vmem_ref.at[idx, last, pl.ds(0, nblocks)],
+                self._region_slice(dst_ref, state_idx, nblocks),
+                sem,
+            ).start()
 
 
 def create_allocs(

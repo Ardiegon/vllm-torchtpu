@@ -52,8 +52,10 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cw_f32, use_kda_glue
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_kda_o6a
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
+    build_kimi_pooled_kda_o6a_ops,
     build_kimi_pooled_kda_op,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
@@ -618,6 +620,39 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
         )
+        # Kimi K3 Cycle 3 Phase O6a (`TPU_KIMI_OPT_SPEC_KDA="o6a"`, K > 0):
+        # the unified-pool KDA runs a side-effect-free W = 1 + K verify that
+        # caches its kernel inputs, and the runner commits each request's
+        # accepted prefix after rejection sampling (`commit_spec`). The
+        # caches hold the leading `max_num_seqs * W` token rows, which cover
+        # every windowed row ([decode][verify][prefill] batch order).
+        self.spec_kda_o6a = use_spec_kda_o6a(self.num_spec_tokens)
+        self.pooled_kda_verify_op = None
+        self.pooled_kda_commit_op = None
+        if self.spec_kda_o6a:
+            self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
+                build_kimi_pooled_kda_o6a_ops(
+                    prefix,
+                    lower_bound=self.gate_lower_bound,
+                    eps=config.rms_norm_eps,
+                    vllm_config=vllm_config,
+                    num_spec_tokens=self.num_spec_tokens,
+                )
+            )
+            cache_rows = vllm_config.scheduler_config.max_num_seqs * (
+                self.num_spec_tokens + 1
+            )
+            act_dtype = vllm_config.model_config.dtype
+            for name, width in (
+                ("o6a_cache_qkv", 3 * self.local_projection_size),
+                ("o6a_cache_gate", self.local_projection_size),
+                ("o6a_cache_beta", self.num_heads),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.zeros(cache_rows, width, dtype=act_dtype),
+                    persistent=False,
+                )
 
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -911,6 +946,32 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             if (self._kda_glue_enabled and self.conv_weight_f32 is not None)
             else self.conv_weight_fused
         )
+        if self.spec_kda_o6a:
+            assert self.pooled_kda_verify_op is not None
+            return self.pooled_kda_verify_op(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                pool,
+                conv_weight,
+                self.A_log,
+                self.dt_bias,
+                self.o_norm.weight,
+                cast(torch.Tensor, metadata.query_start_loc),
+                cast(torch.Tensor, state_indices),
+                cast(torch.Tensor, metadata.seq_lens),
+                cast(torch.Tensor, metadata.request_distribution),
+                cast(
+                    torch.Tensor,
+                    window_distribution
+                    if window_distribution is not None
+                    else metadata.request_distribution,
+                ),
+                cast(torch.Tensor, self.o6a_cache_qkv),
+                cast(torch.Tensor, self.o6a_cache_gate),
+                cast(torch.Tensor, self.o6a_cache_beta),
+            )
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
@@ -928,4 +989,39 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             window_distribution,
             slot_read_offsets,
             ckpt_indices,
+        )
+
+    def commit_spec(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_distribution: torch.Tensor,
+        accepted_lens: torch.Tensor,
+    ) -> None:
+        """Phase O6a: commit each windowed request's accepted verify prefix.
+
+        The metadata tensors are this layer's (mamba group's) attention
+        metadata of the verify step; `accepted_lens[r]` is the number of
+        window tokens of batch row `r` whose inputs became context
+        (`num_accepted_drafts + 1`; the whole window on non-verify steps).
+        Advances the KDA conv + recurrent state in the unified pool exactly
+        as that many sequential 1-token decode steps would.
+        """
+        assert self.spec_kda_o6a and self.pooled_kda_commit_op is not None
+        if self.kv_cache is None or len(self.kv_cache) != 1:
+            raise RuntimeError("O6a KDA commit requires the unified KV pool")
+        self.pooled_kda_commit_op(
+            self.kv_cache[0],
+            self.o6a_cache_qkv,
+            self.o6a_cache_gate,
+            self.o6a_cache_beta,
+            self.conv_weight_fused,
+            self.A_log,
+            self.dt_bias,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            window_distribution,
+            accepted_lens,
         )

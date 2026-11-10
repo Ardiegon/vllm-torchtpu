@@ -56,6 +56,7 @@ from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
     normalize_exit_fold_mode,
 )
 from vllm_torchtpu.kernels.kimi_k3.polish import normalize_compute_polish_mode
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import normalize_spec_kda_mode
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
@@ -124,6 +125,7 @@ def kimi_o2_variant_tag() -> str:
     raw_ef = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
     ef_mode = normalize_exit_fold_mode(raw_ef)
     polish_tag, _ = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
+    spec_kda = normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA)
     base = (
         f"o2_m{int(bool(envs.TPU_KIMI_OPT_2D_EP_MESH))}"
         f"_p{int(bool(envs.TPU_KIMI_OPT_PACKED_DP_AG))}"
@@ -139,9 +141,11 @@ def kimi_o2_variant_tag() -> str:
             tag = f"{base}_ef_{ef_mode}"
         else:
             tag = f"{base}_ef_{ef_mode}_{raw_ef_tok}"
-    if polish_tag == "off":
-        return tag
-    return f"{tag}_cp_{polish_tag}"
+    if polish_tag != "off":
+        tag = f"{tag}_cp_{polish_tag}"
+    if spec_kda != "off":
+        tag = f"{tag}_sk_{spec_kda}"
+    return tag
 
 
 def _pack_dispatch_metadata(

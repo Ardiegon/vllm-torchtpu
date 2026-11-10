@@ -24,6 +24,8 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -60,11 +62,20 @@ class SpecDecodeMetadata:
     # uploads this only for a chunk with nothing substituted.
     deferred_draft_token_ids_cpu: np.ndarray | None = None
 
-    def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
+    def upload_deferred_draft_token_ids(
+        self,
+        device: torch.device,
+        upload: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Upload the deferred host drafts. `upload` (the runner's
+        `_upload_host_temporary`) keeps the host buffer alive until the
+        transfer is fenced (B1-F); without it the metadata object's own
+        reference is the only keepalive."""
         assert self.deferred_draft_token_ids_cpu is not None
-        return torch.from_numpy(self.deferred_draft_token_ids_cpu).to(
-            device, non_blocking=True
-        )
+        host = torch.from_numpy(self.deferred_draft_token_ids_cpu)
+        if upload is not None:
+            return upload(host)
+        return host.to(device, non_blocking=True)
 
 
 class SpeculativeDecodingManager:
@@ -308,8 +319,8 @@ class SpeculativeDecodingManager:
                 draft_token_ids=(
                     None
                     if defer_draft_token_ids
-                    else torch.from_numpy(padded_draft_token_ids).to(
-                        self.runner.device, non_blocking=True
+                    else self.runner._upload_host_temporary(
+                        torch.from_numpy(padded_draft_token_ids)
                     )
                 ),
                 draft_lengths=self._meta_cache.draft_lengths,
@@ -411,36 +422,26 @@ class SpeculativeDecodingManager:
         padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
-        # CPU -> TPU copy.
-        device = self.runner.device
+        # CPU -> TPU copy. Every source is a local temporary, so each upload
+        # goes through the runner's fenced keepalive (B1-F, same bug class
+        # as B1's `logits_indices`).
+        upload = self.runner._upload_host_temporary
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=(
                 None
                 if defer_draft_token_ids
-                else torch.from_numpy(padded_draft_token_ids).to(
-                    device, non_blocking=True
-                )
+                else upload(torch.from_numpy(padded_draft_token_ids))
             ),
-            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
-                device, non_blocking=True
-            ),
+            draft_lengths=upload(torch.from_numpy(padded_num_draft_tokens)),
             draft_lengths_cpu=num_draft_tokens,
-            target_logits_indices=torch.from_numpy(padded_target_logits_indices).to(
-                device, non_blocking=True
+            target_logits_indices=upload(
+                torch.from_numpy(padded_target_logits_indices)
             ),
-            bonus_logits_indices=torch.from_numpy(padded_bonus_logits_indices).to(
-                device, non_blocking=True
-            ),
-            final_logits_indices=torch.from_numpy(padded_logits_indices).to(
-                device, non_blocking=True
-            ),
-            segment_ids=torch.from_numpy(padded_segment_ids).to(
-                device, non_blocking=True
-            ),
-            group_indices=torch.from_numpy(padded_group_indices).to(
-                device, non_blocking=True
-            ),
+            bonus_logits_indices=upload(torch.from_numpy(padded_bonus_logits_indices)),
+            final_logits_indices=upload(torch.from_numpy(padded_logits_indices)),
+            segment_ids=upload(torch.from_numpy(padded_segment_ids)),
+            group_indices=upload(torch.from_numpy(padded_group_indices)),
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),

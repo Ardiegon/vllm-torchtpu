@@ -216,6 +216,13 @@ class ExecuteModelState:
     # logits_list holds the greedy tokens ([rows, 1]), not logits
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
+    # Kimi K3 Phase O6a (`TPU_KIMI_OPT_SPEC_KDA`): per chunk, the attention
+    # metadata dict of the verify forward, so sample_tokens can commit each
+    # request's accepted KDA prefix once rejection sampling is done. None
+    # entries when O6a is inactive.
+    kda_commit_metadata_list: list[dict[str, Any] | None] = field(
+        default_factory=list
+    )
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -252,6 +259,25 @@ def _rollback_offsets_migrate_impl(
     read_offsets: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
 ) -> None:
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
+
+
+def _o6a_kda_commit_impl(
+    layers: tuple[Any, ...],
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    window_distribution: torch.Tensor,
+    state_indices: list[torch.Tensor],
+    accepted_lens: torch.Tensor,
+) -> None:
+    """Kimi K3 Phase O6a: masked KDA commit of every layer in one program."""
+    for layer, layer_state_indices in zip(layers, state_indices):
+        layer.commit_spec(
+            query_start_loc,
+            layer_state_indices,
+            seq_lens,
+            window_distribution,
+            accepted_lens,
+        )
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1994,8 +2020,8 @@ class TPUModelRunner(GPUModelRunner):
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
                 src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
-                dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
-                    self.device, non_blocking=True
+                dst_t = self._upload_host_temporary(
+                    torch.tensor(dsts_g, dtype=torch.int32)
                 )
                 src_t, dst_t = self._expand_pool_split(src_t, dst_t)
                 key = tuple(id(raw) for raw in raws)
@@ -2019,8 +2045,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
-            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = self._upload_host_temporary(
+                torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long)
             )
             assert self.mamba_slot_read_offsets is not None
             _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
@@ -2030,11 +2056,11 @@ class TPUModelRunner(GPUModelRunner):
             # forward that reads the buffer). Padding with (0, 0) null-block
             # self-copies keeps the shapes on the seed-copy bucket ladder.
             offset_pairs = self._pad_to_bucket(offset_pairs, pad=(0, 0))
-            src_t = torch.tensor([s for s, _ in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            src_t = self._upload_host_temporary(
+                torch.tensor([s for s, _ in offset_pairs], dtype=torch.long)
             )
-            dst_t = torch.tensor([d for _, d in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = self._upload_host_temporary(
+                torch.tensor([d for _, d in offset_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
 
@@ -2114,11 +2140,11 @@ class TPUModelRunner(GPUModelRunner):
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = torch.tensor(state_srcs, dtype=torch.long).to(
-            self.device, non_blocking=True
+        state_t = self._upload_host_temporary(
+            torch.tensor(state_srcs, dtype=torch.long)
         )
-        ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
-            self.device, non_blocking=True
+        ckpt_t = self._upload_host_temporary(
+            torch.tensor(ckpt_rows, dtype=torch.int32)
         )
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
@@ -2126,8 +2152,8 @@ class TPUModelRunner(GPUModelRunner):
         # The first-forward reset clears the destination, after this source
         # selection, so ignore that stale offset here without mutating the
         # source block (which may be shared). Live requests retain their offset.
-        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
-            self.device, non_blocking=True
+        new_owner_t = self._upload_host_temporary(
+            torch.tensor(new_owners, dtype=torch.bool)
         )
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
@@ -2173,11 +2199,11 @@ class TPUModelRunner(GPUModelRunner):
                 for block_copy in copies
             ]
             mgr_pairs = self._pad_to_bucket(mgr_pairs, pad=(0, 0))
-            mgr_src_t = torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            mgr_src_t = self._upload_host_temporary(
+                torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long)
             )
-            mgr_dst_t = torch.tensor([d for _, d in mgr_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            mgr_dst_t = self._upload_host_temporary(
+                torch.tensor([d for _, d in mgr_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(read_offsets, mgr_src_t, mgr_dst_t)
 
@@ -3832,6 +3858,15 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
+        kda_commit_metadata_list: list[dict[str, Any] | None] = []
+        o6a_layers = self._o6a_kda_layers()
+        if o6a_layers and target_num_chunks > 1:
+            # Every chunk's verify refreshes the same per-layer input caches,
+            # so only the last chunk could be committed. Fail closed.
+            raise NotImplementedError(
+                "TPU_KIMI_OPT_SPEC_KDA=o6a supports single-chunk steps only "
+                f"(got {target_num_chunks} forward chunks)"
+            )
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
@@ -3907,7 +3942,9 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 # Nothing substituted this chunk, so the host drafts are real.
                 spec_decode_metadata.draft_token_ids = (
-                    spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
+                    spec_decode_metadata.upload_deferred_draft_token_ids(
+                        self.device, upload=self._upload_host_temporary
+                    )
                 )
             draft_input_ids_src = input_ids
 
@@ -4085,6 +4122,7 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
+            kda_commit_metadata_list.append(attn_metadata if o6a_layers else None)
             ctx = self._attn_metadata_builder_ctx
             if self.mamba_slot_read_offsets is None:
                 # No mamba layers, or no spec decoding: nothing to roll back.
@@ -4139,6 +4177,7 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
+            kda_commit_metadata_list=kda_commit_metadata_list,
         )
 
         if self.is_pooling_model:
@@ -4306,6 +4345,70 @@ class TPUModelRunner(GPUModelRunner):
             all_indices = torch.cat(indices_per_group, dim=0).long()
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
+
+    def _o6a_kda_layers(self) -> tuple[Any, ...]:
+        """KDA layers running the Phase O6a verify + masked commit (cached)."""
+        layers = getattr(self, "_o6a_kda_layers_cache", None)
+        if layers is None:
+            context = self.vllm_config.compilation_config.static_forward_context
+            layers = tuple(
+                module
+                for _, module in sorted(context.items())
+                if getattr(module, "spec_kda_o6a", False)
+            )
+            self._o6a_kda_layers_cache = layers
+            if layers:
+                self._o6a_kda_commit_fn = _tpu_compile(
+                    functools.partial(_o6a_kda_commit_impl, layers)
+                )
+        return layers
+
+    @torch.no_grad()
+    def _commit_kda_spec(
+        self,
+        attn_metadata: dict[str, Any],
+        next_tokens: torch.Tensor | None,
+        num_reqs: int,
+    ) -> None:
+        """Kimi K3 Phase O6a: commit this chunk's accepted KDA prefixes.
+
+        `next_tokens` is the rejection sampler's [rows, 1 + K] output (None
+        for a chunk without drafts, whose windows are committed in full).
+        Each batch row's accepted length is its number of valid tokens --
+        accepted drafts + bonus -- i.e. the window tokens whose inputs became
+        context; padded rows commit nothing.
+        """
+        layers = self._o6a_kda_layers()
+        if not layers:
+            return
+        first = attn_metadata[layers[0].prefix]
+        width = int(first.mamba_state_indices.shape[0])
+        window = layers[0].num_spec_tokens + 1
+        if next_tokens is None:
+            accepted = torch.full(
+                (width,), window, dtype=torch.int32, device=self.device
+            )
+        else:
+            rows = min(width, int(next_tokens.shape[0]))
+            num_valid = (next_tokens[:rows] != INVALID_TOKEN_ID).sum(dim=1)
+            accepted = torch.zeros((width,), dtype=torch.int32, device=self.device)
+            accepted[:rows] = num_valid.to(torch.int32)
+        if num_reqs < width:
+            accepted[num_reqs:] = 0
+        window_distribution = first.mamba_request_distribution
+        if window_distribution is None:
+            window_distribution = first.request_distribution
+        state_indices = [
+            attn_metadata[layer.prefix].mamba_state_indices for layer in layers
+        ]
+        with self._stage_timing.stage("o6a_kda_commit"):
+            self._o6a_kda_commit_fn(
+                first.query_start_loc,
+                first.seq_lens,
+                window_distribution,
+                state_indices,
+                accepted,
+            )
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -4628,6 +4731,9 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
+        kda_md_list = state.kda_commit_metadata_list or [None] * len(
+            state.logits_list
+        )
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -4639,11 +4745,12 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices in zip(
+            for logits, num_reqs, md, mamba_indices, kda_md in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
+                kda_md_list,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -4662,9 +4769,17 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
+                    if kda_md is not None:
+                        # O6a: commit the accepted prefix; the committed state
+                        # is always checkpoint 0, so the read offsets stay 0.
+                        self._commit_kda_spec(kda_md, next_tokens, num_reqs)
+                        self._update_mamba_slot_read_offsets(
+                            mamba_indices, None, num_reqs
+                        )
+                    else:
+                        self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -4744,6 +4859,8 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     # Non-verify chunk in a spec step: reset the read offsets
                     # (the latest state checkpoint is at the group base).
+                    if kda_md is not None:
+                        self._commit_kda_spec(kda_md, None, num_reqs)
                     self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
@@ -4753,10 +4870,14 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, mamba_indices in zip(
-                state.logits_list, state.num_reqs_list, mamba_idx_list
+            for logits, num_reqs, mamba_indices, kda_md in zip(
+                state.logits_list, state.num_reqs_list, mamba_idx_list, kda_md_list
             ):
                 cur_end_idx = cur_start_idx + num_reqs
+                # O6a: a step without drafts still ran the side-effect-free
+                # verify over its 1-token windows; commit them in full.
+                if kda_md is not None:
+                    self._commit_kda_spec(kda_md, None, num_reqs)
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)

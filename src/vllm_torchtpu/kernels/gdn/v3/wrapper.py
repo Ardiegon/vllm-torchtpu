@@ -36,6 +36,20 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _stored_window_positions(cfg: config.GDNConfig) -> range:
+    """Window positions whose checkpoint the kernel encodes for copy_out.
+
+    Mirrors `ExternalStateOutBufferedRef`: every position under the default
+    `state_write="all"`, none for a side-effect-free verify, and only the
+    final position for a masked commit.
+    """
+    if cfg.state_write == "none":
+        return range(0)
+    if cfg.state_write == "last":
+        return range(cfg.window_size - 1, cfg.window_size)
+    return range(cfg.window_size)
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
@@ -128,7 +142,7 @@ def inner_kernel(
         # through the region's typed view; copy_out pushes the raw bytes
         # of the valid checkpoints back to the source.
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in _stored_window_positions(cfg):
                 args = (
                     conv_state_out_slot_ref.at[idx, t],
                     cfg.state_plan.conv,
@@ -225,7 +239,7 @@ def inner_kernel(
         )
     else:
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in _stored_window_positions(cfg):
                 args = (
                     recurrent_out_slot_ref.at[idx, t],
                     cfg.state_plan.recurrent,
@@ -366,6 +380,7 @@ def outer_kernel(
         "gate_lower_bound",
         "conv_weight_is_kernel_layout",
         "skip_empty_per_seq",
+        "batched_state_write",
     ),
 )
 def fused_conv1d_gdn(
@@ -404,6 +419,8 @@ def fused_conv1d_gdn(
     mixed_tile_size: int = 64,
     conv_weight_is_kernel_layout: bool = False,
     skip_empty_per_seq: bool = False,
+    batched_state_write: str = "all",
+    window_lens: jax.Array | None = None,  # [num_seqs]
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -476,6 +493,14 @@ def fused_conv1d_gdn(
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        batched_state_write: Which BATCHED-segment window checkpoints are
+            written back to `state_source` (see `GDNConfig.state_write`):
+            "all" (default), "none" (Kimi K3 O6a side-effect-free verify) or
+            "last" (O6a masked commit of each row's first `window_lens[s]`
+            tokens into its own state block). PER_SEQ always writes its
+            single final state. Pooled path only.
+        window_lens: Optional [num_seqs] int32 BATCHED-segment real sizes
+            (`<=` the query lengths) for the O6a masked commit.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -491,12 +516,18 @@ def fused_conv1d_gdn(
         assert state_source is not None
         # Checkpoints are individually addressable source blocks; without
         # the index array they would all alias onto the slot's own block.
-        assert num_spec_tokens == 0 or ckpt_indices is not None, (
-            "num_spec_tokens > 0 requires ckpt_indices"
-        )
+        # O6a verify/commit address only the slot's own state block.
+        assert (
+            num_spec_tokens == 0
+            or ckpt_indices is not None
+            or batched_state_write != "all"
+        ), "num_spec_tokens > 0 requires ckpt_indices"
     else:
         assert state_source is None
         assert conv_state is not None and recurrent_state is not None
+        assert batched_state_write == "all", (
+            "batched_state_write requires an external state source"
+        )
         conv_out_dtype = conv_state.dtype
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
@@ -703,6 +734,9 @@ def fused_conv1d_gdn(
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),
             state_plan=state_plan,
+            state_write=(
+                "all" if mode == config.GDNMode.PER_SEQ else batched_state_write
+            ),
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -716,6 +750,7 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
+                window_lens=window_lens,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -785,6 +820,10 @@ def fused_conv1d_gdn(
 
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
+    if batched_state_write not in ("all", "none", "last"):
+        raise ValueError(f"Invalid batched_state_write={batched_state_write!r}")
+    if window_lens is not None and batched_state_write != "last":
+        raise ValueError("window_lens is only meaningful for a masked commit")
 
     if pooled:
         out_act, out_source = None, state_source

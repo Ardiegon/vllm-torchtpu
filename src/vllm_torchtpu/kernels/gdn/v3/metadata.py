@@ -27,6 +27,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    window_lens: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -35,6 +36,11 @@ def compute_batched_seq_metadata(
     `cfg.window_size` of them. The initial state is read from
     `state_indices[s] + read_offsets[s]` and one state checkpoint per window
     position is written back to `state_indices[s] + t`.
+
+    `window_lens` (Kimi K3 O6a masked commit) overrides each row's real size
+    (`<=` its query length) while keeping the row's token base and its
+    `has_initial_state` from the verify step's query layout: rows past
+    `window_lens[s]` become masked no-op tokens.
     """
 
     max_seqs = seq_lens.size
@@ -48,12 +54,16 @@ def compute_batched_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
 
+    real_lens = query_lens
+    if window_lens is not None:
+        real_lens = jnp.clip(window_lens.astype(query_lens.dtype), 0, query_lens)
+
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
         num_tiles=pl.cdiv(end_seq, cfg.tile_size),
         p_id_to_s_idx=all_valid_seqs,
         p_id_to_r_base=query_start_loc[all_valid_seqs],
-        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens, 0),
+        p_id_to_r_size=jnp.where(is_valid_seqs, real_lens, 0),
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,

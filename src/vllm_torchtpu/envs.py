@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     TPU_KIMI_OPT_XLA_OVERLAP: str = "off"
     TPU_KIMI_OPT_SC_OFFLOAD: str = "off"
     TPU_KIMI_OPT_EXIT_FOLD: str = "off"
+    TPU_KIMI_OPT_SPEC_KDA: str = "off"
 
 
 def env_with_choices(
@@ -1226,6 +1227,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_COMPUTE_POLISH": lambda: (
         os.getenv("TPU_KIMI_OPT_COMPUTE_POLISH", "off").strip() or "off"
     ),
+    # Kimi K3 Cycle 3 Phase O6a speculative-decode KDA mode ("off"/"0" default
+    # keeps every pre-O6a KDA op byte-identical; "o6a" or "c3"/"auto"/"1"
+    # selects the side-effect-free W = 1 + num_speculative_tokens KDA verify
+    # (direct StateSourcePlan pool streaming, no checkpoint blocks) plus the
+    # post-rejection masked commit of each request's accepted prefix). Only
+    # takes effect when speculative decoding is configured.
+    # Canonicalized here so aliases share one Tier-1 compile-hash factor;
+    # env_override validates the value (fails closed) at import.
+    "TPU_KIMI_OPT_SPEC_KDA": lambda: (
+        lambda v: "off"
+        if v in ("", "0", "false", "no", "off", "none")
+        else ("o6a" if v in ("o6a", "c3", "auto", "1", "true", "yes") else v)
+    )(os.getenv("TPU_KIMI_OPT_SPEC_KDA", "off").strip().lower()),
 }
 
 

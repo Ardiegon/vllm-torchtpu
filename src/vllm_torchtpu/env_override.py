@@ -487,6 +487,32 @@ def _normalize_kimi_o5_compute_polish_env(
     return "_".join(sorted(frozen)), frozen
 
 
+_KIMI_O6_SPEC_KDA_OFF_TOKENS: frozenset[str] = frozenset(
+    {"", "0", "false", "no", "off", "none"}
+)
+
+
+def _normalize_kimi_o6_spec_kda_env(raw: str | None = None) -> str:
+    """Normalize ``TPU_KIMI_OPT_SPEC_KDA`` (Kimi K3 Cycle 3 Phase O6a).
+
+    ``"off"`` (default) keeps the pre-O6a KDA ops byte-identical; ``"o6a"``
+    (aliases ``"c3"``/``"auto"``/``"1"``/``"true"``/``"yes"``) selects the
+    side-effect-free multi-token KDA verify + masked commit when speculative
+    decoding is configured. Anything else fails closed.
+    """
+    if raw is None:
+        raw = os.environ.get("TPU_KIMI_OPT_SPEC_KDA", "off")
+    val = (raw or "off").strip().lower()
+    if val in _KIMI_O6_SPEC_KDA_OFF_TOKENS:
+        return "off"
+    if val in ("o6a", "c3", "auto", "1", "true", "yes"):
+        return "o6a"
+    raise ValueError(
+        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off' or "
+        "'o6a' (aliases 'c3'/'auto'/'1')."
+    )
+
+
 _kimi_o4_exit_fold_mode = _normalize_kimi_o4_exit_fold_env(
     os.environ.get("TPU_KIMI_OPT_EXIT_FOLD")
 )
@@ -498,8 +524,29 @@ _kimi_o4_t2_impl_salt = (
 _kimi_o5_polish_tag, _ = _normalize_kimi_o5_compute_polish_env(
     os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH")
 )
+_kimi_o6_spec_kda_mode = _normalize_kimi_o6_spec_kda_env(
+    os.environ.get("TPU_KIMI_OPT_SPEC_KDA")
+)
 
-if _kimi_o5_polish_tag != "off" and not _existing_tier2_cache:
+if _kimi_o6_spec_kda_mode != "off" and not _existing_tier2_cache:
+    # O6a stacks on the Cycle-2b flags: fold every active O3/O4/O5 factor
+    # into the digest so no sweep combination can share a namespace.
+    _o6_t2_digest = hashlib.sha256(
+        (
+            os.environ.get("LIBTPU_INIT_ARGS", "")
+            + "|exit_fold="
+            + _kimi_o4_exit_fold_mode
+            + _kimi_o4_t2_impl_salt
+            + "|polish="
+            + _kimi_o5_polish_tag
+            + "|spec_kda="
+            + _kimi_o6_spec_kda_mode
+        ).encode()
+    ).hexdigest()[:8]
+    _o6_t2_name = f"tpu_tier2_o6_{_kimi_o6_spec_kda_mode}_{_o6_t2_digest}"
+    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = _o6_t2_name
+    os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _o6_t2_name
+elif _kimi_o5_polish_tag != "off" and not _existing_tier2_cache:
     _o5_t2_digest = hashlib.sha256(
         (
             os.environ.get("LIBTPU_INIT_ARGS", "")
