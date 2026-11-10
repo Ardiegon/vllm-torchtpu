@@ -493,12 +493,14 @@ _KIMI_O6_SPEC_KDA_OFF_TOKENS: frozenset[str] = frozenset(
 
 
 def _normalize_kimi_o6_spec_kda_env(raw: str | None = None) -> str:
-    """Normalize ``TPU_KIMI_OPT_SPEC_KDA`` (Kimi K3 Cycle 3 Phase O6a).
+    """Normalize ``TPU_KIMI_OPT_SPEC_KDA`` (Kimi K3 Cycle 3 Phases O6a/O6b).
 
     ``"off"`` (default) keeps the pre-O6a KDA ops byte-identical; ``"o6a"``
     (aliases ``"c3"``/``"auto"``/``"1"``/``"true"``/``"yes"``) selects the
     side-effect-free multi-token KDA verify + masked commit when speculative
-    decoding is configured. Anything else fails closed.
+    decoding is configured. ``"o6b"`` is a superset of ``"o6a"`` that also
+    enables the multi-tray fused verify MoE (up to 256 tokens) and the
+    TP-sharded DSpark context projections. Anything else fails closed.
     """
     if raw is None:
         raw = os.environ.get("TPU_KIMI_OPT_SPEC_KDA", "off")
@@ -507,9 +509,13 @@ def _normalize_kimi_o6_spec_kda_env(raw: str | None = None) -> str:
         return "off"
     if val in ("o6a", "c3", "auto", "1", "true", "yes"):
         return "o6a"
+    if val == "o6b":
+        # Phase O6b: O6a KDA verify/commit + multi-tray fused verify MoE
+        # (<= 256 tokens) + TP-sharded DSpark context projections.
+        return "o6b"
     raise ValueError(
-        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off' or "
-        "'o6a' (aliases 'c3'/'auto'/'1')."
+        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off', "
+        "'o6a' (aliases 'c3'/'auto'/'1') or 'o6b'."
     )
 
 

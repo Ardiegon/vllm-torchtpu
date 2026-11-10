@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import cast
 
 import torch
@@ -324,6 +325,7 @@ class MultiHeadLatentAttention(nn.Module):
             reduce_results=False,
         )
         rotary_emb = None
+        softmax_scale = qk_head_dim**-0.5
         if use_rope:
             rope_parameters = dict(
                 getattr(config, "rope_parameters", None)
@@ -338,6 +340,19 @@ class MultiHeadLatentAttention(nn.Module):
                     if rope_parameters.get("apply_yarn_scaling", True)
                     else "deepseek_llama_scaling"
                 )
+            if rope_parameters["rope_type"] == "deepseek_yarn":
+                # DeepSeek-style YaRN also rescales the attention logits by
+                # mscale(factor, mscale_all_dim)^2 (upstream vLLM K3 MLA and
+                # DeepseekV2 do the same); the Inferact K3 DSpark draft uses
+                # factor 32, mscale_all_dim 1 -> scale *= 1.3466^2.
+                factor = float(rope_parameters["factor"])
+                mscale_all_dim = float(rope_parameters.get("mscale_all_dim", 0) or 0)
+                mscale = (
+                    1.0
+                    if factor <= 1
+                    else 0.1 * mscale_all_dim * math.log(factor) + 1.0
+                )
+                softmax_scale *= mscale * mscale
             rotary_emb = get_rope(
                 self.qk_rope_head_dim,
                 max_position=config.max_position_embeddings,
@@ -345,6 +360,16 @@ class MultiHeadLatentAttention(nn.Module):
                 is_neox_style=False,
                 dtype=torch.float32,
             )
+            # YaRN builds the cos/sin table for original_max * factor (1 M
+            # positions for the K3 DSpark draft, 256 MiB f32) and every call
+            # re-formats the whole table on the SparseCore (~0.35 ms per
+            # draft program on v6e). Positions never exceed the served model
+            # length (+ the draft block), so keep only those rows; each row
+            # depends on its position alone, so the values are unchanged.
+            max_rows = int(vllm_config.model_config.max_model_len) + 128
+            cache = getattr(rotary_emb, "cos_sin_cache", None)
+            if isinstance(cache, torch.Tensor) and cache.shape[0] > max_rows:
+                rotary_emb.cos_sin_cache = cache[:max_rows].contiguous()
 
         self.prefill_group = (
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
@@ -367,7 +392,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
-            qk_head_dim**-0.5,
+            softmax_scale,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,

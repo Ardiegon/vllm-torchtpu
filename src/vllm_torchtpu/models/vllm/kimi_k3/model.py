@@ -255,6 +255,13 @@ class KimiModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        tap_mode = envs.TPU_KIMI_DSPARK_TAP
+        if tap_mode not in ("prefix", "attn_res"):
+            raise ValueError(
+                f"Invalid TPU_KIMI_DSPARK_TAP={tap_mode!r}; expected 'prefix' "
+                "or 'attn_res'."
+            )
+        self.aux_tap_mode = tap_mode
         self._ep_2d_canary_op = None
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
@@ -265,6 +272,29 @@ class KimiModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def _aux_tap(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        block_residuals: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Drafter tap after ``layer_idx`` (``TPU_KIMI_DSPARK_TAP``).
+
+        ``"prefix"``: the AttnRes partial block sum (``prefix_sum + mlp_out``),
+        upstream vLLM's default capture. ``"attn_res"``: the pre-norm AttnRes
+        mixture the next consumer computes from it (next layer's
+        ``self_attention_res``, or ``output_attn_res`` after the last layer),
+        i.e. upstream ``VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1``.
+        """
+        if block_residuals is None or self.aux_tap_mode != "attn_res":
+            return hidden_states
+        if layer_idx + 1 < len(self.layers):
+            consumer = cast(KimiDecoderLayer, self.layers[layer_idx + 1])
+            return consumer.self_attention_res(
+                hidden_states, block_residuals, blocks_first=True
+            )
+        return self.output_attn_res(hidden_states, block_residuals, blocks_first=True)
 
     def forward(
         self,
@@ -310,7 +340,9 @@ class KimiModel(nn.Module):
                 sequence_parallel=sequence_parallel,
             )
             if layer_idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states)
+                aux_hidden_states.append(
+                    self._aux_tap(layer_idx, hidden_states, block_residuals)
+                )
 
         if block_residuals is not None:
             hidden_states = self.output_attn_res(

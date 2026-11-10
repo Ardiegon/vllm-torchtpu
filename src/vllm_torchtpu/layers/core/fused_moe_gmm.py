@@ -24,8 +24,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.kimi_k3.polish import active_trays_mode, use_copy_opt
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    FUSED_DECODE_MOE_MAX_TOKENS,
+    FUSED_VERIFY_MOE_MAX_TOKENS,
     can_use_fused_decode_moe_v6e_planar_t_b11,
     fused_decode_moe_v6e_planar_t_b11,
     moe_gmm_v6e_planar_t_b11,
@@ -622,7 +625,15 @@ def fused_moe_func(
     skip_padded_tokens: bool = False,
     token_trays_mode: str | None = None,
     rank3_scales: bool | None = None,
+    fused_decode_max_tokens: int | None = None,
 ) -> jax.Array:
+    # O6b: speculative-verify batches (65..256 tokens) take the multi-tray
+    # fused decode MoE instead of the routed GMM fallback.
+    resolved_max_tokens = (
+        (FUSED_VERIFY_MOE_MAX_TOKENS if use_spec_o6b() else FUSED_DECODE_MOE_MAX_TOKENS)
+        if fused_decode_max_tokens is None
+        else int(fused_decode_max_tokens)
+    )
     resolved_trays = (
         active_trays_mode() if token_trays_mode is None else token_trays_mode
     )
@@ -649,6 +660,7 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
         token_trays_mode=resolved_trays,
         rank3_scales=resolved_rank3,
+        fused_decode_max_tokens=resolved_max_tokens,
     )
 
 
@@ -664,6 +676,7 @@ def fused_moe_func(
         "skip_padded_tokens",
         "token_trays_mode",
         "rank3_scales",
+        "fused_decode_max_tokens",
     ),
 )
 def _fused_moe_func_jitted(
@@ -686,6 +699,7 @@ def _fused_moe_func_jitted(
     skip_padded_tokens: bool = False,
     token_trays_mode: str = "off",
     rank3_scales: bool = False,
+    fused_decode_max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -754,6 +768,7 @@ def _fused_moe_func_jitted(
         w1_bias,
         w2_bias,
         rhs_quant_dtype=rhs_quant_dtype,
+        max_tokens=fused_decode_max_tokens,
     ):
         logger.info_once(
             "Selected fused single-kernel decode MoE (planar_t_b11): tokens=%d",

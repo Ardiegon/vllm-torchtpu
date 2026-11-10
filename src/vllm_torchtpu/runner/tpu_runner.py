@@ -3720,6 +3720,23 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 self._async_drafter.run_dp_dummy_draft(num_chunks)
 
+    def _dp_zero_tokens_across_dp(self) -> torch.Tensor | None:
+        """All-zero DP token counts for a non-lockstep dummy forward.
+
+        Such a forward enters the forward context with ``num_tokens=0`` on
+        every DP rank, so vLLM's own cross-DP synchronization could only ever
+        return zeros. Handing it the zeros directly skips that CPU/device
+        all-reduce, which otherwise has to pair with the peer engine's
+        collectives by emission order: during single-host DP start-up with
+        speculative decoding (profile_run) it paired with an unrelated
+        collective and returned garbage (`DPMetadata.make` "AssertionError:
+        6 0", O6a §7 item 1).
+        """
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size <= 1:
+            return None
+        return torch.zeros(dp_size, dtype=torch.int32)
+
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
             return None
@@ -5753,7 +5770,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens if dp_lockstep else 0,
                 num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
                 if dp_lockstep
-                else None,
+                else self._dp_zero_tokens_across_dp(),
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,

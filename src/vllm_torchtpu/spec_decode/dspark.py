@@ -33,9 +33,12 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.config import VllmConfig
 
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
@@ -97,7 +100,19 @@ class DSparkProposer(DFlashProposer):
                 self.block_size,
                 trained_block,
             )
-        logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
+        # Phase O6b (`TPU_KIMI_OPT_SPEC_KDA="o6b"`): position-major draft
+        # logits (see `_dflash_forward_and_sample`).
+        self._position_major_logits = use_spec_o6b()
+        self._draft_self_check = self._position_major_logits and (
+            os.environ.get("TPU_KIMI_DSPARK_DRAFT_CHECK", "0") == "1"
+        )
+        self._draft_check_stats = [0, 0, 0]  # steps, rows, mismatched rows
+        logger.info(
+            "DSpark: sample_from_anchor=%s, K=%d, position_major_logits=%s.",
+            self.sample_from_anchor,
+            K,
+            self._position_major_logits,
+        )
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
     # ([draft_vocab, hidden] plus a d2t remap) and possibly its own
@@ -127,6 +142,88 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        self._markov_w2_local = None
+        if self._position_major_logits:
+            self._markov_w2_local = self._shard_markov_head()
+        logger.info(
+            "DSpark: vocab-parallel Markov sampling=%s.",
+            self._markov_w2_local is not None,
+        )
+
+    def _shard_markov_head(self) -> torch.Tensor | None:
+        """Phase O6b: keep only this rank's vocab rows of the Markov head.
+
+        The draft logits come from the target's vocab-parallel lm_head; with
+        the Markov bias sliced to the same vocab shard, every draft position
+        takes a local max plus a tiny cross-rank (value, index) reduction
+        instead of all-gathering the full-vocab logits and reading the whole
+        replicated ``markov_w2`` (V x r) once per position. Each logit is the
+        same full-hidden dot product either way. Returns None (replicated
+        path) when the layout does not allow it.
+        """
+        draft = self.draft_model
+        lm_head = getattr(draft, "lm_head", None)
+        lp = getattr(draft, "logits_processor", None)
+        head = getattr(getattr(draft, "model", None), "markov_head", None)
+        if lm_head is None or lp is None or head is None:
+            return None
+        tp = int(getattr(lm_head, "tp_size", 1))
+        shard = getattr(lm_head, "shard_indices", None)
+        w2 = getattr(head.markov_w2, "weight", None)
+        if (
+            tp <= 1
+            or shard is None
+            or shard.num_org_vocab_padding != 0
+            or getattr(lp, "soft_cap", None) is not None
+            or getattr(lp, "scale", 1.0) != 1.0
+            or not isinstance(w2, torch.Tensor)
+            or w2.dim() != 2
+            or w2.shape[0] != lp.org_vocab_size
+            or getattr(draft, "draft_id_to_target_id", None) is not None
+        ):
+            return None
+        start = int(shard.org_vocab_start_index)
+        end = int(shard.org_vocab_end_index)
+        local = w2[start:end].contiguous().clone()
+        # Drop the replicated copy: only the shard is read from now on
+        # (kept for the debug self-check only).
+        self._markov_w2_full = w2 if self._draft_self_check else None
+        head.markov_w2.weight = torch.nn.Parameter(local, requires_grad=False)
+        self._markov_vocab_start = start
+        self._markov_tp = tp
+        return local
+
+    def _check_draft_tokens(
+        self, draft_tokens: torch.Tensor, reference: torch.Tensor, num_reqs: int
+    ) -> None:
+        a = draft_tokens[:num_reqs].cpu()
+        b = reference[:num_reqs].cpu()
+        st = self._draft_check_stats
+        st[0] += 1
+        st[1] += num_reqs
+        st[2] += int((a != b).any(dim=-1).sum())
+        if st[0] % 200 == 1 or st[2]:
+            logger.info(
+                "DSpark draft self-check: steps=%d rows=%d mismatched_rows=%d",
+                *st,
+            )
+
+    def _vocab_parallel_argmax(
+        self, local_scores: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """Global argmax of vocab-sharded ``[rows, V/tp]`` scores (first max
+        wins on ties, like ``torch.argmax`` over the gathered vocab)."""
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        vals, idx = local_scores.max(dim=-1)
+        pair = torch.stack(
+            [vals.float(), (idx + self._markov_vocab_start).float()], dim=-1
+        )
+        gathered = tensor_model_parallel_all_gather(pair, dim=-1).view(
+            rows, self._markov_tp, 2
+        )
+        best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+        return gathered[:, :, 1].gather(dim=-1, index=best).squeeze(-1).long()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
@@ -152,18 +249,89 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
+        ids_3d = input_ids[: padded_num_reqs * block_size].view(
+            padded_num_reqs, block_size
+        )
+        sample_start = 0 if self.sample_from_anchor else 1
+
+        if self._position_major_logits:
+            # Phase O6b: viewing the [rows, vocab] logits as
+            # [reqs, block, vocab] relayouts the whole full-vocab tensor
+            # (a ~1.3 ms while/dynamic-update-slice loop per draft on v6e
+            # when `reqs` is not a multiple of the 8-row tile). Reorder the
+            # (small) hidden rows position-major instead, padding requests
+            # to the tile, so each position's logits are one aligned slab.
+            reqs_tile = -(-padded_num_reqs // 8) * 8
+            hidden_pm = valid_hidden.view(
+                padded_num_reqs, block_size, valid_hidden.shape[-1]
+            ).transpose(0, 1)
+            if reqs_tile != padded_num_reqs:
+                hidden_pm = torch.nn.functional.pad(
+                    hidden_pm, (0, 0, 0, reqs_tile - padded_num_reqs)
+                )
+            flat_pm = hidden_pm.reshape(block_size * reqs_tile, valid_hidden.shape[-1])
+            prev = ids_3d[:, 0]
+            if reqs_tile != padded_num_reqs:
+                prev = torch.nn.functional.pad(prev, (0, reqs_tile - padded_num_reqs))
+            draft_tokens = []
+            w2_local = self._markov_w2_local
+            if w2_local is not None:
+                lp = self.draft_model.logits_processor
+                local_logits = lp._get_logits(
+                    flat_pm, self.draft_model.lm_head, None, skip_gather=True
+                )
+                local_logits = local_logits.view(
+                    block_size, reqs_tile, local_logits.shape[-1]
+                )
+                for i in range(sample_start, block_size):
+                    bias = torch.nn.functional.linear(
+                        self.draft_model.markov_embed(prev), w2_local
+                    )
+                    step = self._vocab_parallel_argmax(
+                        local_logits[i] + bias, reqs_tile
+                    )
+                    draft_tokens.append(step)
+                    prev = step
+                draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
+                if self._draft_self_check:
+                    # Reference: the pre-O6b path (request-major full-vocab
+                    # logits, replicated Markov head, plain argmax).
+                    ref_logits = self.draft_model.compute_draft_logits(valid_hidden)
+                    ref_logits = ref_logits.view(
+                        padded_num_reqs, block_size, ref_logits.shape[-1]
+                    )
+                    full_w2 = self._markov_w2_full
+                    ref_prev = ids_3d[:, 0]
+                    ref_tokens = []
+                    for i in range(sample_start, block_size):
+                        ref_bias = torch.nn.functional.linear(
+                            self.draft_model.markov_embed(ref_prev), full_w2
+                        )
+                        ref_step = (ref_logits[:, i] + ref_bias).argmax(dim=-1)
+                        ref_tokens.append(ref_step)
+                        ref_prev = ref_step
+                    ref_chunk = torch.stack(ref_tokens, dim=1)
+                    return draft_tokens_chunk[:padded_num_reqs], ref_chunk
+                return draft_tokens_chunk[:padded_num_reqs], hidden
+            logits_pm = self.draft_model.compute_draft_logits(flat_pm)
+            logits_pm = logits_pm.view(block_size, reqs_tile, logits_pm.shape[-1])
+            for i in range(sample_start, block_size):
+                bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+                step = self.draft_model.map_draft_to_target(
+                    (logits_pm[i] + bias).argmax(dim=-1)
+                )
+                draft_tokens.append(step)
+                prev = step
+            draft_tokens_chunk = torch.stack(draft_tokens, dim=1)[:padded_num_reqs]
+            return draft_tokens_chunk, hidden
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
 
-        ids_3d = input_ids[: padded_num_reqs * block_size].view(
-            padded_num_reqs, block_size
-        )
         prev = ids_3d[:, 0]
         draft_tokens = []
-        sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(

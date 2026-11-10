@@ -1500,6 +1500,18 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
         )
         bq = min(max_bq, 1 << (tuning_key.max_num_tokens - 1).bit_length())
         bkvp = 1 if page_size >= 512 else (4 if tuning_key.max_num_tokens <= 1024 else 8)
+        # Cap the f32 score tile (bq * heads x bkvp * page) to the largest one
+        # the K3 target uses (24 heads x 128 q x 1294-token TP4 page = 3.97 M
+        # elements). 16 local heads with the TP4 page (the 64-head DSpark draft
+        # at TP4) otherwise picks bq=256 and fails with e1001 scoped VMEM OOM;
+        # every existing BF16 target key stays under the cap and is unchanged
+        # (FP8-KV geometries are left as they were).
+        while (
+            tuning_key.kv_packing == 2
+            and bq > 16
+            and bq * tuning_key.actual_num_q_heads * bkvp * page_size > (1 << 22)
+        ):
+            bq //= 2
         return TunableParams(
             num_kv_pages_per_block=bkvp,
             num_queries_per_block=bq,

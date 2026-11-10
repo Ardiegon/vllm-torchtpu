@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     TPU_KIMI_OPT_SC_OFFLOAD: str = "off"
     TPU_KIMI_OPT_EXIT_FOLD: str = "off"
     TPU_KIMI_OPT_SPEC_KDA: str = "off"
+    TPU_KIMI_DSPARK_TAP: str = "prefix"
 
 
 def env_with_choices(
@@ -1232,9 +1233,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selects the side-effect-free W = 1 + num_speculative_tokens KDA verify
     # (direct StateSourcePlan pool streaming, no checkpoint blocks) plus the
     # post-rejection masked commit of each request's accepted prefix). Only
-    # takes effect when speculative decoding is configured.
+    # takes effect when speculative decoding is configured. "o6b" (Phase O6b)
+    # adds the multi-tray fused verify MoE (<= 256 tokens) and the TP-sharded
+    # DSpark context projections on top of "o6a".
     # Canonicalized here so aliases share one Tier-1 compile-hash factor;
     # env_override validates the value (fails closed) at import.
+    # Kimi K3 DSpark/DFlash auxiliary hidden-state tap (Phase O6b). "prefix"
+    # (default) hands the drafter the AttnRes partial block sum after each
+    # tapped layer, matching upstream vLLM's default
+    # (VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0) used by the published Inferact
+    # Kimi-K3-DSpark recipe; "attn_res" taps the pre-norm AttnRes mixture the
+    # next layer consumes (upstream VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1).
+    # Changes only the drafter input, never the target outputs.
+    "TPU_KIMI_DSPARK_TAP": lambda: (
+        lambda v: "attn_res"
+        if v in ("attn_res", "stream", "attn_res_stream", "1")
+        else ("prefix" if v in ("", "prefix", "prefix_only", "0") else v)
+    )(os.getenv("TPU_KIMI_DSPARK_TAP", "prefix").strip().lower()),
     "TPU_KIMI_OPT_SPEC_KDA": lambda: (
         lambda v: "off"
         if v in ("", "0", "false", "no", "off", "none")

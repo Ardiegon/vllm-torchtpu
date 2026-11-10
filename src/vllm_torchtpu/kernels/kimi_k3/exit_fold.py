@@ -1434,7 +1434,8 @@ def _make_moe_ep_overlap_jax_fn(
                     copy_opt=polish_copy,
                 )
 
-            # 2. Routed MoE Compute (`fused_decode_moe_v6e_planar_t_b11` for <=64, `moe_gmm` >64)
+            # 2. Routed MoE Compute (`fused_decode_moe_v6e_planar_t_b11` for <=64, or
+            #    <=256 multi-tray under `TPU_KIMI_OPT_SPEC_KDA=o6b`; `moe_gmm` above)
             moe_out = fused_moe_func(
                 ag_latent,
                 local_w1,

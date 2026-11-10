@@ -6713,6 +6713,30 @@ def moe_gmm_v6e_planar_t_b11(
 
 
 FUSED_DECODE_MOE_MAX_TOKENS = 64
+# Phase O6b (`TPU_KIMI_OPT_SPEC_KDA=o6b`): speculative verify batches of
+# 65..256 tokens run the same kernel with a forced multi-tray row loop (the
+# b11 `fold_chunk` weight unpack stays hoisted outside the tray loop, so the
+# weight-side VPU cost is paid once per chunk regardless of M). Callers opt in
+# by passing `max_tokens=FUSED_VERIFY_MOE_MAX_TOKENS` to the eligibility check.
+FUSED_VERIFY_MOE_MAX_TOKENS = 256
+# Measured on v6e (K3 routed expert 7x3584x3072, 0 VREG spills for 32/64/128/
+# 256-row trays): 128-row trays are within 4% of the best tray size at every
+# M in 65..256 (M=96/128: 165/167 us vs 175/176 at 64 rows and 179 at 32;
+# M=192: 203 vs 196 at 64; M=256: 204 vs 215 at 64, 325 at 32, 573 at 16).
+FUSED_VERIFY_MOE_TRAY_M = 128
+_FUSED_VERIFY_MOE_VMEM_BUDGET = 46 * 1024 * 1024
+
+
+def _fused_verify_moe_vmem_bytes(m: int, k: int, n: int, num_groups: int) -> int:
+  """Upper-bound VMEM estimate of the multi-tray kernel at `m` padded rows."""
+  depth_w2 = 1 if n >= 3072 else 2
+  weights = (
+      2 * (k * n + 2 * (k // SCALE_GROUP) * n)
+      + depth_w2 * (n // 2 + n // SCALE_GROUP) * k
+  )
+  accs = 3 * m * PLANAR_WINDOW * 4 + m * n * 2 + m * k * 4
+  io = m * k * 2 + num_groups * m * _LANES * 4 + m * k * 2
+  return weights + accs + io
 
 
 def can_use_fused_decode_moe_v6e_planar_t_b11(
@@ -6725,9 +6749,16 @@ def can_use_fused_decode_moe_v6e_planar_t_b11(
     w2_bias: jax.Array | None,
     *,
     rhs_quant_dtype: jnp.dtype | None = None,
+    max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
 ) -> bool:
-  """Returns whether `fused_decode_moe_v6e_planar_t_b11` is eligible."""
-  if not (0 < hidden_states.shape[0] <= FUSED_DECODE_MOE_MAX_TOKENS):
+  """Returns whether `fused_decode_moe_v6e_planar_t_b11` is eligible.
+
+  `max_tokens` above `FUSED_DECODE_MOE_MAX_TOKENS` (O6b verify, at most
+  `FUSED_VERIFY_MOE_MAX_TOKENS`) admits the multi-tray variant, subject to a
+  VMEM estimate at the padded row count.
+  """
+  max_tokens = min(int(max_tokens), FUSED_VERIFY_MOE_MAX_TOKENS)
+  if not (0 < hidden_states.shape[0] <= max_tokens):
     return False
   if (
       w1.dtype != jnp.uint8
@@ -6751,7 +6782,17 @@ def can_use_fused_decode_moe_v6e_planar_t_b11(
   slab_bytes = (
       2 * (k + 2 * (k // SCALE_GROUP)) * n + (n // 2 + n // SCALE_GROUP) * k
   )
-  return slab_bytes <= 30 * 1024 * 1024
+  if slab_bytes > 30 * 1024 * 1024:
+    return False
+  m = hidden_states.shape[0]
+  if m > FUSED_DECODE_MOE_MAX_TOKENS:
+    tray_m = FUSED_VERIFY_MOE_TRAY_M
+    padded_m = ((m + tray_m - 1) // tray_m) * tray_m
+    return (
+        _fused_verify_moe_vmem_bytes(padded_m, k, n, num_groups)
+        <= _FUSED_VERIFY_MOE_VMEM_BUDGET
+    )
+  return True
 
 
 def fused_decode_moe_v6e_planar_t_b11(
@@ -6768,6 +6809,7 @@ def fused_decode_moe_v6e_planar_t_b11(
     vmem_limit_bytes: int | None = 48 * 1024 * 1024,
     token_trays_mode: str = "off",
     rank3_scales: bool = False,
+    verify_tray_m: int | None = None,
 ) -> jax.Array:
   """Single-kernel fused decode MoE on TPU v6e for small token batches (M <= 64).
 
@@ -6776,6 +6818,11 @@ def fused_decode_moe_v6e_planar_t_b11(
   contiguous expert slabs (`w13[g]` double-buffered, `w2[g]` streamed during
   `w13[g]` compute) into VMEM and computing `w13 + SiTU + w2 + weighted_combine`
   in one Pallas kernel.
+
+  For O6b speculative verify (`64 < M <= FUSED_VERIFY_MOE_MAX_TOKENS`) the row
+  loop is always multi-tray (`verify_tray_m` rows per tray, default
+  `FUSED_VERIFY_MOE_TRAY_M`) and `token_trays_mode` is ignored; `M <= 64` is
+  unaffected by `verify_tray_m`.
   """
   orig_m, k = hidden_states.shape
   num_groups, _, n = w13_pt.shape
@@ -6797,7 +6844,21 @@ def fused_decode_moe_v6e_planar_t_b11(
   situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
   trays_norm = (token_trays_mode or "off").strip().lower()
-  if trays_norm in ("", "0", "off", "false", "none"):
+  if orig_m > FUSED_DECODE_MOE_MAX_TOKENS:
+    if orig_m > FUSED_VERIFY_MOE_MAX_TOKENS:
+      raise ValueError(
+          f"fused_decode_moe_v6e_planar_t_b11 supports at most "
+          f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {orig_m}."
+      )
+    tray_m = int(
+        FUSED_VERIFY_MOE_TRAY_M if verify_tray_m is None else verify_tray_m
+    )
+    if tray_m <= 0 or tray_m % 16 != 0:
+      raise ValueError(f"verify_tray_m must be a positive multiple of 16, got {tray_m}.")
+    use_trays = True
+    padded_m = ((orig_m + tray_m - 1) // tray_m) * tray_m
+    num_trays = padded_m // tray_m
+  elif trays_norm in ("", "0", "off", "false", "none"):
     use_trays = False
     padded_m = max(16, ((orig_m + 7) // 8) * 8)
     tray_m = padded_m
