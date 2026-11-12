@@ -63,19 +63,13 @@ class SpecDecodeMetadata:
     deferred_draft_token_ids_cpu: np.ndarray | None = None
 
     def upload_deferred_draft_token_ids(
-        self,
-        device: torch.device,
-        upload: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        self, upload: Callable[[torch.Tensor], torch.Tensor]
     ) -> torch.Tensor:
-        """Upload the deferred host drafts. `upload` (the runner's
-        `_upload_host_temporary`) keeps the host buffer alive until the
-        transfer is fenced (B1-F); without it the metadata object's own
-        reference is the only keepalive."""
+        """Upload the deferred host drafts with `upload` (the runner's
+        `upload_host_temporary`), which keeps the host buffer alive until the
+        transfer is fenced."""
         assert self.deferred_draft_token_ids_cpu is not None
-        host = torch.from_numpy(self.deferred_draft_token_ids_cpu)
-        if upload is not None:
-            return upload(host)
-        return host.to(device, non_blocking=True)
+        return upload(torch.from_numpy(self.deferred_draft_token_ids_cpu))
 
 
 class SpeculativeDecodingManager:
@@ -319,7 +313,7 @@ class SpeculativeDecodingManager:
                 draft_token_ids=(
                     None
                     if defer_draft_token_ids
-                    else self.runner._upload_host_temporary(
+                    else self.runner.upload_host_temporary(
                         torch.from_numpy(padded_draft_token_ids)
                     )
                 ),
@@ -423,9 +417,9 @@ class SpeculativeDecodingManager:
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
         # CPU -> TPU copy. Every source is a local temporary, so each upload
-        # goes through the runner's fenced keepalive (B1-F, same bug class
-        # as B1's `logits_indices`).
-        upload = self.runner._upload_host_temporary
+        # goes through the runner's fenced keepalive (a freed host temporary
+        # can be reused before a non-blocking H2D reads it).
+        upload = self.runner.upload_host_temporary
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=(

@@ -56,6 +56,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
@@ -2137,10 +2138,10 @@ class TestUnifiedReadOffsetMigration:
             "_pad_dev_to_bucket",
             "_expand_pool_split",
             "_spec_seed_sources",
-            "_upload_host_temporary",
+            "upload_host_temporary",
         ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
-        runner._host_upload_keepalive = []
+        runner._host_uploads = HostUploadKeepalive()
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
         # size; with cp=1 the two coincide here.
@@ -2454,8 +2455,7 @@ def _staging_fence_runner():
     return SimpleNamespace(
         device=torch.device("cpu"),
         _input_staging_fence=None,
-        _host_upload_keepalive=[],
-        _fenced_host_upload_keepalive=[],
+        _host_uploads=HostUploadKeepalive(),
     )
 
 
@@ -2491,7 +2491,7 @@ class TestInputStagingFence:
         """torch_tpu keeps no reference to the source of a non-blocking H2D, so
         a freed temporary could be reused by the allocator before the transfer
         read it (wrong-row prefill logits from a corrupted `logits_indices`).
-        `_upload_host_temporary` holds the host tensor until a fence recorded
+        `upload_host_temporary` holds the host tensor until a fence recorded
         after the upload has been waited on, and no longer."""
         _FakeTpuEvent.instances.clear()
         monkeypatch.setattr(
@@ -2502,7 +2502,7 @@ class TestInputStagingFence:
         def upload_temporary():
             host = torch.arange(4, dtype=torch.int32) - 1
             ref = weakref.ref(host)
-            TPUModelRunner._upload_host_temporary(runner, host)
+            TPUModelRunner.upload_host_temporary(runner, host)
             return ref
 
         before_fence = upload_temporary()

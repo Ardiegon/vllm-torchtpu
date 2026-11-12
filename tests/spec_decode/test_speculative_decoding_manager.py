@@ -19,11 +19,22 @@ import pytest
 import torch
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+
+def _bind_host_uploads(mock_runner: MagicMock) -> None:
+    # A bare MagicMock would return Mocks from upload_host_temporary; bind the
+    # real fenced upload instead.
+    mock_runner._host_uploads = HostUploadKeepalive()
+    mock_runner.upload_host_temporary = TPUModelRunner.upload_host_temporary.__get__(
+        mock_runner
+    )
 
 
 @pytest.mark.tpu_test
@@ -31,6 +42,7 @@ def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
     mock_runner.device = device
+    _bind_host_uploads(mock_runner)
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
 
@@ -264,6 +276,7 @@ def _fresh_metadata_manager(device, input_ids):
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
     mock_runner.input_ids_cpu = input_ids
+    _bind_host_uploads(mock_runner)
     return SpeculativeDecodingManager(mock_runner)
 
 
@@ -316,9 +329,36 @@ def test_spec_decode_metadata_deferred_draft_token_ids(device):
             nd, cu, 4
         )
         assert ref.deferred_draft_token_ids_cpu is None
-        uploaded = md.upload_deferred_draft_token_ids(device)
+        uploaded = md.upload_deferred_draft_token_ids(
+            manager.runner.upload_host_temporary
+        )
         assert uploaded.device.type == device.type
         assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
+
+
+def test_upload_deferred_draft_token_ids_routes_through_upload_callable():
+    host_drafts = np.arange(4, dtype=np.int32)
+    md = SpecDecodeMetadata(
+        draft_token_ids=None,
+        draft_lengths=torch.zeros(1, dtype=torch.int32),
+        draft_lengths_cpu=np.zeros(1, dtype=np.int32),
+        target_logits_indices=torch.zeros(1, dtype=torch.int32),
+        bonus_logits_indices=torch.zeros(1, dtype=torch.int32),
+        final_logits_indices=torch.zeros(1, dtype=torch.int32),
+        segment_ids=torch.zeros(1, dtype=torch.int64),
+        group_indices=torch.zeros(1, dtype=torch.int32),
+        deferred_draft_token_ids_cpu=host_drafts,
+    )
+    received: list[torch.Tensor] = []
+    uploaded = torch.full((4,), 7, dtype=torch.int32)
+
+    def upload(host: torch.Tensor) -> torch.Tensor:
+        received.append(host)
+        return uploaded
+
+    assert md.upload_deferred_draft_token_ids(upload) is uploaded
+    assert len(received) == 1
+    assert torch.equal(received[0], torch.from_numpy(host_drafts))
 
 
 @pytest.mark.tpu_test

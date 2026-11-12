@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_torchtpu
 import vllm_torchtpu.runner.tpu_runner as runner_mod
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
@@ -37,7 +38,7 @@ def _runner_with_raw_tensors(raw_tensors):
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
     runner._install_spec_token_room_guard = lambda: None
-    runner._host_upload_keepalive = []
+    runner._host_uploads = HostUploadKeepalive()
     return runner
 
 
@@ -142,9 +143,9 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         device="cpu",
         mamba_slot_read_offsets=None,
         bm_pool_layout=None,
-        _host_upload_keepalive=[],
+        _host_uploads=HostUploadKeepalive(),
     )
-    fake._upload_host_temporary = TPUModelRunner._upload_host_temporary.__get__(fake)
+    fake.upload_host_temporary = TPUModelRunner.upload_host_temporary.__get__(fake)
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )
@@ -222,9 +223,9 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
         bm_pool_layout=None,
-        _host_upload_keepalive=[],
+        _host_uploads=HostUploadKeepalive(),
     )
-    fake._upload_host_temporary = TPUModelRunner._upload_host_temporary.__get__(fake)
+    fake.upload_host_temporary = TPUModelRunner.upload_host_temporary.__get__(fake)
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )

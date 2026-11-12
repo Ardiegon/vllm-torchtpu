@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -112,13 +113,12 @@ def _make_runner(
     # The staging-tensor fence is recorded by execute_model; these tests
     # call _prepare_inputs directly, so the wait must find an empty fence.
     runner._input_staging_fence = None
-    runner._host_upload_keepalive = []
-    runner._fenced_host_upload_keepalive = []
+    runner._host_uploads = HostUploadKeepalive()
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
     )
-    runner._upload_host_temporary = types.MethodType(
-        TPUModelRunner._upload_host_temporary, runner
+    runner.upload_host_temporary = types.MethodType(
+        TPUModelRunner.upload_host_temporary, runner
     )
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None

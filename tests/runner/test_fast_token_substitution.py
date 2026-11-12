@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -47,11 +48,9 @@ def test_substitution_disabled_by_default():
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
-        _host_upload_keepalive=[],
+        _host_uploads=HostUploadKeepalive(),
     )
-    runner._upload_host_temporary = TPUModelRunner._upload_host_temporary.__get__(
-        runner
-    )
+    runner.upload_host_temporary = TPUModelRunner.upload_host_temporary.__get__(runner)
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)
     pre_indices = np.array([0, 1, 2, 3], dtype=np.int32)

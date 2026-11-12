@@ -30,6 +30,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
@@ -340,7 +341,7 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
-    runner._host_upload_keepalive = []
+    runner._host_uploads = HostUploadKeepalive()
     drafts = torch.tensor(
         [list(range(101, 101 + k)), list(range(201, 201 + k))],
         dtype=torch.int32,

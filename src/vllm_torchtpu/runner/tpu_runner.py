@@ -143,6 +143,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -1062,11 +1063,9 @@ class TPUModelRunner(GPUModelRunner):
         # waits on it before rewriting them.
         self._input_staging_fence: Any = None
         # Host tensors that only live for one non-blocking upload (see
-        # `_upload_host_temporary`). torch_tpu does not keep the source of a
-        # non-blocking H2D alive, so they are held here until a fence recorded
-        # after their upload has been waited on.
-        self._host_upload_keepalive: list[torch.Tensor] = []
-        self._fenced_host_upload_keepalive: list[torch.Tensor] = []
+        # `upload_host_temporary`), held until the staging fence covering
+        # their upload has been waited on.
+        self._host_uploads = HostUploadKeepalive()
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -2058,7 +2057,7 @@ class TPUModelRunner(GPUModelRunner):
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
                 src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
-                dst_t = self._upload_host_temporary(
+                dst_t = self.upload_host_temporary(
                     torch.tensor(dsts_g, dtype=torch.int32)
                 )
                 src_t, dst_t = self._expand_pool_split(src_t, dst_t)
@@ -2083,7 +2082,7 @@ class TPUModelRunner(GPUModelRunner):
 
         if spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
-            dst_t = self._upload_host_temporary(
+            dst_t = self.upload_host_temporary(
                 torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long)
             )
             assert self.mamba_slot_read_offsets is not None
@@ -2094,10 +2093,10 @@ class TPUModelRunner(GPUModelRunner):
             # forward that reads the buffer). Padding with (0, 0) null-block
             # self-copies keeps the shapes on the seed-copy bucket ladder.
             offset_pairs = self._pad_to_bucket(offset_pairs, pad=(0, 0))
-            src_t = self._upload_host_temporary(
+            src_t = self.upload_host_temporary(
                 torch.tensor([s for s, _ in offset_pairs], dtype=torch.long)
             )
-            dst_t = self._upload_host_temporary(
+            dst_t = self.upload_host_temporary(
                 torch.tensor([d for _, d in offset_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
@@ -2108,10 +2107,10 @@ class TPUModelRunner(GPUModelRunner):
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
-            src_t = self._upload_host_temporary(
+            src_t = self.upload_host_temporary(
                 torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32)
             )
-            dst_t = self._upload_host_temporary(
+            dst_t = self.upload_host_temporary(
                 torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32)
             )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
@@ -2178,17 +2177,15 @@ class TPUModelRunner(GPUModelRunner):
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = self._upload_host_temporary(
-            torch.tensor(state_srcs, dtype=torch.long)
-        )
-        ckpt_t = self._upload_host_temporary(torch.tensor(ckpt_rows, dtype=torch.int32))
+        state_t = self.upload_host_temporary(torch.tensor(state_srcs, dtype=torch.long))
+        ckpt_t = self.upload_host_temporary(torch.tensor(ckpt_rows, dtype=torch.int32))
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
         # selection, so ignore that stale offset here without mutating the
         # source block (which may be shared). Live requests retain their offset.
-        new_owner_t = self._upload_host_temporary(
+        new_owner_t = self.upload_host_temporary(
             torch.tensor(new_owners, dtype=torch.bool)
         )
         off = torch.where(new_owner_t, 0, off)
@@ -2235,10 +2232,10 @@ class TPUModelRunner(GPUModelRunner):
                 for block_copy in copies
             ]
             mgr_pairs = self._pad_to_bucket(mgr_pairs, pad=(0, 0))
-            mgr_src_t = self._upload_host_temporary(
+            mgr_src_t = self.upload_host_temporary(
                 torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long)
             )
-            mgr_dst_t = self._upload_host_temporary(
+            mgr_dst_t = self.upload_host_temporary(
                 torch.tensor([d for _, d in mgr_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(read_offsets, mgr_src_t, mgr_dst_t)
@@ -2250,10 +2247,10 @@ class TPUModelRunner(GPUModelRunner):
             for j in range(split)
         ]
         pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-        src_t = self._upload_host_temporary(
+        src_t = self.upload_host_temporary(
             torch.tensor([src for src, _ in pairs], dtype=torch.int32)
         )
-        dst_t = self._upload_host_temporary(
+        dst_t = self.upload_host_temporary(
             torch.tensor([dst for _, dst in pairs], dtype=torch.int32)
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
@@ -2479,10 +2476,10 @@ class TPUModelRunner(GPUModelRunner):
                     constant_values=-1,
                 )
 
-                cur_input_indices = self._upload_host_temporary(
+                cur_input_indices = self.upload_host_temporary(
                     torch.from_numpy(padded_token_in_tpu_cur_input_indices)
                 )
-                pre_next_tokens_indices = self._upload_host_temporary(
+                pre_next_tokens_indices = self.upload_host_temporary(
                     torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
                 )
                 self._cached_subst_key = subst_key
@@ -2504,10 +2501,10 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1,
             )
 
-            cur_input_indices = self._upload_host_temporary(
+            cur_input_indices = self.upload_host_temporary(
                 torch.from_numpy(padded_token_in_tpu_cur_input_indices)
             )
-            pre_next_tokens_indices = self._upload_host_temporary(
+            pre_next_tokens_indices = self.upload_host_temporary(
                 torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
             )
 
@@ -3326,7 +3323,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = self._upload_host_temporary(
+                logits_indices = self.upload_host_temporary(
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
                 )
 
@@ -3478,33 +3475,29 @@ class TPUModelRunner(GPUModelRunner):
         self._input_staging_fence = fence
         # The fence covers every upload issued so far, including those of the
         # host temporaries collected since the previous fence.
-        self._fenced_host_upload_keepalive.extend(self._host_upload_keepalive)
-        self._host_upload_keepalive = []
+        self._host_uploads.on_fence_recorded()
 
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
-            self._fenced_host_upload_keepalive = []
+            self._host_uploads.on_fence_waited()
 
-    def _upload_host_temporary(
+    def upload_host_temporary(
         self, host: torch.Tensor, device: torch.device | None = None
     ) -> torch.Tensor:
         """`host.to(device, non_blocking=True)` for a host tensor that nothing
         else keeps alive (an expression result or a local array).
 
-        torch_tpu hands PJRT the host pointer with
-        kImmutableUntilTransferCompletes and keeps no reference to the source,
-        so a temporary freed right after `.to()` returns can be reused by the
-        allocator (whose free-list pointers then land in the upload) before
-        the transfer has read it. That corrupted e.g. `logits_indices` on one
-        TP rank in ~2% of prefills. The tensor is held until a fence recorded
+        torch_tpu keeps no reference to the source of a non-blocking H2D (see
+        `HostUploadKeepalive`), so the tensor is held until a fence recorded
         after this upload has completed (`_wait_input_staging_fence`).
+        `device` defaults to the runner's device.
         """
-        host = host.contiguous()
-        self._host_upload_keepalive.append(host)
-        return host.to(self.device if device is None else device, non_blocking=True)
+        return self._host_uploads.upload(
+            host, self.device if device is None else device
+        )
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
@@ -3996,7 +3989,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Nothing substituted this chunk, so the host drafts are real.
                 spec_decode_metadata.draft_token_ids = (
                     spec_decode_metadata.upload_deferred_draft_token_ids(
-                        self.device, upload=self._upload_host_temporary
+                        self.upload_host_temporary
                     )
                 )
             draft_input_ids_src = input_ids
@@ -7956,9 +7949,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            self._upload_host_temporary(temps_cpu.unsqueeze(1), logits.device),
-            self._upload_host_temporary(top_k_cpu.unsqueeze(1), logits.device),
-            self._upload_host_temporary(top_p_cpu.unsqueeze(1), logits.device),
+            self.upload_host_temporary(temps_cpu.unsqueeze(1), logits.device),
+            self.upload_host_temporary(top_k_cpu.unsqueeze(1), logits.device),
+            self.upload_host_temporary(top_p_cpu.unsqueeze(1), logits.device),
         )
 
     def _topk_candidate_blocks(self) -> int:

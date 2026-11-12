@@ -36,6 +36,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.runner.tpu_runner as runner_mod
+from vllm_torchtpu.runner.host_upload_keepalive import HostUploadKeepalive
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 BLOCK_SIZE = 256
@@ -114,7 +115,7 @@ def _make_self(
         device="cpu",
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
-        _host_upload_keepalive=[],
+        _host_uploads=HostUploadKeepalive(),
         input_batch=input_batch,
     )
     # Padding/expansion/source-selection helpers the collector calls on
@@ -127,7 +128,7 @@ def _make_self(
         "_expand_pool_split",
         "_spec_seed_sources",
         "_copy_mamba_state_blocks",
-        "_upload_host_temporary",
+        "upload_host_temporary",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws
