@@ -185,7 +185,7 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
-    from vllm_torchtpu.distributed.kimi_dma_mesh import kimi_use_2d_ep_mesh
+    from vllm_torchtpu.distributed.dp_tp_mesh import kimi_use_2d_ep_mesh
 
     ep_ranks = range(len(device_ids))
     if (
@@ -335,13 +335,3 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
-
-
-from vllm_torchtpu.distributed.kimi_dma_mesh import (  # noqa: E402, F401
-    DP_AXIS_NAME,
-    KIMI_2D_MESH_AXES,
-    TP_AXIS_NAME,
-    build_ep_2d_mesh,
-    reset_ep_2d_mesh,
-    validate_ep_2d_group_ranks,
-)

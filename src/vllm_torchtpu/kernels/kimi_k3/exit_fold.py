@@ -58,7 +58,6 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.kimi_dma_mesh import DP_AXIS_NAME, TP_AXIS_NAME
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
     COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
@@ -67,13 +66,11 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
     DEFAULT_MAX_DMA_TOKENS,
     DEFAULT_VMEM_MAX_TOKENS,
-    _REGISTERED_TORCH_OPS,
-    _mesh_shape_and_ids,
+    DP_AXIS_NAME,
+    TP_AXIS_NAME,
     _normalize_axis_name,
-    _sanitize_tag,
     barrier_and_allocate,
     call_kernel,
-    format_pallas_dma_op_name,
     kimi_guarded_all_gather_cols,
     kimi_guarded_all_gather_rows,
     kimi_guarded_psum,
@@ -1524,6 +1521,14 @@ def build_kimi_moe_ep_overlap_op(
     variant_tag: str = "o4",
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, Any], torch.Tensor]:
     """Build (or reuse cached) unified `kimi_moe_ep_overlap` `@jax_op` across layers."""
+    # Imported here: kernels/ must not import models/ at module load (cycle).
+    from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
+        _REGISTERED_TORCH_OPS,
+        _mesh_shape_and_ids,
+        _sanitize_tag,
+        format_pallas_dma_op_name,
+    )
+
     norm_mode = normalize_exit_fold_mode(exit_fold_mode)
     if norm_mode == "off":
         raise ValueError("build_kimi_moe_ep_overlap_op requires an active exit_fold_mode")
@@ -1774,6 +1779,10 @@ def inspect_kimi_moe_ep_overlap_hlo(
 ) -> dict[str, Any]:
     """Lower (or compile when `mesh` holds real `jax.Device`s) SPMD JAX HLO and audit ordering."""
     from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
+        _mesh_shape_and_ids,
+    )
 
     mode = normalize_exit_fold_mode(
         envs.TPU_KIMI_OPT_EXIT_FOLD if exit_fold_mode is None else exit_fold_mode

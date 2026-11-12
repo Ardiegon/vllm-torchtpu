@@ -450,13 +450,13 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
 
-        from vllm_torchtpu.distributed.kimi_dma_mesh import (
+        from vllm_torchtpu.distributed.dp_tp_mesh import (
             build_ep_2d_mesh,
             kimi_use_2d_ep_mesh,
         )
 
         if kimi_use_2d_ep_mesh() and torch.distributed.is_initialized():
-            from vllm_torchtpu.kernels.kimi_k3.latency_collectives import (
+            from vllm_torchtpu.models.vllm.kimi_k3.latency_collective_ops import (
                 build_kimi_o2_collectives,
             )
 

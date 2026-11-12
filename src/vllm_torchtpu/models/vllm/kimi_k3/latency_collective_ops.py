@@ -46,13 +46,10 @@ import torch
 from jax.sharding import Mesh
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.kimi_dma_mesh import DP_AXIS_NAME, TP_AXIS_NAME
 from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
     build_kimi_moe_ep_overlap_op,
     normalize_exit_fold_mode,
 )
-from vllm_torchtpu.kernels.kimi_k3.polish import normalize_compute_polish_mode
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import normalize_spec_kda_mode
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
@@ -61,6 +58,13 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_TP_LATENT_AG,
     COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
     DEFAULT_MAX_DMA_TOKENS,
+    DP_AXIS_NAME,
+    TP_AXIS_NAME,
+)
+from vllm_torchtpu.kernels.kimi_k3.polish import normalize_compute_polish_mode
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import normalize_spec_kda_mode
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
     _mesh_shape_and_ids,
     _sanitize_tag,
     build_pallas_all_gather_cols_op,
@@ -68,7 +72,6 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     build_pallas_psum_op,
     build_pallas_psum_scatter_rows_op,
 )
-from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 

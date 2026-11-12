@@ -293,7 +293,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # And the mesh they export with: `build_ep_mesh` decides the axis, the
     # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
-    "vllm_torchtpu/distributed/kimi_dma_mesh.py",
+    "vllm_torchtpu/distributed/dp_tp_mesh.py",
     "vllm_torchtpu/distributed/pcp.py",
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
@@ -309,6 +309,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/attention.py",
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/dma_collective_ops.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/latency_collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     "vllm_torchtpu/models/vllm/kimi_k3/model.py",
     "vllm_torchtpu/models/vllm/kimi_k3/moe.py",

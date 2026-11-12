@@ -36,12 +36,10 @@ import torch
 import torch.distributed as dist
 from jax.sharding import Mesh
 
+from vllm_torchtpu.kernels.kimi_k3.pallas_dma import DP_AXIS_NAME, TP_AXIS_NAME
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-DP_AXIS_NAME = "dp"
-TP_AXIS_NAME = "tp"
 KIMI_2D_MESH_AXES: tuple[str, str] = (DP_AXIS_NAME, TP_AXIS_NAME)
 
 _MESH_2D_CACHE: dict[tuple[int, int, tuple[int, ...]], Mesh] = {}

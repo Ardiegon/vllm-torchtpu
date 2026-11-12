@@ -37,11 +37,6 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
 from vllm_torchtpu.kernels.kimi_k3.exit_fold import is_exit_fold_active
-from vllm_torchtpu.kernels.kimi_k3.latency_collectives import (
-    _pack_dispatch_metadata,
-    _pack_dp_dispatch,
-    _unpack_dp_dispatch,
-)
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -55,6 +50,11 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
+from .latency_collective_ops import (
+    _pack_dispatch_metadata,
+    _pack_dp_dispatch,
+    _unpack_dp_dispatch,
+)
 from .layers import KimiMLP, quantize_weight_w8a16, w8a16_matmul
 
 if TYPE_CHECKING:
