@@ -11,30 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kimi K3 Phase O4 unified-`@jax_op` split async EP DMA overlap & exact exit-fold.
+"""Kimi K3 MoE layer exit with the EP dispatch overlapped by shared experts.
 
-Implements (`1_v6e_128_design_doc.md §7.2 Step 5`, `D87`, `D89`):
-  1. Single-`@jax_op` (`torch.tpu.pallas.jax_op` + `jax.shard_map` over
-     `mesh_2d = ('dp', 'tp')`) execution holding `pltpu.SemaphoreType.DMA`
-     internally across:
-       - `async_ep_dispatch_start` (`cid=1`): non-blocking Pallas remote-DMA
-         all-gather of `(routed_down_local, packed_meta_shard)` across
-         `('dp', 'tp')` (`'tp'` when `dp_size == 1`),
-       - Overlapped `shared_experts` gate+up matmul (`hidden @ w_shared_gu`) +
-         gated activation (`SituAndMul` / `SiluAndMul`) fenced between
-         `ep_dispatch_start` and `ep_dispatch_wait` via zero-cost
-         `jax.lax.optimization_barrier` edges so XLA strictly schedules
-         `[ep_dispatch_start] -> [w_shared_gu + act_fn] -> [ep_dispatch_wait]`,
-       - `async_ep_dispatch_wait` (`cid=1`): semaphore receive wait + full send
-         drain (`0` residual semaphore count) + FTZ-safe byte-lane unpack,
-       - Routed MoE compute (`fused_moe_func` -> `fused_decode_moe_v6e_planar_t_b11`
-         for `T_global <= 64`, `moe_gmm` fallback for `T_global > 64`, with zero
-         Python branching on `hidden_states.shape[0]`), and
-       - Mathematically exact `routed_expert_norm` (`RMSNorm(latent_dim)`)
-         combine + `[latent_local]` exit-fold:
-           * `O4-B`: 1-shot `'dp'` `latency_psum_scatter_rows` (`cid=2`) +
-             width-guarded `'tp'` `latency_psum` (`cid=3`) + in-`@jax_op`
-             fused `RMSNorm(latent_dim)` + `[latent_local]` slice.
+One `jax_op` (`jax.shard_map` over the `('dp', 'tp')` mesh) runs a whole
+Kimi K3 MoE block for expert parallelism, holding its Pallas DMA semaphores
+internally:
+
+1. Dispatch. Each rank owns a `[B_dp, latent_dim / tp]` slice of the routed
+   latent. Decode batches (at most `max_dma_tokens` tokens in total) gather
+   it in two axial stages: a one-shot remote-DMA all-gather over `'tp'`,
+   then a non-blocking remote-DMA all-gather over `'dp'` of the latent plus
+   the packed routing metadata (`async_ep_dispatch_start` /
+   `async_ep_dispatch_wait`). The shared-expert gate/up matmul and gated
+   activation run between start and wait; `lax.optimization_barrier` edges
+   pin that order (start -> shared experts -> wait). Larger (prefill)
+   batches use XLA all-gathers on contiguous axes instead.
+2. Routed experts (`fused_moe_func`) on the gathered tokens.
+3. Combine. A one-shot `'dp'` reduce-scatter, a `'tp'` psum guarded to
+   small widths (XLA collectives above the caps), the exact
+   `RMSNorm(latent_dim)` of the routed output, and the slice of this rank's
+   `latent_dim / tp` columns.
+
+The op returns `[B_dp, shared_inter_tp + latent_dim / tp]`: the shared
+activation and the normalized routed slice, concatenated.
 """
 
 from __future__ import annotations
@@ -42,7 +41,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.experimental.pallas as pl
@@ -52,6 +51,7 @@ from jax import lax
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
@@ -83,25 +83,47 @@ from vllm_torchtpu.kimi_k3_opt_modes import (
 
 Ref = Any
 
-DEFAULT_C2_COMBINE_KIND = "o4b"
-DEFAULT_C2_DISPATCH_KIND = "axial"
+
+class ExitFoldPlan(NamedTuple):
+    """How the EP-overlap op dispatches tokens and combines expert outputs."""
+
+    combine_kind: str
+    async_dispatch: bool
+    dispatch_kind: str
 
 
-def resolve_effective_exit_fold_plan(mode: str) -> tuple[str, bool, str]:
-    """Map canonical ``exit_fold_mode`` + static shape to ``(combine_kind, async_dispatch, dispatch_kind)``."""
-    norm = normalize_exit_fold_mode(mode)
-    if norm in ("o4d", "c2"):
-        return DEFAULT_C2_COMBINE_KIND, True, DEFAULT_C2_DISPATCH_KIND
-    raise ValueError(f"resolve_effective_exit_fold_plan called with inactive mode={mode!r}")
+# Every active `TPU_KIMI_OPT_EXIT_FOLD` mode runs this plan: the two-stage
+# axial (TP, then async DP) dispatch and the hierarchical combine (DP
+# reduce-scatter, then TP psum). The combine kind keeps its historical name
+# "o4b" because it is part of the op name, which keys the compile caches.
+_EXIT_FOLD_PLAN = ExitFoldPlan(
+    combine_kind="o4b", async_dispatch=True, dispatch_kind="axial"
+)
+
+
+def resolve_effective_exit_fold_plan(mode: str) -> ExitFoldPlan:
+    """Return the plan of an active `TPU_KIMI_OPT_EXIT_FOLD` mode.
+
+    Raises:
+      ValueError: `mode` is invalid or `"off"`.
+    """
+    if normalize_exit_fold_mode(mode) == "off":
+        raise ValueError(
+            f"resolve_effective_exit_fold_plan called with inactive mode={mode!r}"
+        )
+    return _EXIT_FOLD_PLAN
 
 
 # =============================================================================
-# Exact JAX RMSNorm & Shared-Expert Activations (`SituAndMul` / `SiluAndMul`)
+# Exact JAX RMSNorm and shared-expert activations (`SituAndMul` / `SiluAndMul`)
 # =============================================================================
 
 
 def _jax_rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
-    """Exact TPU RMSNorm matching ``vllm.ir.ops.layernorm.rms_norm`` (`<= 1` bf16 ULP)."""
+    """RMSNorm matching `vllm.ir.ops.layernorm.rms_norm` on TPU (<= 1 bf16 ULP).
+
+    The normalized value is rounded to bf16 before the weight multiply.
+    """
     x_f32 = x.astype(jnp.float32)
     var = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
     y_f32 = x_f32 * lax.rsqrt(var + float(eps))
@@ -163,14 +185,14 @@ def _compute_shared_gu_and_act(
 
 
 # =============================================================================
-# Split Non-Blocking Pallas Async EP Dispatch (`start` + `wait`, `cid=1`)
+# Split non-blocking Pallas EP dispatch (`start` + `wait`)
 # =============================================================================
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class AsyncDispatchState:
-    """Pinned HBM send/recv buffers + DMA semaphores kept strictly inside `@jax_op`."""
+    """Pinned HBM send/recv buffers + DMA semaphores kept inside the `jax_op`."""
 
     x_send: Any
     x_recv: Any
@@ -185,7 +207,11 @@ def async_ep_dispatch_start(
     *,
     collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
 ) -> tuple[AsyncDispatchState | jax.Array, jax.Array]:
-    """Barrier-allocate buffers and launch non-blocking 1-shot remote-DMA gather."""
+    """Barrier-allocate buffers and launch a non-blocking one-shot DMA gather.
+
+    Returns the in-flight state and a token for `async_ep_dispatch_wait`. On
+    a single-rank axis the state is `send_shard[None]` and no DMA is issued.
+    """
     axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
     if world_size == 1:
@@ -207,22 +233,18 @@ def async_ep_dispatch_start(
 
         my_id = jnp.uint32(jax.lax.axis_index(axis_key))
         with jax.named_scope("stage_send_and_local_recv"):
-            pltpu.make_async_copy(
+            stage_send = pltpu.make_async_copy(
                 src_ref=x_ref, dst_ref=state_ref.x_send, sem=local_sem
-            ).start()
-            pltpu.make_async_copy(
+            )
+            stage_local_recv = pltpu.make_async_copy(
                 src_ref=x_ref,
                 dst_ref=state_ref.x_recv.at[pl.ds(my_id, 1)],
                 sem=local_sem,
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=x_ref, dst_ref=state_ref.x_send, sem=local_sem
-            ).wait()
-            pltpu.make_async_copy(
-                src_ref=x_ref,
-                dst_ref=state_ref.x_recv.at[pl.ds(my_id, 1)],
-                sem=local_sem,
-            ).wait()
+            )
+            stage_send.start()
+            stage_local_recv.start()
+            stage_send.wait()
+            stage_local_recv.wait()
 
         with jax.named_scope("launch_async_remote_dispatch"):
             for i in range(world_size):
@@ -278,7 +300,12 @@ def async_ep_dispatch_wait(
     collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
     zero_extra_copy: bool = False,
 ) -> jax.Array:
-    """Wait on in-flight async EP dispatch DMAs, drain sends (`0` leak), and unpack."""
+    """Wait for an in-flight EP dispatch, drain its sends, and unpack the rows.
+
+    Returns `[world, rows, orig_lanes]`. With `zero_extra_copy` the rows are
+    unpacked straight from the receive buffer instead of being copied to a
+    fresh output buffer first.
+    """
     axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
     if world_size == 1:
@@ -286,26 +313,31 @@ def async_ep_dispatch_wait(
         return state
 
     assert isinstance(state, AsyncDispatchState)
+
+    def _wait_and_drain(state_ref: AsyncDispatchState) -> None:
+        with jax.named_scope("wait_remote_dispatch_recv"):
+            recv_slice = state_ref.x_recv.at[pl.ds(0, world_size - 1)]
+            pltpu.make_async_copy(
+                src_ref=recv_slice,
+                dst_ref=recv_slice,
+                sem=state_ref.data_recv_sem,
+            ).wait()
+        with jax.named_scope("drain_remote_dispatch_sends"):
+            for _ in range(world_size - 1):
+                pltpu.make_async_copy(
+                    src_ref=state_ref.x_send,
+                    dst_ref=state_ref.x_send,
+                    sem=state_ref.data_send_sem,
+                ).wait()
+
     if zero_extra_copy:
+
         def _wait_kernel_inplace(
             wait_tok_ref: Any,
             state_ref: AsyncDispatchState,
         ) -> None:
             _ = wait_tok_ref[0]
-            with jax.named_scope("wait_remote_dispatch_recv"):
-                recv_slice = state_ref.x_recv.at[pl.ds(0, world_size - 1)]
-                pltpu.make_async_copy(
-                    src_ref=recv_slice,
-                    dst_ref=recv_slice,
-                    sem=state_ref.data_recv_sem,
-                ).wait()
-            with jax.named_scope("drain_remote_dispatch_sends"):
-                for _ in range(world_size - 1):
-                    pltpu.make_async_copy(
-                        src_ref=state_ref.x_send,
-                        dst_ref=state_ref.x_send,
-                        sem=state_ref.data_send_sem,
-                    ).wait()
+            _wait_and_drain(state_ref)
 
         with xla_metadata.set_xla_metadata(
             async_type="collective-done",
@@ -332,31 +364,15 @@ def async_ep_dispatch_wait(
         out_sem: Any,
     ) -> None:
         _ = wait_tok_ref[0]
-        with jax.named_scope("wait_remote_dispatch_recv"):
-            recv_slice = state_ref.x_recv.at[pl.ds(0, world_size - 1)]
-            pltpu.make_async_copy(
-                src_ref=recv_slice,
-                dst_ref=recv_slice,
-                sem=state_ref.data_recv_sem,
-            ).wait()
-        with jax.named_scope("drain_remote_dispatch_sends"):
-            for _ in range(world_size - 1):
-                pltpu.make_async_copy(
-                    src_ref=state_ref.x_send,
-                    dst_ref=state_ref.x_send,
-                    sem=state_ref.data_send_sem,
-                ).wait()
+        _wait_and_drain(state_ref)
         with jax.named_scope("emit_dispatch_rows"):
-            pltpu.make_async_copy(
+            emit = pltpu.make_async_copy(
                 src_ref=state_ref.x_recv,
                 dst_ref=out_ref,
                 sem=out_sem,
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=state_ref.x_recv,
-                dst_ref=out_ref,
-                sem=out_sem,
-            ).wait()
+            )
+            emit.start()
+            emit.wait()
 
     with xla_metadata.set_xla_metadata(
         async_type="collective-done",
@@ -380,7 +396,12 @@ def _unpack_meta_columns(
     *,
     topk: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Unpack FTZ-safe byte-valued `bf16` `[rows, >= 3 * topk]` -> `(ag_ids, ag_weights)`."""
+    """Unpack byte-valued bf16 metadata `[rows, >= 3 * topk]`.
+
+    Columns `[0, topk)` and `[topk, 2 * topk)` hold the low and high bytes of
+    the int16 expert ids (byte values survive bf16 flush-to-zero), columns
+    `[2 * topk, 3 * topk)` the routing weights. Returns `(ids, weights)`.
+    """
     ag_meta = meta_2d[:, : 3 * topk]
     low_i32 = ag_meta[:, :topk].astype(jnp.int32)
     high_i32 = ag_meta[:, topk : 2 * topk].astype(jnp.int32)
@@ -395,20 +416,18 @@ def _unpack_axial_gathered(
     latent_dim: int,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Unpack `[dp_size * b_dp, latent_dim + 3 * topk]` -> `(ag_latent, ag_ids, ag_weights)` (`0` swapaxes)."""
+    """Split `[dp * B_dp, latent_dim + 3 * topk]` into `(latent, ids, weights)`."""
     ag_latent = gathered_dp_2d[:, :latent_dim]
-    ag_ids, ag_weights = _unpack_meta_columns(
-        gathered_dp_2d[:, latent_dim:], topk=topk
-    )
+    ag_ids, ag_weights = _unpack_meta_columns(gathered_dp_2d[:, latent_dim:], topk=topk)
     return ag_latent, ag_ids, ag_weights
 
 
 # =============================================================================
-# Option `O4-B` (`cid=2` + `cid=3` + Fused `RMSNorm` + `[latent_local]` Slice)
+# Hierarchical combine: DP reduce-scatter + TP psum + RMSNorm + column slice
 # =============================================================================
 
 
-def o4b_dp_rs_tp_psum_fused_rms_slice(
+def hierarchical_combine_rms_slice(
     moe_out: jax.Array,
     local_norm_w: jax.Array,
     local_tp_rank: jax.Array,
@@ -419,9 +438,16 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
     use_norm: bool,
     rms_eps: float,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-    vmem_mode: str = "off",
+    vmem_chain: bool = False,
 ) -> jax.Array:
-    """Option `O4-B`: 1-shot `'dp'` RS (`cid=2`) + guarded `'tp'` `psum` (`cid=3`) + fused `RMSNorm` + slice."""
+    """Combine the routed expert partial sums of every rank.
+
+    One-shot `'dp'` reduce-scatter of the rows, `'tp'` psum, exact
+    `RMSNorm(latent_dim)` (when `use_norm`), then this rank's
+    `latent_dim / tp_size` columns. Batches above `max_dma_tokens` (and a
+    single-rank mesh) use XLA collectives. With `vmem_chain` the DMA
+    collectives receive into VMEM up to `max_dma_tokens` rows.
+    """
     latent_local = latent_dim // tp_size
     world_size = dp_size * tp_size
     if moe_out.shape[0] > max_dma_tokens or world_size == 1:
@@ -430,9 +456,7 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
             if dp_size > 1
             else moe_out
         )
-        routed_full = (
-            lax.psum(routed_dp, TP_AXIS_NAME) if tp_size > 1 else routed_dp
-        )
+        routed_full = lax.psum(routed_dp, TP_AXIS_NAME) if tp_size > 1 else routed_dp
         if use_norm:
             routed_full = _jax_rms_norm(routed_full, local_norm_w, rms_eps)
         if tp_size > 1:
@@ -444,7 +468,7 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
             )
         return routed_full
 
-    vmax = max_dma_tokens if vmem_mode == "vmem_chain" else DEFAULT_VMEM_MAX_TOKENS
+    vmax = max_dma_tokens if vmem_chain else DEFAULT_VMEM_MAX_TOKENS
     if dp_size > 1:
         routed_dp = kimi_guarded_psum_scatter_rows(
             moe_out,
@@ -458,9 +482,9 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
         routed_dp = moe_out
 
     if tp_size > 1:
-        # Guard 1-shot `tp` `latency_psum` (`cid=3`) to `b_dp * tp_size <= 128`
-        # (`b_dp <= 32` at `TP=4`, `b_dp <= 16` at `TP=8`, `b_dp <= 8` at `TP=16`),
-        # falling back inside JAX to `lax.psum` for wider prefill/large-batch buckets!
+        # The one-shot TP psum handles at most `b_dp * tp_size <= 128` rows
+        # (b_dp <= 32 at TP=4, 16 at TP=8, 8 at TP=16); wider buckets fall back
+        # to `lax.psum` inside the guarded collective.
         tp_psum_cap = min(max_dma_tokens, max(8, 128 // tp_size))
         routed_full = kimi_guarded_psum(
             routed_dp,
@@ -487,11 +511,48 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
 
 
 # =============================================================================
-# Unified Single-`@jax_op` Factory (`build_kimi_moe_ep_overlap_op`) & HLO Audit
+# The EP-overlap `jax_op`
 # =============================================================================
 
 
-def _extract_moe_overlap_config(moe_module: Any) -> dict[str, Any]:
+@dataclasses.dataclass(frozen=True)
+class MoeOverlapConfig:
+    """Static configuration of one EP-overlap op, resolved before tracing.
+
+    Hashable, so it also keys the op cache.
+    """
+
+    moe_act_str: str
+    topk: int
+    has_scales: bool
+    has_bias: bool
+    use_norm: bool
+    rms_eps: float
+    shared_act_kind: str
+    situ_beta: float
+    situ_linear_beta: float | None
+    use_sparse_core: bool
+    onehot_thresh: int
+    skip_padded: bool
+    # Fused small-batch MXFP4 MoE kernel settings (see `fused_moe_func`).
+    token_trays_mode: str
+    rank3_scales: bool
+    fused_decode_max_tokens: int
+    # Leave the gathered rows in the dispatch receive buffer and let the
+    # combine collectives receive into VMEM.
+    vmem_chain: bool
+
+
+class MoeOverlapJaxFn(NamedTuple):
+    """The SPMD function of the EP-overlap op and its operand layout."""
+
+    fn: Callable[..., jax.Array]
+    in_specs: tuple[PartitionSpec, ...]
+    out_spec: PartitionSpec
+    arg_names: tuple[str, ...]
+
+
+def _extract_moe_overlap_config(moe_module: Any) -> MoeOverlapConfig:
     from vllm_torchtpu.layers.core.fused_moe_gmm import (
         resolve_onehot_permute_threshold,
     )
@@ -500,7 +561,8 @@ def _extract_moe_overlap_config(moe_module: Any) -> dict[str, Any]:
     qm = routed.quant_method
     moe_act_str = getattr(qm, "_tpu_activation_str", None)
     assert moe_act_str is not None, (
-        "[O4] process_weights_after_loading must run on routed_experts before building O4 op"
+        "[kimi_moe_ep_overlap] process_weights_after_loading must run on "
+        "routed_experts before building the EP-overlap op"
     )
     topk = int(routed.moe_config.experts_per_token)
     has_scales = (
@@ -513,9 +575,7 @@ def _extract_moe_overlap_config(moe_module: Any) -> dict[str, Any]:
     )
     use_norm = getattr(moe_module, "routed_expert_norm", None) is not None
     rms_eps = (
-        float(moe_module.routed_expert_norm.variance_epsilon)
-        if use_norm
-        else 1e-5
+        float(moe_module.routed_expert_norm.variance_epsilon) if use_norm else 1e-5
     )
     act_fn = moe_module.shared_experts.act_fn
     shared_act_kind = "situ" if hasattr(act_fn, "beta") else "silu"
@@ -527,21 +587,76 @@ def _extract_moe_overlap_config(moe_module: Any) -> dict[str, Any]:
     use_sparse_core = bool(envs.USE_MOE_SPARSE_CORE)
     onehot_thresh = int(resolve_onehot_permute_threshold())
     skip_padded = True if has_scales else bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
+    _, polish_tokens = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
+    spec_kda_mode = normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA)
 
-    return {
-        "moe_act_str": str(moe_act_str),
-        "topk": topk,
-        "has_scales": bool(has_scales),
-        "has_bias": bool(has_bias),
-        "use_norm": bool(use_norm),
-        "rms_eps": rms_eps,
-        "shared_act_kind": shared_act_kind,
-        "situ_beta": situ_beta,
-        "situ_linear_beta": situ_linear_beta,
-        "use_sparse_core": use_sparse_core,
-        "onehot_thresh": onehot_thresh,
-        "skip_padded": skip_padded,
-    }
+    return MoeOverlapConfig(
+        moe_act_str=str(moe_act_str),
+        topk=topk,
+        has_scales=bool(has_scales),
+        has_bias=bool(has_bias),
+        use_norm=bool(use_norm),
+        rms_eps=rms_eps,
+        shared_act_kind=shared_act_kind,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        use_sparse_core=use_sparse_core,
+        onehot_thresh=onehot_thresh,
+        skip_padded=skip_padded,
+        token_trays_mode="trays" if "trays" in polish_tokens else "off",
+        rank3_scales="copy_opt" in polish_tokens,
+        fused_decode_max_tokens=(
+            FUSED_VERIFY_MOE_MAX_TOKENS
+            if spec_kda_mode == "o6b"
+            else FUSED_DECODE_MOE_MAX_TOKENS
+        ),
+        vmem_chain="vmem_chain" in polish_tokens,
+    )
+
+
+def _dispatch_overlapping_shared_experts(
+    send_shard: jax.Array,
+    axis_name: str,
+    local_hidden: jax.Array,
+    local_w_shared_gu: jax.Array,
+    *,
+    rows: int,
+    orig_lanes: int,
+    zero_extra_copy: bool,
+    cfg: MoeOverlapConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Async EP dispatch over `axis_name` with the shared experts in between.
+
+    The optimization barriers make the shared-expert inputs depend on the
+    dispatch start token and the wait token depend on the shared-expert
+    output, so XLA keeps the order start -> shared experts -> wait.
+
+    Returns `(gathered [world, rows, orig_lanes], shared_act)`.
+    """
+    rx_state, start_tok = async_ep_dispatch_start(
+        send_shard,
+        axis_name,
+        collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+    )
+    hidden_after_start, start_tok = lax.optimization_barrier((local_hidden, start_tok))
+    shared_act = _compute_shared_gu_and_act(
+        hidden_after_start,
+        local_w_shared_gu,
+        act_kind=cfg.shared_act_kind,
+        situ_beta=cfg.situ_beta,
+        situ_linear_beta=cfg.situ_linear_beta,
+    )
+    wait_tok, shared_act = lax.optimization_barrier((start_tok, shared_act))
+    gathered = async_ep_dispatch_wait(
+        rx_state,
+        wait_tok,
+        axis_name,
+        rows=rows,
+        orig_lanes=orig_lanes,
+        collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+        zero_extra_copy=zero_extra_copy,
+    )
+    return gathered, shared_act
 
 
 def _make_moe_ep_overlap_jax_fn(
@@ -549,34 +664,13 @@ def _make_moe_ep_overlap_jax_fn(
     *,
     dp_size: int,
     tp_size: int,
-    exit_fold_mode: str,
     max_dma_tokens: int,
-    cfg: dict[str, Any],
-) -> tuple[Callable[..., jax.Array], tuple[PartitionSpec, ...], PartitionSpec]:
-    """Construct the pure JAX SPMD function + input/output `PartitionSpec`s."""
+    cfg: MoeOverlapConfig,
+) -> MoeOverlapJaxFn:
+    """Construct the SPMD JAX function and its input/output `PartitionSpec`s."""
     from vllm_torchtpu.layers.core.fused_moe_gmm import fused_moe_func
 
-    topk = int(cfg["topk"])
-    has_scales = bool(cfg["has_scales"])
-    has_bias = bool(cfg["has_bias"])
-    use_norm = bool(cfg["use_norm"])
-    rms_eps = float(cfg["rms_eps"])
-    moe_act_str = str(cfg["moe_act_str"])
-    shared_act_kind = str(cfg["shared_act_kind"])
-    situ_beta = float(cfg["situ_beta"])
-    situ_linear_beta = cfg["situ_linear_beta"]
-    use_sparse_core = bool(cfg["use_sparse_core"])
-    onehot_thresh = int(cfg["onehot_thresh"])
-    skip_padded = bool(cfg["skip_padded"])
-    _, polish_tokens = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
-    polish_trays = "trays" if "trays" in polish_tokens else "off"
-    polish_vmem = "vmem_chain" if "vmem_chain" in polish_tokens else "off"
-    polish_copy = "copy_opt" in polish_tokens
-    fused_decode_max_tokens = (
-        FUSED_VERIFY_MOE_MAX_TOKENS
-        if normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA) == "o6b"
-        else FUSED_DECODE_MOE_MAX_TOKENS
-    )
+    topk = cfg.topk
 
     spec_hidden = PartitionSpec(DP_AXIS_NAME, None)
     spec_rdown = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME)
@@ -588,80 +682,67 @@ def _make_moe_ep_overlap_jax_fn(
     out_spec = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME)
     out_sharding = NamedSharding(mesh, out_spec)
 
-    in_specs_list: list[PartitionSpec] = [
-        spec_hidden,     # 0: hidden_states [dp * B_dp, H]
-        spec_rdown,      # 1: routed_down_local [dp * B_dp, tp * d_local]
-        spec_meta,       # 2: packed_meta_padded [dp * B_dp, m_padded]
-        spec_w_sh,       # 3: w_shared_gu [H, tp * 2 * s_inter_tp]
-        spec_ep_w,       # 4: w1_sharded [dp, tp, E_local, ...]
-        spec_ep_w,       # 5: w2_sharded [dp, tp, E_local, ...]
+    # (name, spec) of every operand, in call order.
+    operands: list[tuple[str, PartitionSpec]] = [
+        ("hidden_states", spec_hidden),  # [dp * B_dp, H]
+        ("routed_down_local", spec_rdown),  # [dp * B_dp, tp * d_local]
+        ("packed_meta", spec_meta),  # [dp * B_dp, m_padded]
+        ("w_shared_gu", spec_w_sh),  # [H, tp * 2 * s_inter_tp]
+        ("w1_sharded", spec_ep_w),  # [dp, tp, E_local, ...]
+        ("w2_sharded", spec_ep_w),  # [dp, tp, E_local, ...]
     ]
-    arg_names: list[str] = [
-        "hidden_states",
-        "routed_down_local",
-        "packed_meta",
-        "w_shared_gu",
-        "w1_sharded",
-        "w2_sharded",
-    ]
-    if has_scales:
-        in_specs_list.extend([spec_ep_w, spec_ep_w])  # w1_scale, w2_scale
-        arg_names.extend(["w1_scale_sharded", "w2_scale_sharded"])
-    if has_bias:
-        in_specs_list.extend([spec_ep_w, spec_ep_w])  # w1_bias, w2_bias
-        arg_names.extend(["w1_bias_sharded", "w2_bias_sharded"])
-    if use_norm:
-        in_specs_list.append(spec_norm)               # norm_weight [latent_dim]
-        arg_names.append("norm_weight")
-    in_specs_list.extend([spec_scalar_2d, spec_scalar_2d])  # experts_start_2d, tp_rank_2d
-    arg_names.extend(["experts_start_2d", "tp_rank_2d"])
-    in_specs = tuple(in_specs_list)
-    arg_names_t = tuple(arg_names)
+    if cfg.has_scales:
+        operands += [("w1_scale_sharded", spec_ep_w), ("w2_scale_sharded", spec_ep_w)]
+    if cfg.has_bias:
+        operands += [("w1_bias_sharded", spec_ep_w), ("w2_bias_sharded", spec_ep_w)]
+    if cfg.use_norm:
+        operands.append(("norm_weight", spec_norm))  # [latent_dim]
+    operands += [("experts_start_2d", spec_scalar_2d), ("tp_rank_2d", spec_scalar_2d)]
+    in_specs = tuple(spec for _, spec in operands)
+    arg_names_t = tuple(name for name, _ in operands)
 
     def _jax_fn(*global_args: jax.Array) -> jax.Array:
         def _local(*local_args: jax.Array) -> jax.Array:
-            idx = 0
-            local_hidden = local_args[idx]; idx += 1
-            local_rdown = local_args[idx]; idx += 1
-            local_meta = local_args[idx]; idx += 1
-            local_w_shared_gu = local_args[idx]; idx += 1
-            local_w1 = jnp.squeeze(local_args[idx], axis=(0, 1)); idx += 1
-            local_w2 = jnp.squeeze(local_args[idx], axis=(0, 1)); idx += 1
-            if has_scales:
-                local_w1_scale = jnp.squeeze(local_args[idx], axis=(0, 1)); idx += 1
-                local_w2_scale = jnp.squeeze(local_args[idx], axis=(0, 1)); idx += 1
+            named = dict(zip(arg_names_t, local_args, strict=True))
+            local_hidden = named["hidden_states"]
+            local_rdown = named["routed_down_local"]
+            local_meta = named["packed_meta"]
+            local_w_shared_gu = named["w_shared_gu"]
+            local_w1 = jnp.squeeze(named["w1_sharded"], axis=(0, 1))
+            local_w2 = jnp.squeeze(named["w2_sharded"], axis=(0, 1))
+            if cfg.has_scales:
+                local_w1_scale = jnp.squeeze(named["w1_scale_sharded"], axis=(0, 1))
+                local_w2_scale = jnp.squeeze(named["w2_scale_sharded"], axis=(0, 1))
             else:
                 local_w1_scale = None
                 local_w2_scale = None
-            if has_bias:
-                local_w1_bias = jnp.squeeze(local_args[idx], axis=(0, 1)); idx += 1
-                local_w2_bias = jnp.squeeze(local_args[idx], axis=(0, 1)); idx += 1
+            if cfg.has_bias:
+                local_w1_bias = jnp.squeeze(named["w1_bias_sharded"], axis=(0, 1))
+                local_w2_bias = jnp.squeeze(named["w2_bias_sharded"], axis=(0, 1))
             else:
                 local_w1_bias = None
                 local_w2_bias = None
-            if use_norm:
-                local_norm_w = local_args[idx]; idx += 1
+            if cfg.use_norm:
+                local_norm_w = named["norm_weight"]
             else:
                 local_norm_w = jnp.ones((1,), dtype=jnp.bfloat16)
-            local_experts_start = local_args[idx][0, 0]; idx += 1
-            local_tp_rank = local_args[idx]; idx += 1
+            local_experts_start = named["experts_start_2d"][0, 0]
+            local_tp_rank = named["tp_rank_2d"]
 
             b_dp, d_local = local_rdown.shape
             latent_dim = tp_size * d_local
             b_global = dp_size * b_dp
-            zero_wait_copy = polish_vmem == "vmem_chain"
 
-            # 1. Dispatch + Shared Gate/Up Compute: 2-stage `TP` (`cid=0`) ->
-            #    async `DP` (`cid=1`) for decode (`<= max_dma_tokens`), and 1D
-            #    axial `TP` (`axis=1`) -> `DP` (`axis=0`) XLA `all_gather` for
-            #    prefill (`> max_dma_tokens`).
+            # 1. Dispatch + shared gate/up compute.
             if b_global > max_dma_tokens:
+                # Prefill: XLA all-gathers on contiguous axes (TP on axis 1,
+                # then DP on axis 0), so no 4D transpose is needed.
                 shared_act = _compute_shared_gu_and_act(
                     local_hidden,
                     local_w_shared_gu,
-                    act_kind=shared_act_kind,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
+                    act_kind=cfg.shared_act_kind,
+                    situ_beta=cfg.situ_beta,
+                    situ_linear_beta=cfg.situ_linear_beta,
                 )
                 lat_tp = (
                     lax.all_gather(local_rdown, TP_AXIS_NAME, axis=1, tiled=True)
@@ -680,10 +761,10 @@ def _make_moe_ep_overlap_jax_fn(
                     )
                 else:
                     ag_latent = lat_tp
-                    ag_ids, ag_weights = _unpack_meta_columns(
-                        local_meta, topk=topk
-                    )
+                    ag_ids, ag_weights = _unpack_meta_columns(local_meta, topk=topk)
             elif dp_size > 1:
+                # Decode: one-shot TP all-gather of the latent, then the async
+                # DP dispatch of latent + metadata.
                 lat_tp = (
                     kimi_guarded_all_gather_cols(
                         local_rdown,
@@ -699,90 +780,50 @@ def _make_moe_ep_overlap_jax_fn(
                 packed_dp = jnp.concatenate(
                     (lat_tp, local_meta[:, : 3 * topk]), axis=-1
                 )
-                rx_state, start_tok = async_ep_dispatch_start(
+                gathered_dp_3d, shared_act = _dispatch_overlapping_shared_experts(
                     packed_dp,
                     DP_AXIS_NAME,
-                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                )
-                hidden_after_start, start_tok = lax.optimization_barrier(
-                    (local_hidden, start_tok)
-                )
-                shared_act = _compute_shared_gu_and_act(
-                    hidden_after_start,
+                    local_hidden,
                     local_w_shared_gu,
-                    act_kind=shared_act_kind,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
-                )
-                wait_tok, shared_act = lax.optimization_barrier(
-                    (start_tok, shared_act)
-                )
-                gathered_dp_3d = async_ep_dispatch_wait(
-                    rx_state,
-                    wait_tok,
-                    DP_AXIS_NAME,
                     rows=b_dp,
                     orig_lanes=dp_orig_lanes,
-                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                    zero_extra_copy=zero_wait_copy,
+                    zero_extra_copy=cfg.vmem_chain,
+                    cfg=cfg,
                 )
-                gathered_dp = gathered_dp_3d.reshape(
-                    dp_size * b_dp, dp_orig_lanes
-                )
+                gathered_dp = gathered_dp_3d.reshape(dp_size * b_dp, dp_orig_lanes)
                 ag_latent, ag_ids, ag_weights = _unpack_axial_gathered(
                     gathered_dp, latent_dim=latent_dim, topk=topk
                 )
             elif tp_size > 1:
-                rx_state, start_tok = async_ep_dispatch_start(
+                # Decode, single DP group: async TP dispatch of the latent.
+                lat_tp_3d, shared_act = _dispatch_overlapping_shared_experts(
                     local_rdown,
                     TP_AXIS_NAME,
-                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                )
-                hidden_after_start, start_tok = lax.optimization_barrier(
-                    (local_hidden, start_tok)
-                )
-                shared_act = _compute_shared_gu_and_act(
-                    hidden_after_start,
+                    local_hidden,
                     local_w_shared_gu,
-                    act_kind=shared_act_kind,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
-                )
-                wait_tok, shared_act = lax.optimization_barrier(
-                    (start_tok, shared_act)
-                )
-                lat_tp_3d = async_ep_dispatch_wait(
-                    rx_state,
-                    wait_tok,
-                    TP_AXIS_NAME,
                     rows=b_dp,
                     orig_lanes=d_local,
-                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                    zero_extra_copy=zero_wait_copy,
+                    zero_extra_copy=cfg.vmem_chain,
+                    cfg=cfg,
                 )
                 ag_latent = (
                     lat_tp_3d.reshape(1, latent_dim)
                     if b_dp == 1
                     else jnp.swapaxes(lat_tp_3d, 0, 1).reshape(b_dp, latent_dim)
                 )
-                ag_ids, ag_weights = _unpack_meta_columns(
-                    local_meta, topk=topk
-                )
+                ag_ids, ag_weights = _unpack_meta_columns(local_meta, topk=topk)
             else:
                 shared_act = _compute_shared_gu_and_act(
                     local_hidden,
                     local_w_shared_gu,
-                    act_kind=shared_act_kind,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
+                    act_kind=cfg.shared_act_kind,
+                    situ_beta=cfg.situ_beta,
+                    situ_linear_beta=cfg.situ_linear_beta,
                 )
                 ag_latent = local_rdown
-                ag_ids, ag_weights = _unpack_meta_columns(
-                    local_meta, topk=topk
-                )
+                ag_ids, ag_weights = _unpack_meta_columns(local_meta, topk=topk)
 
-            # 2. Routed MoE Compute (`fused_decode_moe_v6e_planar_t_b11` for <=64, or
-            #    <=256 multi-tray under `TPU_KIMI_OPT_SPEC_KDA=o6b`; `moe_gmm` above)
+            # 2. Routed experts.
             moe_out = fused_moe_func(
                 ag_latent,
                 local_w1,
@@ -795,33 +836,32 @@ def _make_moe_ep_overlap_jax_fn(
                 ag_ids,
                 local_experts_start,
                 topk=topk,
-                activation=moe_act_str,
+                activation=cfg.moe_act_str,
                 use_ep=True,
-                use_sparse_core=use_sparse_core,
-                onehot_moe_permute_threshold=onehot_thresh,
+                use_sparse_core=cfg.use_sparse_core,
+                onehot_moe_permute_threshold=cfg.onehot_thresh,
                 rhs_quant_dtype=None,
-                skip_padded_tokens=skip_padded,
-                token_trays_mode=polish_trays,
-                rank3_scales=polish_copy,
-                fused_decode_max_tokens=fused_decode_max_tokens,
+                skip_padded_tokens=cfg.skip_padded,
+                token_trays_mode=cfg.token_trays_mode,
+                rank3_scales=cfg.rank3_scales,
+                fused_decode_max_tokens=cfg.fused_decode_max_tokens,
             )
 
-            # 3. Mathematically Exact Combine + `RMSNorm(latent_dim)` + `[latent_local]` Exit-Fold
-            routed_local = o4b_dp_rs_tp_psum_fused_rms_slice(
+            # 3. Exact combine + RMSNorm(latent_dim) + [latent_local] slice.
+            routed_local = hierarchical_combine_rms_slice(
                 moe_out,
                 local_norm_w,
                 local_tp_rank,
                 dp_size=dp_size,
                 tp_size=tp_size,
                 latent_dim=latent_dim,
-                use_norm=use_norm,
-                rms_eps=rms_eps,
+                use_norm=cfg.use_norm,
+                rms_eps=cfg.rms_eps,
                 max_dma_tokens=max_dma_tokens,
-                vmem_mode=polish_vmem,
+                vmem_chain=cfg.vmem_chain,
             )
 
-            # Concatenate `(shared_act, routed_local)` inside `@jax_op` so `packed_moe_out`
-            # receives a single contiguous `[B_dp, s_inter_tp + latent_local]` tensor!
+            # One contiguous [B_dp, s_inter_tp + latent_local] output.
             return jnp.concatenate((shared_act, routed_local), axis=-1)
 
         out = jax.shard_map(
@@ -842,7 +882,7 @@ def _make_moe_ep_overlap_jax_fn(
         ],
         return_annotation=jax.Array,
     )
-    return _jax_fn, in_specs, out_spec, arg_names_t
+    return MoeOverlapJaxFn(_jax_fn, in_specs, out_spec, arg_names_t)
 
 
 def build_kimi_moe_ep_overlap_op(
@@ -851,9 +891,9 @@ def build_kimi_moe_ep_overlap_op(
     *,
     exit_fold_mode: str,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-    variant_tag: str = "o4",
+    variant_tag: str = "ep_overlap",
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, Any], torch.Tensor]:
-    """Build (or reuse cached) unified `kimi_moe_ep_overlap` `@jax_op` across layers."""
+    """Build (or reuse the cached) EP-overlap `jax_op` for one MoE layer shape."""
     # Imported here: kernels/ must not import models/ at module load (cycle).
     from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
         REGISTERED_OPS,
@@ -864,32 +904,18 @@ def build_kimi_moe_ep_overlap_op(
 
     norm_mode = normalize_exit_fold_mode(exit_fold_mode)
     if norm_mode == "off":
-        raise ValueError("build_kimi_moe_ep_overlap_op requires an active exit_fold_mode")
+        raise ValueError(
+            "build_kimi_moe_ep_overlap_op requires an active exit_fold_mode"
+        )
 
     dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
     cfg = _extract_moe_overlap_config(moe_module)
-    cfg_sig = (
-        cfg["moe_act_str"],
-        cfg["topk"],
-        cfg["has_scales"],
-        cfg["has_bias"],
-        cfg["use_norm"],
-        cfg["rms_eps"],
-        cfg["shared_act_kind"],
-        cfg["situ_beta"],
-        cfg["situ_linear_beta"],
-        cfg["use_sparse_core"],
-        cfg["onehot_thresh"],
-        cfg["skip_padded"],
-    )
 
-    combine_kind_sig, _, dispatch_kind_sig = resolve_effective_exit_fold_plan(
-        norm_mode
-    )
-    impl_tag = f"_{dispatch_kind_sig}_{combine_kind_sig}"
+    plan = resolve_effective_exit_fold_plan(norm_mode)
+    impl_tag = f"_{plan.dispatch_kind}_{plan.combine_kind}"
     spec_tag = (
-        f"{norm_mode}{impl_tag}_k{cfg['topk']}_{sanitize_tag(cfg['shared_act_kind'])}"
-        f"_q{int(cfg['has_scales'])}_n{int(cfg['use_norm'])}"
+        f"{norm_mode}{impl_tag}_k{cfg.topk}_{sanitize_tag(cfg.shared_act_kind)}"
+        f"_q{int(cfg.has_scales)}_n{int(cfg.use_norm)}"
     )
     op_name = format_pallas_dma_op_name(
         kind="moe_ep_overlap",
@@ -902,7 +928,7 @@ def build_kimi_moe_ep_overlap_op(
         tp_size=tp_size,
         variant_tag=variant_tag,
     )
-    raw_key = ("moe_ep_overlap_raw", op_name, dev_ids, cfg_sig)
+    raw_key = ("moe_ep_overlap_raw", op_name, dev_ids, cfg)
 
     if raw_key in REGISTERED_OPS:
         raw_op = REGISTERED_OPS[raw_key]
@@ -913,7 +939,6 @@ def build_kimi_moe_ep_overlap_op(
             mesh,
             dp_size=dp_size,
             tp_size=tp_size,
-            exit_fold_mode=norm_mode,
             max_dma_tokens=max_dma_tokens,
             cfg=cfg,
         )
@@ -945,10 +970,6 @@ def build_kimi_moe_ep_overlap_op(
         raw_op.register_fake(_fake_fn)
         REGISTERED_OPS[raw_key] = raw_op  # type: ignore[assignment]
 
-    has_scales = bool(cfg["has_scales"])
-    has_bias = bool(cfg["has_bias"])
-    use_norm = bool(cfg["use_norm"])
-
     def _call(
         hidden_states: torch.Tensor,
         routed_down_local: torch.Tensor,
@@ -975,13 +996,13 @@ def build_kimi_moe_ep_overlap_op(
             w1_5d,
             w2_5d,
         ]
-        if has_scales:
+        if cfg.has_scales:
             call_args.append(routed.w13_weight_scale.unsqueeze(0).unsqueeze(0))
             call_args.append(routed.w2_weight_scale.unsqueeze(0).unsqueeze(0))
-        if has_bias:
+        if cfg.has_bias:
             call_args.append(routed.w13_bias.unsqueeze(0).unsqueeze(0))
             call_args.append(routed.w2_bias.unsqueeze(0).unsqueeze(0))
-        if use_norm:
+        if cfg.use_norm:
             call_args.append(layer_moe.routed_expert_norm.weight)
         call_args.append(routed._experts_start.reshape(1, 1))
         call_args.append(layer_moe._dma_tp_rank_buf)
