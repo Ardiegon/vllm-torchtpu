@@ -71,9 +71,7 @@ def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=Fa
 def _mix_kernel_bt(prefix, weight, history_ref, output, *, eps):
     p = prefix[...].astype(jnp.float32)
     w = weight[...].astype(jnp.float32)
-    bs = [
-        history_ref[b].astype(jnp.float32) for b in range(history_ref.shape[0])
-    ] + [p]
+    bs = [history_ref[b].astype(jnp.float32) for b in range(history_ref.shape[0])] + [p]
     scores = []
     for v in bs:
         inv_norm = jax.lax.rsqrt(jnp.mean(v * v, axis=-1, keepdims=True) + eps)
@@ -133,4 +131,3 @@ def attention_residual_bt(
         interpret=interpret,
         name=f"kimi_attnres_bt_m{bm}",
     )(prefix, folded_weight, history_bt)
-
