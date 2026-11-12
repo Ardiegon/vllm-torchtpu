@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
