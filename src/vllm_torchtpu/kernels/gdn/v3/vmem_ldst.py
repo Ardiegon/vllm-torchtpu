@@ -127,17 +127,18 @@ def load_state_region(
         for j in range(region.nblocks)
     ]
     arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
-    # When a bfloat16 state uses a uint32 VMEM view (2 bf16 elements per
-    # uint32 word), unpack on the full tile-aligned (rows_capacity, out_lanes)
-    # VREG array before slicing to rows_used * 2 so Mosaic never sees a
-    # sub-8-sublane bitcast (e.g., 54 rows = 6*8 + 6).
+    # When a bfloat16 state uses a uint32 VMEM view (BF16_PER_U32 bf16
+    # elements per uint32 word), unpack on the full tile-aligned
+    # (rows_capacity, out_lanes) VREG array before slicing to the bf16 rows
+    # so Mosaic never sees a sub-8-sublane bitcast (e.g., 54 rows = 6*8 + 6).
+    bf16_rows_used = region.rows_used * config.BF16_PER_U32
     if (
         region.view_dtype == jnp.uint32
-        and math.prod(shape) == region.rows_used * arr.shape[-1] * 2
+        and math.prod(shape) == bf16_rows_used * arr.shape[-1]
     ):
         assert region.rows_perm is None
         arr = pltpu.bitcast(arr, jnp.bfloat16)
-        arr = arr[: region.rows_used * 2]
+        arr = arr[:bf16_rows_used]
     else:
         arr = arr[: region.rows_used]
     if region.rows_perm is not None:
@@ -160,7 +161,7 @@ def store_state_region(
     if region.view_dtype == jnp.uint32 and values.dtype == jnp.float32:
         assert region.rows_perm is None
         bf16_arr = values.astype(jnp.bfloat16).reshape(-1, out_lanes)
-        bf16_cap = capacity * 2
+        bf16_cap = capacity * config.BF16_PER_U32
         if bf16_arr.shape[0] < bf16_cap:
             bf16_arr = jnp.pad(bf16_arr, ((0, bf16_cap - bf16_arr.shape[0]), (0, 0)))
         arr = pltpu.bitcast(bf16_arr, jnp.uint32)

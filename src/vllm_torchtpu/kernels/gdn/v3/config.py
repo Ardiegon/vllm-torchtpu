@@ -56,6 +56,10 @@ class StateWrite(enum.StrEnum):
     LAST = enum.auto()
 
 
+# bfloat16 elements packed into one uint32 word of a uint32 state view.
+BF16_PER_U32 = jnp.dtype(jnp.uint32).itemsize // jnp.dtype(jnp.bfloat16).itemsize
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Dtypes:

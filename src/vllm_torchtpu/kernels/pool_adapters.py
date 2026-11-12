@@ -476,6 +476,12 @@ def _conv_qk_pair_rows_perm(
     return tuple(perm)
 
 
+def _bf16_rows_as_u32(rows: int) -> int:
+    """Typed rows of a uint32 view packing ``rows`` bf16 rows per lane."""
+    assert rows % gdn_v3_config.BF16_PER_U32 == 0, rows
+    return rows // gdn_v3_config.BF16_PER_U32
+
+
 def v3_state_source(
     pool,
     *,
@@ -552,8 +558,7 @@ def v3_state_source(
     # which halves the number of view rows used.
     if recurrent_state_dtype == jnp.bfloat16:
         ssm_view_dtype = jnp.dtype(jnp.uint32)
-        assert ssm_rows_used % 2 == 0, ssm_rows_used
-        ssm_rows_used //= 2
+        ssm_rows_used = _bf16_rows_as_u32(ssm_rows_used)
     else:
         ssm_view_dtype = recurrent_state_dtype
 
@@ -580,11 +585,6 @@ def v3_state_source(
         block_size,
     )
     if conv_dim % lanes == 0:
-        assert (kernel_size - 1) * conv_dim % lanes == 0, (
-            kernel_size,
-            conv_dim,
-            lanes,
-        )
         conv_lane_split = 1
         conv_out_lanes = lanes
         conv_view_dtype = jnp.dtype(jnp.bfloat16)
@@ -600,7 +600,6 @@ def v3_state_source(
         conv_lane_split = lanes // d_v
         conv_out_lanes = d_v
         conv_bf16_rows = (kernel_size - 1) * conv_dim // conv_out_lanes
-        assert conv_bf16_rows % 2 == 0, conv_bf16_rows
         assert conv_bf16_rows * 2 * conv_out_lanes <= conv_ntok * tok_bytes, (
             conv_bf16_rows,
             conv_ntok,
@@ -612,7 +611,7 @@ def v3_state_source(
         # load_state_region / store_state_region unpacks/packs 2 bf16 per uint32
         # on the full tile-aligned VREG array.
         conv_view_dtype = jnp.dtype(jnp.uint32)
-        conv_rows = conv_bf16_rows // 2
+        conv_rows = _bf16_rows_as_u32(conv_bf16_rows)
     conv_rows_perm = None
     if qk_pair_layout:
         assert conv_lane_split == 1, conv_lane_split
