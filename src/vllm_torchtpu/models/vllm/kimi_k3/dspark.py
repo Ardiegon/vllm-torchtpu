@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -38,6 +39,7 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_torchtpu.layers.core.quantization import quantize_kv
+from vllm_torchtpu.logger import init_logger
 
 from .attention import MultiHeadLatentAttention
 from .layers import KimiMLP
@@ -46,6 +48,11 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         VllmTPUMLAAttention,
     )
+
+logger = init_logger(__name__)
+
+# Largest integer up to which every integer is exact in float32.
+_MAX_EXACT_FLOAT32_INT = 2**24
 
 
 def _duplicate_context_kv_weights(
@@ -343,6 +350,9 @@ class K3DSparkForCausalLM(nn.Module):
             self.config.draft_vocab_size,
             scale=getattr(self.config, "logit_scale", 1.0),
         )
+        # Set by `shard_markov_head`: the Markov head then holds only this
+        # rank's vocab rows.
+        self._markov_head_vocab_sharded = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -389,7 +399,73 @@ class K3DSparkForCausalLM(nn.Module):
         return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        if self._markov_head_vocab_sharded:
+            raise RuntimeError(
+                "K3DSpark: the Markov head holds only this rank's vocab rows "
+                "after shard_markov_head(); use markov_bias_local()."
+            )
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def shard_markov_head(self) -> int | None:
+        """Keep only this rank's vocab rows of the Markov head.
+
+        The draft logits come from the target's vocab-parallel lm_head. With
+        the Markov bias sliced to the same vocab shard, a draft position
+        needs a local max and a cross-rank (value, index) reduction instead
+        of the gathered full-vocab logits and the whole ``markov_w2``.
+
+        Returns:
+            The first vocab id of this rank's shard, or None when the head
+            stays replicated.
+        """
+        lm_head = self.lm_head
+        assert isinstance(lm_head, ParallelLMHead), type(lm_head)
+        if lm_head.tp_size == 1:
+            return None
+        reason = self._markov_head_replication_reason(lm_head)
+        if reason is not None:
+            logger.warning_once(
+                "K3DSpark: keeping the Markov head replicated across %d TP "
+                "ranks (full-vocab draft logits are gathered per draft): %s.",
+                lm_head.tp_size,
+                reason,
+            )
+            return None
+        shard = lm_head.shard_indices
+        start = int(shard.org_vocab_start_index)
+        end = int(shard.org_vocab_end_index)
+        w2 = self.model.markov_head.markov_w2
+        w2.weight = nn.Parameter(
+            w2.weight[start:end].contiguous().clone(), requires_grad=False
+        )
+        self._markov_head_vocab_sharded = True
+        return start
+
+    def _markov_head_replication_reason(self, lm_head: ParallelLMHead) -> str | None:
+        """Why the Markov head cannot be vocab-sharded, or None if it can."""
+        if lm_head.shard_indices.num_org_vocab_padding != 0:
+            return "the lm_head vocab shards are padded"
+        processor = self.logits_processor
+        if processor.soft_cap is not None or processor.scale != 1.0:
+            return "the logits are soft-capped or scaled"
+        w2 = self.model.markov_head.markov_w2.weight
+        if w2.dim() != 2 or w2.shape[0] != processor.org_vocab_size:
+            return "the Markov head rows do not match the lm_head vocab"
+        if processor.org_vocab_size > _MAX_EXACT_FLOAT32_INT:
+            return "token ids are not exact in float32 for this vocab size"
+        return None
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab slice of the draft logits (no TP gather)."""
+        assert self.lm_head is not None
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """The Markov bias over this rank's vocab rows."""
+        assert self._markov_head_vocab_sharded
+        return nn.functional.linear(
+            markov_embed, self.model.markov_head.markov_w2.weight
+        )
 
     def load_weights(
         self,

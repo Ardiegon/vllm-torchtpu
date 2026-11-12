@@ -34,6 +34,7 @@ Gumbel-coupled sampling is not implemented.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Protocol, runtime_checkable
 
 import torch
 import vllm.distributed
@@ -47,8 +48,38 @@ from vllm_torchtpu.tpu_info import get_chip_version
 
 logger = init_logger(__name__)
 
-# Largest integer up to which every integer is exact in float32.
-_MAX_EXACT_FLOAT32_INT = 2**24
+
+@runtime_checkable
+class VocabParallelMarkovDraft(Protocol):
+    """DSpark draft model that drafts position-major from its vocab shard.
+
+    A draft model opts in by implementing these methods; the proposer then
+    computes the draft logits position-major (see `_position_major_hidden`)
+    and, when the model could shard its Markov head, samples from this
+    rank's vocab slice. Draft models that do not implement them keep the
+    request-major path through `compute_draft_logits` and `markov_bias`.
+    """
+
+    def shard_markov_head(self) -> int | None:
+        """Keep only this rank's vocab rows of the Markov head.
+
+        Called once, after the lm_head is shared with the target. The
+        proposer reduces (value, token id) pairs across ranks in float32, so
+        a model shards only a vocab whose ids are exact in float32.
+
+        Returns:
+            The first vocab id of this rank's shard, or None when the head
+            stays replicated.
+        """
+        ...
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's ``[rows, vocab / tp]`` slice of the draft logits."""
+        ...
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """The Markov bias over this rank's vocab rows."""
+        ...
 
 
 class DSparkProposer(DFlashProposer):
@@ -106,18 +137,16 @@ class DSparkProposer(DFlashProposer):
                 self.block_size,
                 trained_block,
             )
-        # Position-major draft logits (see `_dflash_forward_and_sample`);
-        # `load_model` derives it from the draft's lm_head layout.
+        # Set by `load_model` for a `VocabParallelMarkovDraft` draft model.
         self._position_major_logits = False
         # Rows of one aligned tile of position-major requests. Resolved here
         # because the drafting forward is traced.
         self._request_tile_rows = pltpu.get_tpu_info_for_chip(
             get_chip_version(), 1
         ).num_sublanes
-        # Vocab-parallel Markov head state, set by `_shard_markov_head`.
-        self._markov_w2_local: torch.Tensor | None = None
-        self._markov_vocab_start = 0
-        self._markov_tp = 1
+        # First vocab id of this rank's shard when the draft model sharded its
+        # Markov head (`VocabParallelMarkovDraft.shard_markov_head`).
+        self._markov_vocab_start: int | None = None
         logger.info(
             "DSpark: sample_from_anchor=%s, K=%d.",
             self.sample_from_anchor,
@@ -152,74 +181,15 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
-        # A vocab-parallel lm_head makes the draft logits position-major (see
-        # `_position_major_hidden`), with the Markov head sharded over the
-        # same vocab rows where the layout allows it.
         draft = self.draft_model
-        assert draft is not None
-        lm_head = draft.lm_head
-        self._markov_w2_local = self._shard_markov_head()
-        self._position_major_logits = self._markov_w2_local is not None or (
-            lm_head is not None and lm_head.tp_size > 1
-        )
+        if isinstance(draft, VocabParallelMarkovDraft):
+            self._position_major_logits = True
+            self._markov_vocab_start = draft.shard_markov_head()
         logger.info(
             "DSpark: position_major_logits=%s, vocab-parallel Markov sampling=%s.",
             self._position_major_logits,
-            self._markov_w2_local is not None,
+            self._markov_vocab_start is not None,
         )
-
-    def _shard_markov_head(self) -> torch.Tensor | None:
-        """Keep only this rank's vocab rows of the Markov head.
-
-        The draft logits come from the target's vocab-parallel lm_head; with
-        the Markov bias sliced to the same vocab shard, every draft position
-        takes a local max plus a tiny cross-rank (value, index) reduction
-        instead of all-gathering the full-vocab logits and reading the whole
-        replicated ``markov_w2`` (V x r) once per position. Each logit is the
-        same full-hidden dot product either way. Returns None (replicated
-        path) when the layout does not allow it.
-        """
-        reason = self._markov_head_replication_reason()
-        if reason is not None:
-            logger.info("DSpark: keeping the Markov head replicated: %s.", reason)
-            return None
-        draft = self.draft_model
-        assert draft is not None
-        head = draft.model.markov_head
-        shard = draft.lm_head.shard_indices
-        start = int(shard.org_vocab_start_index)
-        end = int(shard.org_vocab_end_index)
-        local = head.markov_w2.weight[start:end].contiguous().clone()
-        # Drop the replicated copy: only the shard is read from now on. The
-        # draft's own `markov_bias` would now see a partial vocab, so the
-        # vocab-parallel drafting path never calls it.
-        head.markov_w2.weight = torch.nn.Parameter(local, requires_grad=False)
-        self._markov_vocab_start = start
-        self._markov_tp = draft.lm_head.tp_size
-        return local
-
-    def _markov_head_replication_reason(self) -> str | None:
-        """Why the Markov head cannot be vocab-sharded, or None if it can."""
-        draft = self.draft_model
-        assert draft is not None
-        lm_head = draft.lm_head
-        if lm_head is None or lm_head.tp_size <= 1:
-            return "the lm_head is not vocab-parallel"
-        if lm_head.shard_indices.num_org_vocab_padding != 0:
-            return "the lm_head vocab shards are padded"
-        lp = draft.logits_processor
-        if lp.soft_cap is not None or lp.scale != 1.0:
-            return "the logits are soft-capped or scaled"
-        if draft.draft_id_to_target_id is not None:
-            return "draft token ids are remapped to the target vocab"
-        w2 = draft.model.markov_head.markov_w2.weight
-        if not isinstance(w2, torch.Tensor) or w2.dim() != 2:
-            return "the Markov head weight is not a 2-D tensor"
-        if w2.shape[0] != lp.org_vocab_size:
-            return "the Markov head rows do not match the lm_head vocab"
-        if lp.org_vocab_size > _MAX_EXACT_FLOAT32_INT:
-            return "token ids are not exact in float32 for this vocab size"
-        return None
 
     def _vocab_parallel_argmax(
         self, local_scores: torch.Tensor, rows: int
@@ -227,13 +197,14 @@ class DSparkProposer(DFlashProposer):
         """Global argmax of vocab-sharded ``[rows, V/tp]`` scores (first max
         wins on ties, like ``torch.argmax`` over the gathered vocab)."""
         vals, idx = local_scores.max(dim=-1)
-        # One float32 all-gather carries (value, token id) pairs; the ids are
-        # exact because `_shard_markov_head` caps the vocab at 2**24.
-        pair = torch.stack(
-            [vals.float(), (idx + self._markov_vocab_start).float()], dim=-1
-        )
+        vocab_start = self._markov_vocab_start
+        assert vocab_start is not None
+        # One float32 all-gather carries (value, token id) pairs; the draft
+        # model only shards a vocab whose ids are exact in float32.
+        pair = torch.stack([vals.float(), (idx + vocab_start).float()], dim=-1)
+        tp_size = vllm.distributed.get_tensor_model_parallel_world_size()
         gathered = vllm.distributed.tensor_model_parallel_all_gather(pair, dim=-1).view(
-            rows, self._markov_tp, 2
+            rows, tp_size, 2
         )
         best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
         return gathered[:, :, 1].gather(dim=-1, index=best).squeeze(-1).long()
@@ -271,13 +242,10 @@ class DSparkProposer(DFlashProposer):
             flat_pm, prev, reqs_tile = self._position_major_hidden(
                 valid_hidden, ids_3d[:, 0], block_size, self._request_tile_rows
             )
-            w2_local = self._markov_w2_local
-            if w2_local is not None:
-                # This rank's vocab slice of the logits (no TP gather), like
-                # upstream LlamaForCausalLM.compute_logits_local.
-                local_logits = self.draft_model.logits_processor(
-                    self.draft_model.lm_head, flat_pm, skip_gather=True
-                )
+            if self._markov_vocab_start is not None:
+                draft = self.draft_model
+                assert isinstance(draft, VocabParallelMarkovDraft)
+                local_logits = draft.compute_draft_logits_local(flat_pm)
                 local_logits = local_logits.view(
                     block_size, reqs_tile, local_logits.shape[-1]
                 )
@@ -286,7 +254,7 @@ class DSparkProposer(DFlashProposer):
                     prev,
                     sample_start,
                     block_size,
-                    bias_fn=lambda e: torch.nn.functional.linear(e, w2_local),
+                    bias_fn=draft.markov_bias_local,
                     select_fn=lambda s: self._vocab_parallel_argmax(s, reqs_tile),
                 )
                 return draft_tokens_chunk[:padded_num_reqs], hidden

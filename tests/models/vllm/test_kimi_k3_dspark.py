@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Units for the Kimi K3 DSpark draft model: TP-sharded context projections,
-the rank-major context-KV reorder and the fused context-KV weight duplication.
+the rank-major context-KV reorder, the fused context-KV weight duplication
+and the vocab-sharded Markov head.
 """
+
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from vllm_torchtpu.models.vllm.kimi_k3 import dspark as k3_dspark
 from vllm_torchtpu.models.vllm.kimi_k3.dspark import (
+    K3DSparkForCausalLM,
     _context_tp_shards,
     _duplicate_context_kv_weights,
     _layer_major_context_kv,
@@ -79,3 +86,76 @@ def test_duplicate_context_kv_weights():
     assert out[1][1].shard_id == 0 and out[4][1].shard_id == 1
     assert torch.equal(out[1][1], weights[0][1])
     assert torch.equal(out[4][1], weights[2][1])
+
+
+_VOCAB, _RANK, _TP = 24, 3, 4
+
+
+def _draft_with_markov_head(
+    tp=_TP, rank=2, padding=0, soft_cap=None, scale=1.0, org_vocab=_VOCAB
+):
+    """A K3 draft holding only what the Markov-head sharding reads."""
+    shard = _VOCAB // tp
+    lm_head = ParallelLMHead.__new__(ParallelLMHead)
+    torch.nn.Module.__init__(lm_head)
+    lm_head.tp_size = tp
+    lm_head.shard_indices = SimpleNamespace(
+        org_vocab_start_index=rank * shard,
+        org_vocab_end_index=(rank + 1) * shard,
+        num_org_vocab_padding=padding,
+    )
+    draft = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    torch.nn.Module.__init__(draft)
+    draft.lm_head = lm_head
+    draft.logits_processor = SimpleNamespace(
+        soft_cap=soft_cap, scale=scale, org_vocab_size=org_vocab
+    )
+    w2 = torch.arange(_VOCAB * _RANK, dtype=torch.float32).reshape(_VOCAB, _RANK)
+    draft.model = SimpleNamespace(
+        markov_head=SimpleNamespace(markov_w2=SimpleNamespace(weight=w2))
+    )
+    draft._markov_head_vocab_sharded = False
+    return draft
+
+
+def test_shard_markov_head_keeps_the_local_vocab_rows():
+    draft = _draft_with_markov_head()
+    full = draft.model.markov_head.markov_w2.weight.clone()
+
+    assert draft.shard_markov_head() == 12
+
+    assert torch.equal(draft.model.markov_head.markov_w2.weight, full[12:18])
+    markov_embed = torch.randn(5, _RANK)
+    assert torch.equal(
+        draft.markov_bias_local(markov_embed), markov_embed @ full[12:18].T
+    )
+    # The full-vocab bias no longer exists on this rank.
+    with pytest.raises(RuntimeError, match="markov_bias_local"):
+        draft.markov_bias(markov_embed)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(padding=4),
+        dict(soft_cap=30.0),
+        dict(scale=0.5),
+        dict(org_vocab=_VOCAB - 1),
+    ],
+    ids=["vocab_padding", "soft_cap", "scale", "vocab_mismatch"],
+)
+def test_shard_markov_head_warns_and_stays_replicated(overrides):
+    draft = _draft_with_markov_head(**overrides)
+    full = draft.model.markov_head.markov_w2.weight
+    with mock.patch.object(k3_dspark, "logger") as log:
+        assert draft.shard_markov_head() is None
+    log.warning_once.assert_called_once()
+    assert draft.model.markov_head.markov_w2.weight is full
+    assert draft._markov_head_vocab_sharded is False
+
+
+def test_shard_markov_head_is_a_no_op_without_tensor_parallelism():
+    draft = _draft_with_markov_head(tp=1, rank=0)
+    with mock.patch.object(k3_dspark, "logger") as log:
+        assert draft.shard_markov_head() is None
+    log.warning_once.assert_not_called()
