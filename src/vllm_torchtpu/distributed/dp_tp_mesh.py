@@ -40,6 +40,7 @@ from vllm.distributed import parallel_state as ps
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed import ep_mesh
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import DP_AXIS_NAME, TP_AXIS_NAME
+from vllm_torchtpu.kimi_k3_opt_modes import OFF_TOKENS
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -55,10 +56,12 @@ def reset_dp_tp_mesh() -> None:
 
 def kimi_use_2d_ep_mesh() -> bool:
     """True when any Kimi K3 option that needs the ``('dp', 'tp')`` mesh is on."""
+    # Only "is it off?" matters here, so unvalidated values count as on; the
+    # full parsers reject them when the ops are built.
     tp_psum_raw = (envs.TPU_KIMI_OPT_LATENCY_TP_PSUM or "off").strip().lower()
-    tp_psum_active = tp_psum_raw not in ("", "0", "false", "no", "off", "none")
+    tp_psum_active = tp_psum_raw not in OFF_TOKENS
     exit_fold_raw = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
-    exit_fold_active = exit_fold_raw not in ("", "0", "false", "no", "off", "none")
+    exit_fold_active = exit_fold_raw not in OFF_TOKENS
     return bool(
         envs.TPU_KIMI_OPT_2D_EP_MESH
         or envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES

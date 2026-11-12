@@ -59,6 +59,7 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
 from vllm_torchtpu.kimi_k3_opt_modes import (
     normalize_compute_polish_mode,
     normalize_exit_fold_mode,
+    normalize_latency_tp_psum_mode,
     normalize_spec_kda_mode,
 )
 from vllm_torchtpu.logger import init_logger
@@ -75,36 +76,6 @@ from vllm_torchtpu.models.vllm.kimi_k3.moe_ep_overlap_op import (
 )
 
 logger = init_logger(__name__)
-
-
-def normalize_latency_tp_psum_mode(raw: str | None) -> str:
-    """Normalize ``TPU_KIMI_OPT_LATENCY_TP_PSUM`` to a canonical mode token.
-
-    Supported modes:
-      - ``"off"`` (aliases: ``""``, ``"0"``, ``"false"``, ``"no"``, ``"none"``)
-      - ``"tp16"`` (alias: ``"auto"``): active when ``tp_size >= 16`` with
-        ``max_dma_tokens = 8`` (`vmem` 1-shot decode reduction)
-      - ``"routed_only"``: wires only ``cid=3`` (`routed_out`) when ``tp_size > 1``
-      - ``"all"`` (aliases: ``"1"``, ``"true"``, ``"yes"``): wires ``cid=3, 4, 5``
-        whenever ``tp_size > 1`` with ``max_dma_tokens = 64``
-      - Positive integer string ``"<N>"`` (e.g. ``"8"``, ``"16"``): wires
-        ``cid=3, 4, 5`` whenever ``tp_size > 1`` with ``max_dma_tokens = int(N)``
-    """
-    val = (raw or "off").strip().lower()
-    if val in ("", "0", "false", "no", "off", "none"):
-        return "off"
-    if val in ("tp16", "auto"):
-        return "tp16"
-    if val == "routed_only":
-        return "routed_only"
-    if val in ("1", "true", "yes", "all"):
-        return "all"
-    if val.isdigit() and int(val) > 0:
-        return str(int(val))
-    raise ValueError(
-        f"Invalid TPU_KIMI_OPT_LATENCY_TP_PSUM={raw!r}; expected 'off', 'tp16'/'auto', "
-        "'routed_only', 'all', or a positive integer max_dma_tokens threshold."
-    )
 
 
 def kimi_dma_variant_tag() -> str:

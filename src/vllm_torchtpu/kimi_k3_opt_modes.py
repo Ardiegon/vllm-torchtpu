@@ -135,3 +135,33 @@ def normalize_spec_kda_mode(raw: str | None) -> str:
         f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off', "
         "'o6a' (aliases 'c3'/'auto'/'1') or 'o6b'."
     )
+
+
+def normalize_latency_tp_psum_mode(raw: str | None) -> str:
+    """Canonicalize `TPU_KIMI_OPT_LATENCY_TP_PSUM`.
+
+    Selects which TP psums use the one-shot remote-DMA collective:
+      - `"off"` (default and the `OFF_TOKENS` spellings): none.
+      - `"tp16"` (alias `"auto"`): all of them when `tp_size >= 16`, for
+        batches of at most 8 rows.
+      - `"routed_only"`: only the MoE routed-output psum, when `tp_size > 1`.
+      - `"all"` (aliases `"1"`, `"true"`, `"yes"`): the routed-output, the
+        attention/MLP exit and the MoE exit psums when `tp_size > 1`, for
+        batches of at most 64 rows.
+      - a positive integer `"<N>"`: like `"all"` with an `N`-row cap.
+    """
+    val = (raw or "off").strip().lower()
+    if val in OFF_TOKENS:
+        return "off"
+    if val in ("tp16", "auto"):
+        return "tp16"
+    if val == "routed_only":
+        return "routed_only"
+    if val in ("1", "true", "yes", "all"):
+        return "all"
+    if val.isdigit() and int(val) > 0:
+        return str(int(val))
+    raise ValueError(
+        f"Invalid TPU_KIMI_OPT_LATENCY_TP_PSUM={raw!r}; expected 'off', 'tp16'/'auto', "
+        "'routed_only', 'all', or a positive integer max_dma_tokens threshold."
+    )
