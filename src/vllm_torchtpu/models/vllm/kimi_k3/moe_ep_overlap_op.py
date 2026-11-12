@@ -48,6 +48,7 @@ import torch
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import jax_op
+from vllm.model_executor.layers.activation import SiluAndMul
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
@@ -86,6 +87,8 @@ from vllm_torchtpu.models.vllm.kimi_k3.opt_flags import (
     use_spec_verify_extensions,
     vmem_chain_mode,
 )
+
+from .layers import SituAndMul
 
 
 class ExitFoldPlan(NamedTuple):
@@ -172,17 +175,26 @@ def _extract_moe_overlap_config(moe_module: Any) -> MoeOverlapConfig:
         getattr(routed, "w13_bias", None) is not None
         and getattr(routed, "w2_bias", None) is not None
     )
-    use_norm = getattr(moe_module, "routed_expert_norm", None) is not None
+    use_norm = moe_module.routed_expert_norm is not None
     rms_eps = (
         float(moe_module.routed_expert_norm.variance_epsilon) if use_norm else 1e-5
     )
     act_fn = moe_module.shared_experts.act_fn
-    shared_act_kind = "situ" if hasattr(act_fn, "beta") else "silu"
-    situ_beta = float(getattr(act_fn, "beta", 1.0))
-    situ_linear_beta_raw = getattr(act_fn, "linear_beta", None)
-    situ_linear_beta = (
-        float(situ_linear_beta_raw) if situ_linear_beta_raw is not None else None
-    )
+    if isinstance(act_fn, SituAndMul):
+        shared_act_kind = "situ"
+        situ_beta = float(act_fn.beta)
+        situ_linear_beta = (
+            float(act_fn.linear_beta) if act_fn.linear_beta is not None else None
+        )
+    elif isinstance(act_fn, SiluAndMul):
+        shared_act_kind = "silu"
+        situ_beta = 1.0
+        situ_linear_beta = None
+    else:
+        raise NotImplementedError(
+            f"shared_experts activation {type(act_fn).__name__} is not supported "
+            "by the EP-overlap op"
+        )
     use_sparse_core = bool(envs.USE_MOE_SPARSE_CORE)
     onehot_thresh = int(resolve_onehot_permute_threshold())
     skip_padded = True if has_scales else bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
@@ -512,7 +524,7 @@ def build_kimi_moe_ep_overlap_op(
             return_annotation=torch.Tensor,
         )
         raw_op.register_fake(_fake_fn)
-        REGISTERED_OPS[raw_key] = raw_op  # type: ignore[assignment]
+        REGISTERED_OPS[raw_key] = raw_op
 
     def _call(
         hidden_states: torch.Tensor,
