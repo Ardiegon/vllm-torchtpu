@@ -45,7 +45,6 @@ from jax.sharding import Mesh
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dp_tp_mesh import validate_dp_tp_group_ranks
-from vllm_torchtpu.kernels.kimi_k3.exit_fold import build_kimi_moe_ep_overlap_op
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
@@ -70,6 +69,9 @@ from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
     build_pallas_psum_scatter_rows_op,
     mesh_shape_and_ids,
     sanitize_tag,
+)
+from vllm_torchtpu.models.vllm.kimi_k3.moe_ep_overlap_op import (
+    build_kimi_moe_ep_overlap_op,
 )
 
 logger = init_logger(__name__)

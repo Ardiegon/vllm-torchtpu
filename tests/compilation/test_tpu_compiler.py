@@ -201,6 +201,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/attention.py",
             "vllm_torchtpu/models/vllm/kimi_k3/model.py",
             "vllm_torchtpu/models/vllm/kimi_k3/moe.py",
+            "vllm_torchtpu/models/vllm/kimi_k3/moe_ep_overlap_op.py",
             "vllm_torchtpu/models/vllm/kimi_k3/opt_flags.py",
         } <= hashed
 

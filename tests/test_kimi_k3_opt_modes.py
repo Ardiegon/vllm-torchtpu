@@ -25,7 +25,7 @@ from vllm_torchtpu.kimi_k3_opt_modes import (
     normalize_spec_kda_mode,
 )
 from vllm_torchtpu.layers.adapter import fused_moe
-from vllm_torchtpu.models.vllm.kimi_k3 import opt_flags
+from vllm_torchtpu.models.vllm.kimi_k3 import moe_ep_overlap_op, opt_flags
 
 _OFF_SPELLINGS = [None, *sorted(OFF_TOKENS), " Off ", "NONE"]
 
@@ -205,3 +205,13 @@ def test_fused_moe_adapter_resolves_fused_decode_options(
 ):
     _set_modes(monkeypatch, polish=polish, spec_kda=spec_kda)
     assert fused_moe._resolve_fused_decode_options() == expected
+
+
+def test_exit_fold_plan_is_axial_async_hierarchical():
+    for mode in ("c2", "auto", "1", "o4d", "c2b"):
+        plan = moe_ep_overlap_op.resolve_effective_exit_fold_plan(mode)
+        assert plan == ("o4b", True, "axial")
+        assert plan.dispatch_kind == "axial"
+    for mode in ("off", "", "o4a", "bogus"):
+        with pytest.raises(ValueError):
+            moe_ep_overlap_op.resolve_effective_exit_fold_plan(mode)

@@ -16,7 +16,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -35,16 +34,6 @@ def _one_device_mesh() -> Mesh:
     return Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("dp", "tp"))
 
 
-def test_plan_is_axial_async_hierarchical():
-    for mode in ("c2", "auto", "1", "o4d", "c2b"):
-        plan = exit_fold.resolve_effective_exit_fold_plan(mode)
-        assert plan == ("o4b", True, "axial")
-        assert plan.dispatch_kind == "axial"
-    for mode in ("off", "", "o4a", "bogus"):
-        with pytest.raises(ValueError):
-            exit_fold.resolve_effective_exit_fold_plan(mode)
-
-
 def test_unpack_meta_columns_round_trips_expert_ids():
     topk = 4
     ids = np.arange(-1, 895, dtype=np.int32)
@@ -53,7 +42,7 @@ def test_unpack_meta_columns_round_trips_expert_ids():
     meta = _pack_meta(ids, weights)
     # Padding columns past 3 * topk are ignored.
     meta = jnp.pad(meta, ((0, 0), (0, 5)))
-    got_ids, got_w = exit_fold._unpack_meta_columns(meta, topk=topk)
+    got_ids, got_w = exit_fold.unpack_meta_columns(meta, topk=topk)
     np.testing.assert_array_equal(np.asarray(got_ids), ids)
     np.testing.assert_array_equal(
         np.asarray(got_w), np.asarray(weights.astype(jnp.bfloat16))
@@ -68,7 +57,7 @@ def test_unpack_axial_gathered_splits_latent_and_meta():
     gathered = jnp.concatenate(
         (latent_rows.astype(jnp.bfloat16), _pack_meta(ids, weights)), axis=-1
     )
-    lat, got_ids, got_w = exit_fold._unpack_axial_gathered(
+    lat, got_ids, got_w = exit_fold.unpack_axial_gathered(
         gathered, latent_dim=latent, topk=topk
     )
     np.testing.assert_array_equal(np.asarray(lat), np.asarray(gathered[:, :latent]))

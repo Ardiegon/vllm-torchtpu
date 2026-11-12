@@ -317,6 +317,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     "vllm_torchtpu/models/vllm/kimi_k3/model.py",
     "vllm_torchtpu/models/vllm/kimi_k3/moe.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/moe_ep_overlap_op.py",
     "vllm_torchtpu/models/vllm/kimi_k3/opt_flags.py",
 )
 
