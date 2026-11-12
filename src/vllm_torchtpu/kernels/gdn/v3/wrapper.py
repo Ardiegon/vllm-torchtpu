@@ -835,9 +835,7 @@ def fused_conv1d_gdn(
             if skip_empty_per_seq and out_act is not None:
                 out_act, out_source, _ = jax.lax.cond(
                     distribution[0] < distribution[-1],
-                    lambda op: call_kernel(
-                        op[1], None, op[0], config.GDNMode.PER_SEQ
-                    ),
+                    lambda op: call_kernel(op[1], None, op[0], config.GDNMode.PER_SEQ),
                     lambda op: (op[0], op[1], None),
                     (out_act, out_source),
                 )

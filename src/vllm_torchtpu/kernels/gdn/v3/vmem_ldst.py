@@ -162,9 +162,7 @@ def store_state_region(
         bf16_arr = values.astype(jnp.bfloat16).reshape(-1, out_lanes)
         bf16_cap = capacity * 2
         if bf16_arr.shape[0] < bf16_cap:
-            bf16_arr = jnp.pad(
-                bf16_arr, ((0, bf16_cap - bf16_arr.shape[0]), (0, 0))
-            )
+            bf16_arr = jnp.pad(bf16_arr, ((0, bf16_cap - bf16_arr.shape[0]), (0, 0)))
         arr = pltpu.bitcast(bf16_arr, jnp.uint32)
     else:
         arr = values.astype(region.view_dtype).reshape(-1, out_lanes)
