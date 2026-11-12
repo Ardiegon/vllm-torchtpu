@@ -56,8 +56,8 @@ from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cw_f32, use_kda_glue
 from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_kda_o6a
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
-    build_kimi_pooled_kda_o6a_ops,
     build_kimi_pooled_kda_op,
+    build_kimi_pooled_kda_verify_commit_ops,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -656,7 +656,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.pooled_kda_commit_op = None
         if self.defers_spec_state_commit:
             self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
-                build_kimi_pooled_kda_o6a_ops(
+                build_kimi_pooled_kda_verify_commit_ops(
                     prefix,
                     lower_bound=self.gate_lower_bound,
                     eps=config.rms_norm_eps,
