@@ -34,7 +34,31 @@ def _mix_kernel(prefix, history, weight, output, *, eps):
     output[...] = jnp.sum(values * probabilities, axis=1).astype(output.dtype)
 
 
-def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=False):
+def _validate_attention_residual(
+    prefix: jax.Array,
+    history_tokens: int,
+    history_hidden: int,
+    folded_weight: jax.Array,
+    history_name: str,
+) -> None:
+    """Shape checks shared by both history layouts."""
+    tokens, hidden = prefix.shape
+    if history_tokens != tokens or history_hidden != hidden:
+        raise ValueError(f"Attention Residual prefix/{history_name} shapes disagree")
+    if folded_weight.shape != (hidden,):
+        raise ValueError(
+            "Attention Residual needs one folded weight per hidden feature"
+        )
+
+
+def attention_residual(
+    prefix: jax.Array,
+    history: jax.Array,
+    folded_weight: jax.Array,
+    *,
+    eps: float = 1e-5,
+    interpret: bool = False,
+) -> jax.Array:
     """Mix [tokens,hidden] prefix and [tokens,blocks,hidden] saved blocks.
 
     Norm and projection weights are folded to one FP32 vector at load time.
@@ -42,12 +66,9 @@ def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=Fa
     count in the history shape. No state or cache is modified.
     """
     tokens, hidden = prefix.shape
-    if history.shape[0] != tokens or history.shape[-1] != hidden:
-        raise ValueError("Attention Residual prefix/history shapes disagree")
-    if folded_weight.shape != (hidden,):
-        raise ValueError(
-            "Attention Residual needs one folded weight per hidden feature"
-        )
+    _validate_attention_residual(
+        prefix, history.shape[0], history.shape[-1], folded_weight, "history"
+    )
     if history.shape[1] == 0 or tokens == 0:
         return prefix
     if tokens % 16:
@@ -69,6 +90,9 @@ def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=Fa
 
 
 def _mix_kernel_bt(prefix, weight, history_ref, output, *, eps):
+    # The softmax over blocks is unrolled on purpose: every block stays a
+    # separate 2D (bm, hidden) value, so no [bm, blocks, hidden] tensor (which
+    # would pad `blocks` to 8 sublanes) is ever formed.
     p = prefix[...].astype(jnp.float32)
     w = weight[...].astype(jnp.float32)
     bs = [history_ref[b].astype(jnp.float32) for b in range(history_ref.shape[0])] + [p]
@@ -92,8 +116,13 @@ def _mix_kernel_bt(prefix, weight, history_ref, output, *, eps):
 
 
 def attention_residual_bt(
-    prefix, history_bt, folded_weight, *, eps=1e-5, interpret=False
-):
+    prefix: jax.Array,
+    history_bt: jax.Array,
+    folded_weight: jax.Array,
+    *,
+    eps: float = 1e-5,
+    interpret: bool = False,
+) -> jax.Array:
     """Mix [tokens, hidden] prefix and [blocks, tokens, hidden] saved blocks.
 
     Storing history with `blocks` on the leading axis and loading each block as
@@ -103,12 +132,9 @@ def attention_residual_bt(
     """
     tokens, hidden = prefix.shape
     num_blocks = history_bt.shape[0]
-    if history_bt.shape[1] != tokens or history_bt.shape[-1] != hidden:
-        raise ValueError("Attention Residual prefix/history_bt shapes disagree")
-    if folded_weight.shape != (hidden,):
-        raise ValueError(
-            "Attention Residual needs one folded weight per hidden feature"
-        )
+    _validate_attention_residual(
+        prefix, history_bt.shape[1], history_bt.shape[-1], folded_weight, "history_bt"
+    )
     if num_blocks == 0 or tokens == 0:
         return prefix
     if tokens % 16:
