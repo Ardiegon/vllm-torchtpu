@@ -1149,9 +1149,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Stream Kimi K3's pooled KDA conv and recurrent states directly between the
     # unified KV pool in HBM and VMEM inside fused_conv1d_gdn via StateSourcePlan,
     # bypassing external gather_region / scatter_region Pallas calls.
-    "TPU_KDA_DIRECT_POOL_STREAMING": env_bool(
-        "TPU_KDA_DIRECT_POOL_STREAMING", True
-    ),
+    "TPU_KDA_DIRECT_POOL_STREAMING": env_bool("TPU_KDA_DIRECT_POOL_STREAMING", True),
     # Quantize Kimi K3's dense projections (KDA packed_prefill_weight & o_proj,
     # MLA fused_qkv_a_proj, q_b_proj & o_proj, Layer-0 dense KimiMLP, MoE
     # packed_moe_in_weight & packed_moe_out_weight, and lm_head) to weight-only
@@ -1159,21 +1157,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Note: despite the "_B11" suffix, weights are quantized to int8, not
     # float8_e4m3b11fnuz. Off by default so the model is lossless (bf16 dense
     # weights at checkpoint precision); set TPU_KIMI_DENSE_W8A16_B11=1 to opt in.
-    "TPU_KIMI_DENSE_W8A16_B11": env_bool(
-        "TPU_KIMI_DENSE_W8A16_B11", False
-    ),
+    "TPU_KIMI_DENSE_W8A16_B11": env_bool("TPU_KIMI_DENSE_W8A16_B11", False),
     # Build and validate a PyTorch-rank-ordered 2D ('dp', 'tp') JAX mesh for
     # Kimi K3 Pallas remote-DMA collectives and keep EP mesh DeviceAssignment in
     # rank order across all multi-device @jax_op kernels in the compiled graph.
-    "TPU_KIMI_OPT_2D_EP_MESH": env_bool(
-        "TPU_KIMI_OPT_2D_EP_MESH", False
-    ),
+    "TPU_KIMI_OPT_2D_EP_MESH": env_bool("TPU_KIMI_OPT_2D_EP_MESH", False),
     # Coalesce Kimi K3's 3 per-layer DP all_gather calls (latent, topk_ids,
     # topk_weights) into 1 packed [B_dp, latent_dim + 3*K] bfloat16 tensor
     # (works with both XLA dp_group.all_gather and 1-shot Pallas latency_all_gather_rows).
-    "TPU_KIMI_OPT_PACKED_DP_AG": env_bool(
-        "TPU_KIMI_OPT_PACKED_DP_AG", False
-    ),
+    "TPU_KIMI_OPT_PACKED_DP_AG": env_bool("TPU_KIMI_OPT_PACKED_DP_AG", False),
     # Replace Kimi K3 decode (T_padded <= 64 inside @jax_op, XLA fallback > 64)
     # narrow TP latent all_gather (cid=0), DP dispatch all_gather (cid=1), and
     # DP post-MoE combine reduce_scatter (cid=2) with 1-shot Pallas remote-DMA ops.
@@ -1182,9 +1174,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Optional flat world = dp * tp 1-shot latency_all_gather_rows (cid=1) for
     # A/B comparison against the 2-stage (tp latent AG -> pack -> dp AG) dispatch.
-    "TPU_KIMI_OPT_WORLD_LATENT_AG": env_bool(
-        "TPU_KIMI_OPT_WORLD_LATENT_AG", False
-    ),
+    "TPU_KIMI_OPT_WORLD_LATENT_AG": env_bool("TPU_KIMI_OPT_WORLD_LATENT_AG", False),
     # Wire 1-shot deterministic Pallas latency_psum (cid=3, 4, 5) into Kimi K3
     # row-parallel TP exits ("off", "tp16"/"auto", "routed_only", "all", or an
     # integer max_dma_tokens threshold string such as "8").

@@ -271,15 +271,13 @@ def resolve_kimi_o3_libtpu_flags(
                         f"overlap ratio {ratio} must be in 1..31 (32 hits the "
                         "v6e VMEM prefetch capacity cliff)."
                     )
-                flag_map["--xla_msa_preferred_overlap_to_async_copy_ratio"] = str(
-                    ratio
-                )
+                flag_map["--xla_msa_preferred_overlap_to_async_copy_ratio"] = str(ratio)
                 active = True
             elif tok == "async_coll":
                 flag_map["--xla_tpu_enable_async_collective_fusion"] = "true"
-                flag_map[
-                    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather"
-                ] = "true"
+                flag_map["--xla_tpu_enable_async_collective_fusion_fuse_all_gather"] = (
+                    "true"
+                )
                 active = True
             elif tok == "cpp_256":
                 flag_map["--xla_msa_max_cross_program_prefetches"] = "256"
@@ -304,15 +302,13 @@ def resolve_kimi_o3_libtpu_flags(
         m_th = _SC_THRESH_ONLY_RE.match(sc_norm)
         if m_full:
             min_bytes = int(m_full.group(1))
-            flag_map[
-                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"
-            ] = "true"
-            flag_map[
-                "--xla_tpu_enable_sparse_core_collective_offload_all_gather"
-            ] = "true"
-            flag_map["--xla_tpu_enable_concurrent_sparse_core_offloading"] = (
+            flag_map["--xla_tpu_enable_sparse_core_collective_offload_all_reduce"] = (
                 "true"
             )
+            flag_map["--xla_tpu_enable_sparse_core_collective_offload_all_gather"] = (
+                "true"
+            )
+            flag_map["--xla_tpu_enable_concurrent_sparse_core_offloading"] = "true"
             sc_thresholds[
                 "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
             ] = min_bytes
@@ -322,12 +318,10 @@ def resolve_kimi_o3_libtpu_flags(
             active = True
         elif m_ar:
             min_bytes = int(m_ar.group(1))
-            flag_map[
-                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"
-            ] = "true"
-            flag_map["--xla_tpu_enable_concurrent_sparse_core_offloading"] = (
+            flag_map["--xla_tpu_enable_sparse_core_collective_offload_all_reduce"] = (
                 "true"
             )
+            flag_map["--xla_tpu_enable_concurrent_sparse_core_offloading"] = "true"
             sc_thresholds[
                 "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
             ] = min_bytes
@@ -359,9 +353,7 @@ _libtpu_extra_args: list[str] = []
 if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
 
-_kimi_o3_flags, _kimi_o3_sc_thresholds, _kimi_o3_active = (
-    resolve_kimi_o3_libtpu_flags()
-)
+_kimi_o3_flags, _kimi_o3_sc_thresholds, _kimi_o3_active = resolve_kimi_o3_libtpu_flags()
 for _o3_flag_name, _o3_flag_val in _kimi_o3_flags:
     if not _user_has_flag(_o3_flag_name):
         _libtpu_extra_args.append(f"{_o3_flag_name}={_o3_flag_val}")
