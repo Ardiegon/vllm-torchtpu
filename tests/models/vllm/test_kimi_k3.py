@@ -2217,6 +2217,7 @@ def test_packed_kda_keeps_parameter_abi_across_token_buckets(monkeypatch):
     layer.register_buffer(
         "packed_prefill_weight", torch.empty(7168, 1792, dtype=torch.bfloat16)
     )
+    layer.register_buffer("packed_prefill_scale", None, persistent=False)
     layer.f_b_proj = Projection(128, 384)
     layer.o_proj = Projection(384, 7168)
     layer._metadata = lambda: None
@@ -2633,3 +2634,136 @@ def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> N
         KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
             stub, 1000, 1, 1, torch.device("cpu"), torch.float32
         )
+
+
+def test_moe_gate_correction_bias_is_float32(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Routing e_score_correction_bias stays float32 under a bf16 default dtype."""
+
+    class Fake(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(kimi_moe, "GateLinear", Fake)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", Fake)
+    monkeypatch.setattr(kimi_moe, "make_latent_projection", Fake)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", lambda **kwargs: Fake())
+    monkeypatch.setattr(kimi_moe, "RMSNorm", Fake)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_experts=8,
+        num_experts_per_token=2,
+        moe_intermediate_size=32,
+        routed_expert_hidden_size=8,
+        latent_moe_use_norm=False,
+    )
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    assert layer.gate.e_score_correction_bias.dtype == torch.float32
+    assert layer.gate.e_score_correction_bias.shape == (8,)
+
+
+def test_w8a16_matmul_within_int8_error() -> None:
+    """CPU W8A16 matmul tracks the bf16 reference within int8 step error."""
+    from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
+        quantize_weight_w8a16,
+        w8a16_matmul,
+    )
+
+    gen = torch.Generator().manual_seed(7)
+    w = torch.randn(64, 32, generator=gen).to(torch.bfloat16)
+    x = torch.randn(4, 64, generator=gen).to(torch.bfloat16)
+    w_q, w_s = quantize_weight_w8a16(w)
+    out = w8a16_matmul(x, w_q, w_s)
+    ref = (x.float() @ w.float()).to(torch.bfloat16)
+    bound = (w.float().abs().amax(0) / 127.0 * (64**0.5) * 4.0).max().item()
+    assert (out.float() - ref.float()).abs().max().item() < bound
+
+
+def test_quantize_linear_layer_w8a16_swaps_method() -> None:
+    """quantize_linear_layer_w8a16 installs W8A16LinearMethod and int8 weights."""
+    from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
+        W8A16LinearMethod,
+        quantize_linear_layer_w8a16,
+    )
+
+    gen = torch.Generator().manual_seed(11)
+    layer = nn.Module()
+    layer.weight = nn.Parameter(
+        torch.randn(16, 32, generator=gen).to(torch.bfloat16), requires_grad=False
+    )
+    layer.quant_method = None
+    synced = quantize_linear_layer_w8a16(layer)
+    assert isinstance(layer.quant_method, W8A16LinearMethod)
+    assert layer.weight.dtype == torch.int8 and layer.weight.shape == (32, 16)
+    assert len(synced) == 2
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_attention_residual_blocks_first_matches_token_major(num_tokens: int) -> None:
+    """Blocks-first [K, T, H] AttentionResidual matches token-major [T, K, H]."""
+    torch.manual_seed(3)
+    hidden, num_blocks, eps = 64, 4, 1e-5
+    module = _attention_residual_stub(hidden=hidden, eps=eps)
+    prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    blocks_bt = torch.randn(num_blocks, num_tokens, hidden, dtype=torch.bfloat16)
+    blocks_tb = blocks_bt.transpose(0, 1).contiguous()
+
+    out_bt = module(prefix_sum, blocks_bt, blocks_first=True)
+    out_tb = module(prefix_sum, blocks_tb, blocks_first=False)
+    torch.testing.assert_close(out_bt, out_tb, rtol=0, atol=0)
+
+
+def test_dspark_tap_modes() -> None:
+    """PREFIX and ATTN_RES taps differ on aux states and match on final outputs."""
+    from vllm_torchtpu.kimi_k3_opt_modes import DSparkTapMode
+
+    torch.manual_seed(5)
+    hidden, eps = 32, 1e-5
+
+    class ToyDecoderLayer(nn.Module):
+        def __init__(self, scale: float) -> None:
+            super().__init__()
+            self.scale = scale
+            self.self_attention_res = _attention_residual_stub(hidden=hidden, eps=eps)
+
+        def forward(self, _pos, x, block_residuals, *, sequence_parallel=False):
+            del sequence_parallel
+            assert block_residuals is not None
+            mixed = (
+                self.self_attention_res(x, block_residuals, blocks_first=True)
+                if block_residuals.shape[0] > 0
+                else x
+            )
+            next_blocks = torch.cat((block_residuals, x.unsqueeze(0)), dim=0)
+            return mixed * self.scale + 0.25, next_blocks
+
+    l0, l1 = ToyDecoderLayer(0.8), ToyDecoderLayer(1.2)
+    out_res = _attention_residual_stub(hidden=hidden, eps=eps)
+    embeds = torch.randn(4, hidden, dtype=torch.bfloat16)
+    positions = torch.arange(4)
+
+    results = {}
+    for tap_mode in (DSparkTapMode.PREFIX, DSparkTapMode.ATTN_RES):
+        model = KimiModel.__new__(KimiModel)
+        nn.Module.__init__(model)
+        model.sp_prefill = False
+        model.attn_res_block_size = 1
+        model.aux_hidden_state_layers = (1, 2)
+        model.aux_tap_mode = tap_mode
+        model.layers = nn.ModuleList([l0, l1])
+        model.output_attn_res = out_res
+        model.norm = nn.Identity()
+        results[tap_mode] = model.forward(None, positions, inputs_embeds=embeds)
+
+    out_prefix, aux_prefix = results[DSparkTapMode.PREFIX]
+    out_attn_res, aux_attn_res = results[DSparkTapMode.ATTN_RES]
+    torch.testing.assert_close(out_prefix, out_attn_res, rtol=0, atol=0)
+    assert len(aux_prefix) == len(aux_attn_res) == 2
+    assert not torch.equal(aux_prefix[0], aux_attn_res[0])
+    assert not torch.equal(aux_prefix[1], aux_attn_res[1])
