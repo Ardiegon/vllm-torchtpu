@@ -17,8 +17,8 @@ Ported from Google-internal GemAX / Kimi K3 Pallas transport modules
 (``kiloblox_a2a.py``, ``dense_a2a.py``, and ``latency_collectives.py``) with
 zero external dependencies:
 
-1. ``barrier_and_allocate``, ``_color_dma_operands``, ``call_kernel``, and
-   ``pin_hbm`` preserve birth memory spaces (``pltpu.HBM`` / ``pltpu.VMEM``)
+1. ``barrier_and_allocate``, ``_color_dma_operands`` and ``call_kernel``
+   preserve birth memory spaces (``pltpu.HBM`` / ``pltpu.VMEM``)
    across kernel boundaries so XLA's memory-space pass never relocates buffers
    targeted by in-flight remote DMAs.
 2. ``dense_all_to_all`` performs 1-shot point-to-point ``make_async_remote_copy``
@@ -70,16 +70,6 @@ COLLECTIVE_ID_MOE_TP_ROUTED_PSUM = 3     # 'tp': KimiMoE routed_out psum [B_dp, 
 COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM = 4  # 'tp': KDA/MLA o_proj + L0 KimiMLP.down_proj [B_dp, 7168]
 COLLECTIVE_ID_MOE_TP_EXIT_PSUM = 5       # 'tp': KimiMoE packed_moe_out [B_dp, 7168]
 COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT = 6   # ('dp','tp') + 'tp': O4-A owner combine + seam_exit_split
-
-ALL_KIMI_COLLECTIVE_IDS: tuple[int, ...] = (
-    COLLECTIVE_ID_MOE_TP_LATENT_AG,
-    COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-    COLLECTIVE_ID_MOE_DP_COMBINE_RS,
-    COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
-    COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
-    COLLECTIVE_ID_MOE_TP_EXIT_PSUM,
-    COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
-)
 
 DENSE_COLLECTIVE_ID = COLLECTIVE_ID_MOE_TP_LATENT_AG
 DENSE_TRANSPOSE_COLLECTIVE_ID = COLLECTIVE_ID_MOE_DP_COMBINE_RS
@@ -249,21 +239,6 @@ def call_kernel(
     )(inout, args, any_args)
 
     return (*aliased_args, *out_args)
-
-
-def pin_hbm(x: jax.Array) -> jax.Array:
-    """Zero-copy aliased identity that records a required ``pltpu.HBM`` space on ``x``."""
-
-    def _id(src_ref: Any, dst_ref: Any) -> None:
-        del src_ref, dst_ref
-
-    return pl.pallas_call(
-        _id,
-        in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
-        out_specs=pl.BlockSpec(memory_space=pl.ANY),
-        out_shape=pltpu.HBM(shape=x.shape, dtype=x.dtype),
-        input_output_aliases={0: 0},
-    )(x)
 
 
 def barrier_and_allocate(
@@ -1183,72 +1158,6 @@ def _mesh_shape_and_ids(mesh: Mesh) -> tuple[int, int, tuple[int, ...]]:
     dp_size, tp_size = (int(mesh.devices.shape[0]), int(mesh.devices.shape[1]))
     dev_ids = tuple(int(d.id) for d in mesh.devices.flat)
     return dp_size, tp_size, dev_ids
-
-
-def build_pallas_2d_identity_canary_op(
-    mesh: Mesh,
-    *,
-    spec_mode: str = "dp_replicated",
-    variant_tag: str = "opt2d_1",
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Build a 2D-mesh ``shard_map`` pass-through ``@jax_op`` verifying sharding + DeviceAssignment.
-
-    ``spec_mode``:
-      - ``'dp_replicated'``: ``PartitionSpec('dp', None) -> PartitionSpec('dp', None)``
-      - ``'dp_tp_sharded'``: ``PartitionSpec('dp', 'tp') -> PartitionSpec('dp', 'tp')``
-    """
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
-    if spec_mode == "dp_replicated":
-        spec = PartitionSpec(DP_AXIS_NAME, None)
-    elif spec_mode == "dp_tp_sharded":
-        spec = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME)
-    else:
-        raise ValueError(
-            f"spec_mode must be 'dp_replicated' or 'dp_tp_sharded', got {spec_mode!r}"
-        )
-
-    op_name = format_pallas_dma_op_name(
-        kind="ep2d_canary",
-        spec_tag=spec_mode,
-        axis_name=("dp", "tp"),
-        collective_id=0,
-        recv_memory_space="none",
-        max_dma_tokens=0,
-        dp_size=dp_size,
-        tp_size=tp_size,
-        variant_tag=variant_tag,
-    )
-    cache_key = ("canary", op_name, dev_ids)
-    if cache_key in _REGISTERED_TORCH_OPS:
-        return _REGISTERED_TORCH_OPS[cache_key]
-
-    out_sharding = NamedSharding(mesh, spec)
-
-    def _canary_jax(x: jax.Array) -> jax.Array:
-        out = jax.shard_map(
-            lambda part: part,
-            mesh=mesh,
-            in_specs=spec,
-            out_specs=spec,
-            check_vma=False,
-        )(x)
-        return jax.lax.with_sharding_constraint(out, out_sharding)
-
-    raw_op = jax_op(
-        op_name,
-        _canary_jax,
-        mesh=mesh,
-        input_partition_specs=(spec,),
-        output_partition_specs=(spec,),
-    )
-    raw_op.register_fake(lambda x: x.new_empty(x.shape))
-
-    def _call(x: torch.Tensor) -> torch.Tensor:
-        return raw_op(x)
-
-    _call._qualname = op_name  # type: ignore[attr-defined]
-    _REGISTERED_TORCH_OPS[cache_key] = _call
-    return _call
 
 
 def build_pallas_all_gather_cols_op(

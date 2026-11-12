@@ -32,7 +32,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import jax
 import torch
 import torch.distributed as dist
 from jax.sharding import Mesh
@@ -64,7 +63,6 @@ def kimi_use_2d_ep_mesh() -> bool:
     return bool(
         envs.TPU_KIMI_OPT_2D_EP_MESH
         or envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES
-        or envs.TPU_KIMI_OPT_WORLD_LATENT_AG
         or tp_psum_active
         or exit_fold_active
     )

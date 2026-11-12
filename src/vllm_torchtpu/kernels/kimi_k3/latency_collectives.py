@@ -42,12 +42,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import jax
-import jax.numpy as jnp
 import torch
-from jax import lax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from torch_tpu._internal.pallas import jax_op
+from jax.sharding import Mesh
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.kimi_dma_mesh import DP_AXIS_NAME, TP_AXIS_NAME
@@ -66,27 +62,15 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
     DEFAULT_MAX_DMA_TOKENS,
     _mesh_shape_and_ids,
-    _REGISTERED_TORCH_OPS,
     _sanitize_tag,
     build_pallas_all_gather_cols_op,
     build_pallas_all_gather_rows_op,
     build_pallas_psum_op,
     build_pallas_psum_scatter_rows_op,
-    format_pallas_dma_op_name,
-    kimi_guarded_all_gather_cols,
-    kimi_guarded_all_gather_rows,
-    kimi_guarded_psum,
-    kimi_guarded_psum_scatter_rows,
 )
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Re-export JAX-level guarded 1-shot collectives under canonical O2 spec names.
-latency_all_gather_cols = kimi_guarded_all_gather_cols
-latency_all_gather_rows = kimi_guarded_all_gather_rows
-latency_psum = kimi_guarded_psum
-latency_psum_scatter_rows = kimi_guarded_psum_scatter_rows
 
 
 def normalize_latency_tp_psum_mode(raw: str | None) -> str:
@@ -130,7 +114,9 @@ def kimi_o2_variant_tag() -> str:
         f"o2_m{int(bool(envs.TPU_KIMI_OPT_2D_EP_MESH))}"
         f"_p{int(bool(envs.TPU_KIMI_OPT_PACKED_DP_AG))}"
         f"_lc{int(bool(envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES))}"
-        f"_w{int(bool(envs.TPU_KIMI_OPT_WORLD_LATENT_AG))}"
+        # The flat world dispatch this field once selected is gone; the field
+        # stays as a fixed "_w0" so the custom-op names do not change.
+        "_w0"
         f"_tp_{tp_mode}"
     )
     if ef_mode == "off":
@@ -207,145 +193,6 @@ def _unpack_dp_dispatch(
     return latent, topk_ids, topk_weights
 
 
-def build_pallas_world_packed_dispatch_op(
-    mesh: Mesh,
-    *,
-    collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-    recv_memory_space: str = "auto",
-    max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-    variant_tag: str = "o2_world",
-) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Build 1-shot flat ``world = dp * tp`` packed dispatch all-gather (`cid=1`).
-
-    Inputs (rank-local PyTorch tensors):
-      - ``routed_down_local``: ``[B_dp, D_local]`` (`PartitionSpec('dp', 'tp')`)
-      - ``packed_meta``: ``[B_dp, M]`` (`M = 3 * K`, `PartitionSpec('dp', None)`)
-      - ``tp_rank_buf``: ``[1, 1]`` ``int32`` runtime buffer (`PartitionSpec('dp', 'tp')`)
-    Output:
-      - ``gathered_packed``: ``[dp_size * B_dp, tp_size * D_local + M]``
-        (`PartitionSpec(None, None)`), ready for ``_unpack_dp_dispatch``.
-
-    Shards ``packed_meta`` dynamically inside ``shard_map`` using the runtime
-    ``tp_rank_buf`` tensor (same rank-uniform graph invariant as
-    ``register_experts_start_buffer`` / ``_RANK_BUFFER``) so:
-      1. Every rank compiles an identical HLO program (no rank-dependent slice
-         constants desynchronizing SparseCore/TensorCore sync flags),
-      2. Routing metadata is never duplicated ``tp_size`` times on the wire
-         (`224 + 3 = 227 -> 256` padded lanes at `TP=16`), and
-      3. No ``lax.axis_index`` (`partition-id` HLO) is emitted outside Pallas.
-    """
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
-
-    gather_axis: str | tuple[str, str] = (
-        TP_AXIS_NAME if dp_size == 1 else (DP_AXIS_NAME, TP_AXIS_NAME)
-    )
-
-    op_name = format_pallas_dma_op_name(
-        kind="world_pack_ag",
-        spec_tag="dp_tp_meta",
-        axis_name=gather_axis,
-        collective_id=collective_id,
-        recv_memory_space=recv_memory_space,
-        max_dma_tokens=max_dma_tokens,
-        dp_size=dp_size,
-        tp_size=tp_size,
-        variant_tag=variant_tag,
-    )
-    raw_key = ("world_pack_ag_raw", op_name, dev_ids)
-    in_spec_x = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME)
-    in_spec_m = PartitionSpec(DP_AXIS_NAME, None)
-    in_spec_r = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME)
-    out_spec = PartitionSpec(None, None)
-    out_sharding = NamedSharding(mesh, out_spec)
-
-    if raw_key in _REGISTERED_TORCH_OPS:
-        raw_op = _REGISTERED_TORCH_OPS[raw_key]
-    else:
-
-        def _world_ag_jax(
-            x_global: jax.Array,
-            meta_global: jax.Array,
-            tp_rank_global: jax.Array,
-        ) -> jax.Array:
-            def _local(
-                local_x: jax.Array,
-                local_meta: jax.Array,
-                local_tp_rank: jax.Array,
-            ) -> jax.Array:
-                b_dp, d_local = local_x.shape
-                m_padded = local_meta.shape[1]
-                m_per_tp = m_padded // tp_size
-                col_start = local_tp_rank[0, 0] * m_per_tp
-                local_meta_shard = lax.dynamic_slice_in_dim(
-                    local_meta, col_start, m_per_tp, axis=1
-                )
-                send_shard = jnp.concatenate((local_x, local_meta_shard), axis=-1)
-                gathered = kimi_guarded_all_gather_rows(
-                    send_shard,
-                    gather_axis,
-                    collective_id=collective_id,
-                    recv_memory_space=recv_memory_space,
-                    max_dma_tokens=max_dma_tokens,
-                )
-                gathered_4d = gathered.reshape(
-                    dp_size, tp_size, b_dp, d_local + m_per_tp
-                )
-                lat_4d = gathered_4d[..., :d_local]
-                meta_4d = gathered_4d[..., d_local:]
-                ag_latent = jnp.swapaxes(lat_4d, 1, 2).reshape(
-                    dp_size * b_dp, tp_size * d_local
-                )
-                ag_meta_padded = jnp.swapaxes(meta_4d, 1, 2).reshape(
-                    dp_size * b_dp, tp_size * m_per_tp
-                )
-                return jnp.concatenate((ag_latent, ag_meta_padded), axis=-1)
-
-            out = jax.shard_map(
-                _local,
-                mesh=mesh,
-                in_specs=(in_spec_x, in_spec_m, in_spec_r),
-                out_specs=out_spec,
-                check_vma=False,
-            )(x_global, meta_global, tp_rank_global)
-            return lax.with_sharding_constraint(out, out_sharding)
-
-        raw_op = jax_op(
-            op_name,
-            _world_ag_jax,
-            mesh=mesh,
-            input_partition_specs=(in_spec_x, in_spec_m, in_spec_r),
-            output_partition_specs=(out_spec,),
-        )
-        raw_op.register_fake(
-            lambda x, m_pad, _r: x.new_empty(
-                (x.shape[0] * dp_size, x.shape[1] * tp_size + m_pad.shape[1])
-            )
-        )
-        _REGISTERED_TORCH_OPS[raw_key] = raw_op  # type: ignore[assignment]
-
-    def _call(
-        routed_down_local: torch.Tensor,
-        packed_meta: torch.Tensor,
-        tp_rank_buf: torch.Tensor,
-    ) -> torch.Tensor:
-        d_local = int(routed_down_local.shape[1])
-        meta_cols = int(packed_meta.shape[1])
-        m_per_tp = (meta_cols + tp_size - 1) // tp_size
-        pad_m = m_per_tp * tp_size - meta_cols
-        padded_meta = (
-            torch.nn.functional.pad(packed_meta, (0, pad_m))
-            if pad_m > 0
-            else packed_meta
-        )
-        out_full = raw_op(routed_down_local, padded_meta, tp_rank_buf)
-        if pad_m > 0:
-            return out_full[:, : d_local * tp_size + meta_cols]
-        return out_full
-
-    _call._qualname = op_name  # type: ignore[attr-defined]
-    return _call
-
-
 @dataclass(frozen=True)
 class KimiO2Collectives:
     """Pre-built Phase O2/O4 `@jax_op` callables attached at model load time."""
@@ -355,9 +202,6 @@ class KimiO2Collectives:
     tp_size: int
     tp_latent_ag_op: Callable[[torch.Tensor], torch.Tensor] | None = None
     dp_packed_ag_op: Callable[[torch.Tensor], torch.Tensor] | None = None
-    world_dispatch_op: (
-        Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None
-    ) = None
     dp_combine_rs_op: Callable[[torch.Tensor], torch.Tensor] | None = None
     tp_routed_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
     tp_attn_mlp_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
@@ -373,7 +217,6 @@ class KimiO2Collectives:
             for op in (
                 self.tp_latent_ag_op,
                 self.dp_packed_ag_op,
-                self.world_dispatch_op,
                 self.dp_combine_rs_op,
                 self.tp_routed_psum_op,
                 self.tp_attn_mlp_psum_op,
@@ -384,7 +227,6 @@ class KimiO2Collectives:
     def attach_to_moe(self, moe_module: Any) -> None:
         moe_module._o2_tp_latent_ag_op = self.tp_latent_ag_op
         moe_module._o2_dp_packed_ag_op = self.dp_packed_ag_op
-        moe_module._o2_world_dispatch_op = self.world_dispatch_op
         moe_module._o2_dp_combine_rs_op = self.dp_combine_rs_op
         moe_module._o2_tp_routed_psum_op = self.tp_routed_psum_op
         moe_module._o2_tp_moe_exit_psum_op = self.tp_moe_exit_psum_op
@@ -396,7 +238,7 @@ class KimiO2Collectives:
             and getattr(moe_module, "packed_moe_out_weight", None) is not None
             and bool(getattr(moe_module, "use_ep", False))
         )
-        if self.world_dispatch_op is not None or can_attach_o4:
+        if can_attach_o4:
             tp_rank = (
                 int(torch.distributed.get_rank()) % self.tp_size
                 if torch.distributed.is_initialized()
@@ -459,28 +301,18 @@ def build_kimi_o2_collectives(
     dp_size, tp_size, _ = _mesh_shape_and_ids(mesh)
     vtag = kimi_o2_variant_tag()
     use_lat = bool(envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES)
-    use_world = bool(envs.TPU_KIMI_OPT_WORLD_LATENT_AG)
     tp_psum_mode = normalize_latency_tp_psum_mode(envs.TPU_KIMI_OPT_LATENCY_TP_PSUM)
     ef_mode = normalize_exit_fold_mode(envs.TPU_KIMI_OPT_EXIT_FOLD)
 
     tp_latent_ag_op = None
     dp_packed_ag_op = None
-    world_dispatch_op = None
     dp_combine_rs_op = None
     tp_routed_psum_op = None
     tp_attn_mlp_psum_op = None
     tp_moe_exit_psum_op = None
 
     if ef_mode == "off":
-        if use_world and (dp_size * tp_size > 1):
-            world_dispatch_op = build_pallas_world_packed_dispatch_op(
-                mesh,
-                collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                recv_memory_space="auto",
-                max_dma_tokens=max_dma_tokens,
-                variant_tag=vtag,
-            )
-        elif use_lat:
+        if use_lat:
             if tp_size > 1:
                 tp_latent_ag_op = build_pallas_all_gather_cols_op(
                     mesh,
@@ -501,7 +333,7 @@ def build_kimi_o2_collectives(
                     variant_tag=vtag,
                 )
 
-        if (use_lat or use_world) and dp_size > 1:
+        if use_lat and dp_size > 1:
             dp_combine_rs_op = build_pallas_psum_scatter_rows_op(
                 mesh,
                 axis_name=DP_AXIS_NAME,
@@ -565,7 +397,6 @@ def build_kimi_o2_collectives(
         tp_size=tp_size,
         tp_latent_ag_op=tp_latent_ag_op,
         dp_packed_ag_op=dp_packed_ag_op,
-        world_dispatch_op=world_dispatch_op,
         dp_combine_rs_op=dp_combine_rs_op,
         tp_routed_psum_op=tp_routed_psum_op,
         tp_attn_mlp_psum_op=tp_attn_mlp_psum_op,
@@ -577,14 +408,13 @@ def build_kimi_o2_collectives(
     if bundle.has_any_op:
         logger.info(
             "Armed Kimi O2/O4 collectives | variant=%s | mesh=(dp=%d, tp=%d) | "
-            "exit_fold=%s tp_lat_ag=%s dp_pack_ag=%s world_ag=%s dp_rs=%s tp_psum=(routed=%s, exit=%s)",
+            "exit_fold=%s tp_lat_ag=%s dp_pack_ag=%s dp_rs=%s tp_psum=(routed=%s, exit=%s)",
             vtag,
             dp_size,
             tp_size,
             ef_mode,
             tp_latent_ag_op is not None,
             dp_packed_ag_op is not None,
-            world_dispatch_op is not None,
             dp_combine_rs_op is not None,
             tp_routed_psum_op is not None,
             tp_moe_exit_psum_op is not None,

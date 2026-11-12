@@ -262,7 +262,6 @@ class KimiModel(nn.Module):
                 "or 'attn_res'."
             )
         self.aux_tap_mode = tap_mode
-        self._ep_2d_canary_op = None
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,
@@ -317,8 +316,6 @@ class KimiModel(nn.Module):
             hidden_states = hidden_states.reshape(
                 self.sp_group.world_size, -1, hidden_states.shape[-1]
             )[self.sp_group.rank_in_group].contiguous()
-        elif self._ep_2d_canary_op is not None:
-            hidden_states = self._ep_2d_canary_op(hidden_states)
         # A view avoids passing a symbolic local token count to TorchTPU's
         # concrete-size allocation kernel during the dynamic trace.
         block_residuals = (
@@ -462,16 +459,10 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             from vllm_torchtpu.kernels.kimi_k3.latency_collectives import (
                 build_kimi_o2_collectives,
             )
-            from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
-                build_pallas_2d_identity_canary_op,
-            )
 
             mesh_2d = build_ep_2d_mesh()
             o2_collectives = build_kimi_o2_collectives(mesh_2d)
             if o2_collectives.has_any_op:
-                # Real O2 2D Pallas DMA collectives are armed; disable the O1
-                # identity canary so zero extra custom-op overhead runs in O2.
-                self.model._ep_2d_canary_op = None
                 for module in self.modules():
                     if isinstance(module, KimiMoE):
                         o2_collectives.attach_to_moe(module)
@@ -481,12 +472,6 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         o2_collectives.attach_to_attn(module)
                     elif isinstance(module, KimiMLP):
                         o2_collectives.attach_to_mlp(module)
-            elif envs.TPU_KIMI_OPT_2D_EP_MESH:
-                self.model._ep_2d_canary_op = build_pallas_2d_identity_canary_op(
-                    mesh_2d,
-                    spec_mode="dp_replicated",
-                    variant_tag=o2_collectives.variant_tag,
-                )
 
         if envs.TPU_KIMI_DENSE_W8A16_B11:
             from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
