@@ -68,13 +68,13 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     DEFAULT_VMEM_MAX_TOKENS,
     DP_AXIS_NAME,
     TP_AXIS_NAME,
-    normalize_axis_name,
     barrier_and_allocate,
     call_kernel,
     kimi_guarded_all_gather_cols,
     kimi_guarded_all_gather_rows,
     kimi_guarded_psum,
     kimi_guarded_psum_scatter_rows,
+    normalize_axis_name,
     seam_pieces_pack,
     seam_pieces_tile,
     seam_pieces_unpack,
@@ -1524,9 +1524,9 @@ def build_kimi_moe_ep_overlap_op(
     # Imported here: kernels/ must not import models/ at module load (cycle).
     from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
         REGISTERED_OPS,
+        format_pallas_dma_op_name,
         mesh_shape_and_ids,
         sanitize_tag,
-        format_pallas_dma_op_name,
     )
 
     norm_mode = normalize_exit_fold_mode(exit_fold_mode)

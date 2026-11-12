@@ -47,10 +47,12 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     normalize_axis_name,
 )
 
-REGISTERED_OPS: dict[tuple[Any, ...], Callable[[torch.Tensor], torch.Tensor]] = {}
+# Built ops by (kind, op name, device ids), so every layer reuses one custom op.
+REGISTERED_OPS: dict[tuple[Any, ...], Callable[..., torch.Tensor]] = {}
 
 
 def sanitize_tag(tag: str) -> str:
+    """``tag`` with every character outside ``[a-zA-Z0-9_]`` replaced by ``_``."""
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", tag)
     return cleaned or "v1"
 
@@ -67,7 +69,11 @@ def format_pallas_dma_op_name(
     tp_size: int,
     variant_tag: str,
 ) -> str:
-    """Construct a unique ``pallas::...`` custom-op name encoding all variant knobs (D87)."""
+    """Unique ``pallas::kimi_*`` custom-op name encoding every variant knob.
+
+    Every knob that changes the traced program is in the name, so a warm
+    compile cache never serves another variant.
+    """
     ax_str = "_".join(axis_tuple(axis_name))
     v_str = sanitize_tag(variant_tag)
     rmem_str = sanitize_tag(recv_memory_space)
@@ -79,6 +85,7 @@ def format_pallas_dma_op_name(
 
 
 def mesh_shape_and_ids(mesh: Mesh) -> tuple[int, int, tuple[int, ...]]:
+    """``(dp_size, tp_size, flat device ids)`` of a ``('dp', 'tp')`` mesh."""
     if tuple(mesh.axis_names) != (DP_AXIS_NAME, TP_AXIS_NAME):
         raise ValueError(
             f"Expected mesh.axis_names == ('dp', 'tp'), got {mesh.axis_names}"
@@ -86,6 +93,37 @@ def mesh_shape_and_ids(mesh: Mesh) -> tuple[int, int, tuple[int, ...]]:
     dp_size, tp_size = (int(mesh.devices.shape[0]), int(mesh.devices.shape[1]))
     dev_ids = tuple(int(d.id) for d in mesh.devices.flat)
     return dp_size, tp_size, dev_ids
+
+
+def _register_jax_op(
+    op_name: str,
+    jax_fn: Callable[[jax.Array], jax.Array],
+    mesh: Mesh,
+    in_spec: PartitionSpec,
+    out_spec: PartitionSpec,
+    fake: Callable[[torch.Tensor], torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Register ``jax_fn`` as the torch custom op ``op_name`` with a fake impl."""
+    raw_op = jax_op(
+        op_name,
+        jax_fn,
+        mesh=mesh,
+        input_partition_specs=(in_spec,),
+        output_partition_specs=(out_spec,),
+    )
+    raw_op.register_fake(fake)
+    return raw_op
+
+
+def _cache_op(
+    cache_key: tuple[Any, ...],
+    op_name: str,
+    call: Callable[[torch.Tensor], torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Tag ``call`` with its op name and cache it under ``cache_key``."""
+    call._qualname = op_name  # type: ignore[attr-defined]
+    REGISTERED_OPS[cache_key] = call
+    return call
 
 
 def build_pallas_all_gather_cols_op(
@@ -97,7 +135,7 @@ def build_pallas_all_gather_cols_op(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
     variant_tag: str = "opt2d_1",
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Build ``PartitionSpec('dp', 'tp') -> PartitionSpec('dp', None)`` column all-gather."""
+    """Column all-gather over 'tp': ``P('dp', 'tp') -> P('dp', None)``."""
     if axis_name != TP_AXIS_NAME:
         raise ValueError(f"all_gather_cols expects axis_name='tp', got {axis_name!r}")
     dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
@@ -139,21 +177,19 @@ def build_pallas_all_gather_cols_op(
         )(x)
         return jax.lax.with_sharding_constraint(out, out_sharding)
 
-    raw_op = jax_op(
+    raw_op = _register_jax_op(
         op_name,
         _ag_cols_jax,
-        mesh=mesh,
-        input_partition_specs=(in_spec,),
-        output_partition_specs=(out_spec,),
+        mesh,
+        in_spec,
+        out_spec,
+        lambda x: x.new_empty((x.shape[0], x.shape[1] * tp_size)),
     )
-    raw_op.register_fake(lambda x: x.new_empty((x.shape[0], x.shape[1] * tp_size)))
 
     def _call(x: torch.Tensor) -> torch.Tensor:
         return raw_op(x)
 
-    _call._qualname = op_name  # type: ignore[attr-defined]
-    REGISTERED_OPS[cache_key] = _call
-    return _call
+    return _cache_op(cache_key, op_name, _call)
 
 
 def build_pallas_all_gather_rows_op(
@@ -187,16 +223,20 @@ def build_pallas_all_gather_rows_op(
     elif axes_t == (DP_AXIS_NAME, TP_AXIS_NAME):
         gather_factor = dp_size * tp_size
     else:
-        raise ValueError(f"Unsupported axis_name={axis_name!r} for 2D ('dp', 'tp') mesh")
+        raise ValueError(
+            f"Unsupported axis_name={axis_name!r} for 2D ('dp', 'tp') mesh"
+        )
 
     if input_sharding == "dp_replicated" and axes_t != (DP_AXIS_NAME,):
         raise ValueError(
             "input_sharding='dp_replicated' is only valid when gathering across 'dp'; "
-            "use input_sharding='rank_unshared' when gathering distinct rows across 'tp'."
+            "use input_sharding='rank_unshared' when gathering distinct rows "
+            "across 'tp'."
         )
     if input_sharding not in ("dp_replicated", "rank_unshared"):
         raise ValueError(
-            f"input_sharding must be 'dp_replicated' or 'rank_unshared', got {input_sharding!r}"
+            "input_sharding must be 'dp_replicated' or 'rank_unshared', "
+            f"got {input_sharding!r}"
         )
 
     op_name = format_pallas_dma_op_name(
@@ -238,23 +278,19 @@ def build_pallas_all_gather_rows_op(
             )(x)
             return jax.lax.with_sharding_constraint(out, out_sharding)
 
-        raw_op = jax_op(
+        raw_op = _register_jax_op(
             op_name,
             _ag_dp_rep_jax,
-            mesh=mesh,
-            input_partition_specs=(in_spec,),
-            output_partition_specs=(out_spec,),
-        )
-        raw_op.register_fake(
-            lambda x: x.new_empty((x.shape[0] * gather_factor, x.shape[1]))
+            mesh,
+            in_spec,
+            out_spec,
+            lambda x: x.new_empty((x.shape[0] * gather_factor, x.shape[1])),
         )
 
         def _call_dp_rep(x: torch.Tensor) -> torch.Tensor:
             return raw_op(x)
 
-        _call_dp_rep._qualname = op_name  # type: ignore[attr-defined]
-        REGISTERED_OPS[cache_key] = _call_dp_rep
-        return _call_dp_rep
+        return _cache_op(cache_key, op_name, _call_dp_rep)
 
     # rank_unshared: 3D view [B_in, 1, D] partitioned across ('dp', 'tp', None).
     in_spec_3d = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME, None)
@@ -289,29 +325,26 @@ def build_pallas_all_gather_rows_op(
         )(x3d)
         return jax.lax.with_sharding_constraint(out, out_sharding_u)
 
-    raw_op_u = jax_op(
+    raw_op_u = _register_jax_op(
         op_name,
         _ag_unshared_jax,
-        mesh=mesh,
-        input_partition_specs=(in_spec_3d,),
-        output_partition_specs=(out_spec_unshared,),
+        mesh,
+        in_spec_3d,
+        out_spec_unshared,
+        (
+            (lambda x3d: x3d.new_empty((x3d.shape[0] * gather_factor, 1, x3d.shape[2])))
+            if squeeze_out
+            else (
+                lambda x3d: x3d.new_empty((x3d.shape[0] * gather_factor, x3d.shape[2]))
+            )
+        ),
     )
-    if squeeze_out:
-        raw_op_u.register_fake(
-            lambda x3d: x3d.new_empty((x3d.shape[0] * gather_factor, 1, x3d.shape[2]))
-        )
-    else:
-        raw_op_u.register_fake(
-            lambda x3d: x3d.new_empty((x3d.shape[0] * gather_factor, x3d.shape[2]))
-        )
 
     def _call_unshared(x: torch.Tensor) -> torch.Tensor:
         y = raw_op_u(x.unsqueeze(1))
         return y.squeeze(1) if squeeze_out else y
 
-    _call_unshared._qualname = op_name  # type: ignore[attr-defined]
-    REGISTERED_OPS[cache_key] = _call_unshared
-    return _call_unshared
+    return _cache_op(cache_key, op_name, _call_unshared)
 
 
 def build_pallas_psum_op(
@@ -323,7 +356,7 @@ def build_pallas_psum_op(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
     variant_tag: str = "opt2d_1",
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Build deterministic 1-shot Pallas ``psum`` over ``'tp'``, ``'dp'``, or ``('dp', 'tp')``."""
+    """Deterministic one-shot DMA ``psum`` over 'tp', 'dp' or ('dp', 'tp')."""
     dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
     axis_key = normalize_axis_name(axis_name)
     axes_t = axis_tuple(axis_key)
@@ -339,7 +372,9 @@ def build_pallas_psum_op(
         out_spec = PartitionSpec(None, None)
         squeeze_out = False
     else:
-        raise ValueError(f"Unsupported axis_name={axis_name!r} for 2D ('dp', 'tp') mesh")
+        raise ValueError(
+            f"Unsupported axis_name={axis_name!r} for 2D ('dp', 'tp') mesh"
+        )
 
     op_name = format_pallas_dma_op_name(
         kind="psum",
@@ -378,27 +413,24 @@ def build_pallas_psum_op(
         )(x3d)
         return jax.lax.with_sharding_constraint(out, out_sharding)
 
-    raw_op = jax_op(
+    raw_op = _register_jax_op(
         op_name,
         _psum_jax,
-        mesh=mesh,
-        input_partition_specs=(in_spec_3d,),
-        output_partition_specs=(out_spec,),
+        mesh,
+        in_spec_3d,
+        out_spec,
+        (
+            (lambda x3d: x3d.new_empty(x3d.shape))
+            if squeeze_out
+            else (lambda x3d: x3d.new_empty((x3d.shape[0], x3d.shape[2])))
+        ),
     )
-    if squeeze_out:
-        raw_op.register_fake(lambda x3d: x3d.new_empty(x3d.shape))
-    else:
-        raw_op.register_fake(
-            lambda x3d: x3d.new_empty((x3d.shape[0], x3d.shape[2]))
-        )
 
     def _call(x: torch.Tensor) -> torch.Tensor:
         y = raw_op(x.unsqueeze(1))
         return y.squeeze(1) if squeeze_out else y
 
-    _call._qualname = op_name  # type: ignore[attr-defined]
-    REGISTERED_OPS[cache_key] = _call
-    return _call
+    return _cache_op(cache_key, op_name, _call)
 
 
 def build_pallas_psum_scatter_rows_op(
@@ -410,7 +442,7 @@ def build_pallas_psum_scatter_rows_op(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
     variant_tag: str = "opt2d_1",
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Build deterministic 1-shot Pallas ``psum_scatter_rows`` over ``'dp'``, ``'tp'``, or ``('dp', 'tp')``."""
+    """Deterministic one-shot DMA row reduce-scatter over 'dp', 'tp' or both."""
     dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
     axis_key = normalize_axis_name(axis_name)
     axes_t = axis_tuple(axis_key)
@@ -421,7 +453,9 @@ def build_pallas_psum_scatter_rows_op(
     elif axes_t == (DP_AXIS_NAME, TP_AXIS_NAME):
         scatter_factor = dp_size * tp_size
     else:
-        raise ValueError(f"Unsupported axis_name={axis_name!r} for 2D ('dp', 'tp') mesh")
+        raise ValueError(
+            f"Unsupported axis_name={axis_name!r} for 2D ('dp', 'tp') mesh"
+        )
 
     in_spec_3d = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME, None)
     out_spec_3d = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME, None)
@@ -462,22 +496,16 @@ def build_pallas_psum_scatter_rows_op(
         )(x3d)
         return jax.lax.with_sharding_constraint(out, out_sharding)
 
-    raw_op = jax_op(
+    raw_op = _register_jax_op(
         op_name,
         _rs_jax,
-        mesh=mesh,
-        input_partition_specs=(in_spec_3d,),
-        output_partition_specs=(out_spec_3d,),
-    )
-    raw_op.register_fake(
-        lambda x3d: x3d.new_empty(
-            (x3d.shape[0] // scatter_factor, 1, x3d.shape[2])
-        )
+        mesh,
+        in_spec_3d,
+        out_spec_3d,
+        lambda x3d: x3d.new_empty((x3d.shape[0] // scatter_factor, 1, x3d.shape[2])),
     )
 
     def _call(x: torch.Tensor) -> torch.Tensor:
         return raw_op(x.unsqueeze(1)).squeeze(1)
 
-    _call._qualname = op_name  # type: ignore[attr-defined]
-    REGISTERED_OPS[cache_key] = _call
-    return _call
+    return _cache_op(cache_key, op_name, _call)

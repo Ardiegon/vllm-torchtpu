@@ -11,31 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pallas 1-shot remote-DMA primitives and ``@jax_op`` wrappers for Kimi K3.
+"""Pallas one-shot remote-DMA collectives for the Kimi K3 ('dp', 'tp') mesh.
 
-Ported from Google-internal GemAX / Kimi K3 Pallas transport modules
-(``kiloblox_a2a.py``, ``dense_a2a.py``, and ``latency_collectives.py``) with
-zero external dependencies:
+1. ``barrier_and_allocate``, ``_color_dma_operands`` and ``call_kernel`` pin
+   the memory space (``pltpu.HBM`` / ``pltpu.VMEM``) a buffer was created in
+   across kernel boundaries, so XLA's memory-space pass never relocates a
+   buffer that an in-flight remote DMA targets.
+2. ``dense_all_to_all`` sends one point-to-point ``make_async_remote_copy`` to
+   each of the ``N - 1`` peers in parallel with a local VMEM copy. It pads the
+   lane dimension to a multiple of 128 (e.g. ``224 -> 256``,
+   ``3632 -> 3712``) and retiles or pads the sublane dimension.
+3. ``latency_all_gather_rows``, ``latency_all_gather_cols``, ``latency_psum``
+   and ``latency_psum_scatter_rows`` call ``dense_all_to_all`` on a 3D
+   ``(axis_size, rows, lanes)`` view with ``split_axis=0, concat_axis=0``, so
+   small decode batches (e.g. ``B=4`` with 3632 lanes) tile cleanly.
+4. ``kimi_guarded_*`` pick the one-shot DMA collective for small inputs and the
+   ``jax.lax`` collective otherwise; the choice is made at trace time from
+   static shapes.
 
-1. ``barrier_and_allocate``, ``_color_dma_operands`` and ``call_kernel``
-   preserve birth memory spaces (``pltpu.HBM`` / ``pltpu.VMEM``)
-   across kernel boundaries so XLA's memory-space pass never relocates buffers
-   targeted by in-flight remote DMAs.
-2. ``dense_all_to_all`` performs 1-shot point-to-point ``make_async_remote_copy``
-   transfers to ``N - 1`` peers in parallel with a local VMEM bounce copy,
-   automatically padding lane dimensions to a multiple of ``128`` (e.g.
-   ``224 -> 256``, ``3632 -> 3712``) and retiling or padding sublane dims.
-3. ``latency_all_gather_rows``, ``latency_all_gather_cols``, ``latency_psum``,
-   and ``latency_psum_scatter_rows`` wrap ``dense_all_to_all`` with 3D
-   ``(axis_size, rows, lanes)`` ``split_axis=0, concat_axis=0`` geometry so
-   arbitrary small decode batch sizes (including ``B=4`` on odd-128 widths like
-   ``3632 -> 3712``) never trigger sublane tiling mismatches.
-4. Pre-built ``@jax_op`` + ``register_fake`` factories expose 2D
-   ``('dp', 'tp')`` ``jax.shard_map`` collectives to PyTorch / ``torch.compile``
-   with JAX-internal ``T_padded <= max_dma_tokens`` width guards (falling back
-   inside JAX to ``lax.all_gather`` / ``lax.psum_scatter`` / ``lax.psum`` for
-   chunked prefill buckets ``> 64``) and explicit variant tags in every
-   ``pallas::...`` custom-op name (``D87`` warm-cache safety).
+The torch ``@jax_op`` wrappers live in
+``vllm_torchtpu/models/vllm/kimi_k3/dma_collective_ops.py``.
 """
 
 from __future__ import annotations
@@ -58,26 +53,42 @@ Ref = Any
 DP_AXIS_NAME = "dp"
 TP_AXIS_NAME = "tp"
 
-# =============================================================================
-# Unified Non-Overlapping Kimi K3 `collective_id` Barrier Registry (0..6)
-# =============================================================================
-COLLECTIVE_ID_MOE_TP_LATENT_AG = 0       # 'tp': KimiMoE routed_down_local [B_dp, 224->256]
-COLLECTIVE_ID_MOE_DP_DISPATCH_AG = 1     # 'dp' / ('dp','tp'): pack_dp_dispatch [B_dp, 3632->3712]
-COLLECTIVE_ID_MOE_DP_COMBINE_RS = 2      # 'dp': post-MoE combine psum_scatter_rows [B_glob, 3584]
-COLLECTIVE_ID_MOE_TP_ROUTED_PSUM = 3     # 'tp': KimiMoE routed_out psum [B_dp, 3584]
-COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM = 4  # 'tp': KDA/MLA o_proj + L0 KimiMLP.down_proj [B_dp, 7168]
-COLLECTIVE_ID_MOE_TP_EXIT_PSUM = 5       # 'tp': KimiMoE packed_moe_out [B_dp, 7168]
-COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT = 6   # ('dp','tp') + 'tp': O4-A owner combine + seam_exit_split
+# Barrier ``collective_id`` of each Kimi K3 DMA collective. Collectives that can
+# be in flight at the same time must use different ids:
+#   0 'tp': KimiMoE routed_down_local column gather, [B_dp, 224 -> 256]
+#   1 'dp' or ('dp', 'tp'): packed MoE dispatch gather, [B_dp, 3632 -> 3712]
+#   2 'dp': post-MoE combine reduce-scatter, [B_global, 3584]
+#   3 'tp': KimiMoE routed_out psum, [B_dp, 3584]
+#   4 'tp': KDA/MLA o_proj and layer-0 KimiMLP down_proj psum, [B_dp, 7168]
+#   5 'tp': KimiMoE packed_moe_out psum, [B_dp, 7168]
+#   6 ('dp', 'tp') + 'tp': owner combine + seam exit split of the fused MoE
+COLLECTIVE_ID_MOE_TP_LATENT_AG = 0
+COLLECTIVE_ID_MOE_DP_DISPATCH_AG = 1
+COLLECTIVE_ID_MOE_DP_COMBINE_RS = 2
+COLLECTIVE_ID_MOE_TP_ROUTED_PSUM = 3
+COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM = 4
+COLLECTIVE_ID_MOE_TP_EXIT_PSUM = 5
+COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT = 6
 
 DENSE_COLLECTIVE_ID = COLLECTIVE_ID_MOE_TP_LATENT_AG
 DENSE_TRANSPOSE_COLLECTIVE_ID = COLLECTIVE_ID_MOE_DP_COMBINE_RS
 
+# Inputs with more rows than this take the jax.lax collective (prefill sizes).
 DEFAULT_MAX_DMA_TOKENS = 64
+# "auto" receive buffers go to VMEM only up to this many rows ...
 DEFAULT_VMEM_MAX_TOKENS = 8
+# ... and up to this many bytes.
+_VMEM_RECV_MAX_BYTES = 2 * 1024 * 1024
+# The one-shot DMA path is also limited to this many rows in total over the axis.
+_ONE_SHOT_MAX_TOTAL_ROWS = 1024
+# VMEM window of the local-copy pipeline in run_dense_a2a.
+_LOCAL_COPY_VMEM_WINDOW_BYTES = 3 * 1024 * 1024
+# XLA latency-hiding-scheduler estimate (cycles) for the barrier and the DMA.
+_DMA_LATENCY_METADATA = "300000"
 
 
 def normalize_axis_name(axis_name: str | Sequence[str]) -> str | tuple[str, ...]:
-    """Return a hashable axis identifier suitable for ``lax`` and Pallas ``device_id``."""
+    """Hashable axis identifier for ``jax.lax`` and Pallas ``device_id``."""
     if isinstance(axis_name, str):
         return axis_name
     axes = tuple(axis_name)
@@ -87,6 +98,7 @@ def normalize_axis_name(axis_name: str | Sequence[str]) -> str | tuple[str, ...]
 
 
 def axis_tuple(axis_name: str | Sequence[str]) -> tuple[str, ...]:
+    """``axis_name`` as a tuple of axis names."""
     return (axis_name,) if isinstance(axis_name, str) else tuple(axis_name)
 
 
@@ -132,9 +144,7 @@ def _color_dma_operands(
             return x
         if x.dtype in (jnp.uint32, jnp.int32, jnp.uint16, jnp.int16):
             return x
-        is_dense_recv = any(
-            getattr(entry, "name", None) == "x_recv" for entry in path
-        )
+        is_dense_recv = any(getattr(entry, "name", None) == "x_recv" for entry in path)
         is_named_vmem = bool(vmem_names_set) and any(
             getattr(entry, "name", None) in vmem_names_set for entry in path
         )
@@ -149,7 +159,7 @@ def _color_dma_operands(
 
 def call_kernel(
     kernel: Callable[..., Any],
-    *extra_pos: Any,
+    *,
     args: tuple[Any, ...] = (),
     inout: Any = (),
     output: Any = (),
@@ -164,7 +174,6 @@ def call_kernel(
     **kwargs: Any,
 ) -> Any:
     """Invoke a Pallas kernel with explicit memory-space coloring and I/O aliasing."""
-    assert not extra_pos, "Pass operands via `args=...`"
     scoped = {} if scoped is None else dict(scoped)
     if compiler_params is None:
         compiler_params = pltpu.CompilerParams()
@@ -224,8 +233,7 @@ def call_kernel(
             jax.tree.map(
                 lambda x: (
                     pltpu.SMEM(x.shape, dtype=x.dtype)
-                    if block_spec_from_array(x).memory_space
-                    == pltpu.MemorySpace.SMEM
+                    if block_spec_from_array(x).memory_space == pltpu.MemorySpace.SMEM
                     else x
                 ),
                 output,
@@ -262,9 +270,7 @@ def barrier_and_allocate(
     in_args: tuple[Any, ...] = ()
     in_specs: Any = ()
     if order_dep is not None:
-        dep_space = (
-            pltpu.MemorySpace.VMEM if order_dep_vmem else pltpu.MemorySpace.HBM
-        )
+        dep_space = pltpu.MemorySpace.VMEM if order_dep_vmem else pltpu.MemorySpace.HBM
         dep = (
             pltpu.with_memory_space_constraint(order_dep, dep_space)
             if allow_pin
@@ -330,21 +336,18 @@ class DenseReceiveState:
     data_recv_sem: Ref
 
 
-class BadTilingException(Exception):
-    pass
+class BadTilingException(ValueError):
+    """The shape cannot be tiled for a one-shot DMA all-to-all."""
 
 
 def _get_vmem_tiling(
     shape: Sequence[int],
     dtype: Any,
-    window_size: int = 3 * 1024 * 1024,
+    window_size: int = _LOCAL_COPY_VMEM_WINDOW_BYTES,
     num_chunks: int = 1,
 ) -> tuple[int, ...]:
     block_shape = list(shape)
-    while (
-        math.prod(block_shape) * jnp.dtype(dtype).itemsize * num_chunks
-        > window_size
-    ):
+    while math.prod(block_shape) * jnp.dtype(dtype).itemsize * num_chunks > window_size:
         candidates = []
         for i, val in enumerate(block_shape):
             if i == len(block_shape) - 1:
@@ -409,7 +412,11 @@ def run_dense_a2a(
                     )
 
                     @pl.when(i != my_id)
-                    def _() -> None:
+                    def _(
+                        i: int = i,
+                        src_slices: list[Any] = src_slices,
+                        dest_slices: list[Any] = dest_slices,
+                    ) -> None:
                         pltpu.make_async_remote_copy(
                             src_ref=x_ref.at[*src_slices],
                             dst_ref=recv_state_ref.x_recv.at[*dest_slices],
@@ -498,6 +505,32 @@ def run_dense_a2a(
     )[0].x_recv
 
 
+def _tiling_problem(
+    x_shape: tuple[int, ...],
+    axis_size: int,
+    split_axis: int,
+    concat_axis: int,
+    num_chunks: int,
+) -> str | None:
+    """Why ``x_shape`` cannot be sent as-is by a one-shot all-to-all, or None."""
+    if axis_size == 1:
+        return None
+    out_shape = list(x_shape)
+    out_shape[split_axis] //= axis_size * num_chunks
+    out_shape[concat_axis] *= axis_size * num_chunks
+    if x_shape[-1] % 128 != 0 or out_shape[-1] % 128 != 0:
+        return (
+            f"lane dim of input {x_shape} or output {tuple(out_shape)} "
+            "is not a multiple of 128"
+        )
+    if len(x_shape) > 1 and min(x_shape[-2], 8) != min(out_shape[-2], 8):
+        return (
+            f"sublane dim changes from {x_shape} to {tuple(out_shape)} "
+            f"(axis_size={axis_size}, num_chunks={num_chunks})"
+        )
+    return None
+
+
 def _check_tiling(
     x_shape: tuple[int, ...],
     axis_size: int,
@@ -505,25 +538,9 @@ def _check_tiling(
     concat_axis: int,
     num_chunks: int,
 ) -> None:
-    if axis_size == 1:
-        return
-
-    def _assert(cond: bool, msg: Any) -> None:
-        if not cond:
-            raise BadTilingException(msg)
-
-    out_shape = list(x_shape)
-    out_shape[split_axis] //= axis_size * num_chunks
-    out_shape[concat_axis] *= axis_size * num_chunks
-    out_shape_t = tuple(out_shape)
-
-    _assert(x_shape[-1] % 128 == 0, (x_shape, out_shape_t))
-    _assert(out_shape_t[-1] % 128 == 0, (x_shape, out_shape_t))
-    if len(x_shape) > 1:
-        _assert(
-            min(x_shape[-2], 8) == min(out_shape_t[-2], 8),
-            (x_shape, out_shape_t, axis_size, num_chunks),
-        )
+    problem = _tiling_problem(x_shape, axis_size, split_axis, concat_axis, num_chunks)
+    if problem is not None:
+        raise BadTilingException(problem)
 
 
 def _unpad_lanes_pallas(
@@ -546,8 +563,7 @@ def _unpad_lanes_pallas(
             src_start = p * padded_lane_size
             dst_start = p * orig_lanes
             out_ref[
-                base_indices
-                + (slice(None), slice(dst_start, dst_start + orig_lanes))
+                base_indices + (slice(None), slice(dst_start, dst_start + orig_lanes))
             ] = x_val_flat[:, src_start : src_start + orig_lanes]
 
     in_spec = pl.BlockSpec(
@@ -574,19 +590,15 @@ def _unpad_lanes_pallas(
     return out_tuple[0]
 
 
+# Largest sublane tile per dtype width in bits (4- and 8-bit values pack 64 and
+# 32 rows per tile); every wider dtype uses 8.
+_MAX_SUBLANE_PACKING = {4: 64, 8: 32}
+
+
 def _sublane_packing_params(x: jax.Array) -> tuple[int, int]:
-    if x.dtype == jnp.dtype("int4"):
-        dtype_width_bits = 4
-    else:
-        dtype_width_bits = x.dtype.itemsize * 8
-
-    if dtype_width_bits == 4:
-        max_sublane_packing = 64
-    elif dtype_width_bits == 8:
-        max_sublane_packing = 32
-    else:
-        max_sublane_packing = 8
-
+    """``(rows per 32-bit word, sublane tile rows)`` for ``x``'s dtype and rows."""
+    dtype_width_bits = jax.dtypes.itemsize_bits(x.dtype)
+    max_sublane_packing = _MAX_SUBLANE_PACKING.get(dtype_width_bits, 8)
     min_sublane_packing = 32 // dtype_width_bits
     next_pow2_sublane = 1 << (x.shape[-2] - 1).bit_length()
     sublane_packing = max(
@@ -607,12 +619,11 @@ def needs_retile(
     _, sublane_packing = _sublane_packing_params(x)
     if x.shape[-2] % sublane_packing != 0:
         return True
-    if axis_size is not None:
-        try:
-            _check_tiling(x.shape, axis_size, split_axis, concat_axis, num_chunks)
-        except BadTilingException:
-            return True
-    return False
+    return (
+        axis_size is not None
+        and _tiling_problem(x.shape, axis_size, split_axis, concat_axis, num_chunks)
+        is not None
+    )
 
 
 def can_retile(x: jax.Array) -> bool:
@@ -705,7 +716,7 @@ def _dense_all_to_all(
     recv_space = pltpu.VMEM if recv_memory_space == "vmem" else pltpu.HBM
     with xla_metadata.set_xla_metadata(
         async_type="collective-start",
-        latency_metadata="300000",
+        latency_metadata=_DMA_LATENCY_METADATA,
     ):
         recv_state = barrier_and_allocate(
             DenseReceiveState(
@@ -720,7 +731,7 @@ def _dense_all_to_all(
 
     with xla_metadata.set_xla_metadata(
         async_type="collective-done",
-        latency_metadata="300000",
+        latency_metadata=_DMA_LATENCY_METADATA,
     ):
         return run_dense_a2a(
             x,
@@ -757,8 +768,7 @@ def dense_all_to_all(
         len(x.shape) == 2
         and split_axis == 0
         and concat_axis == 0
-        and (x.shape[0] // (jax.lax.axis_size(axis_key) * num_chunks))
-        % tile_sublanes
+        and (x.shape[0] // (jax.lax.axis_size(axis_key) * num_chunks)) % tile_sublanes
         != 0
     ):
         raise BadTilingException(
@@ -879,12 +889,13 @@ def _resolve_recv_memory_space(
         return recv_memory_space
     if recv_memory_space != "auto":
         raise ValueError(
-            f"recv_memory_space must be 'auto', 'hbm', or 'vmem', got {recv_memory_space!r}"
+            "recv_memory_space must be 'auto', 'hbm', or 'vmem', "
+            f"got {recv_memory_space!r}"
         )
     if not allow_vmem_auto or lanes % 128 != 0:
         return "hbm"
     recv_bytes = axis_size * max(rows, 8) * lanes * jnp.dtype(dtype).itemsize
-    if rows <= vmem_max_tokens and recv_bytes <= 2 * 1024 * 1024:
+    if rows <= vmem_max_tokens and recv_bytes <= _VMEM_RECV_MAX_BYTES:
         return "vmem"
     return "hbm"
 
@@ -979,7 +990,10 @@ def latency_psum_scatter_rows(
     collective_id: int = DENSE_TRANSPOSE_COLLECTIVE_ID,
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
-    """Deterministic 1-shot Pallas remote-DMA row reduce-scatter: ``[Ax*rows, ...] -> [rows, ...]``."""
+    """Deterministic one-shot DMA row reduce-scatter.
+
+    ``[axis_size * rows, ...] -> [rows, ...]``, summed in float32.
+    """
     axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     if axis_size == 1:
@@ -999,6 +1013,15 @@ def latency_psum_scatter_rows(
     return received.astype(jnp.float32).sum(axis=0).astype(x.dtype)
 
 
+def _use_one_shot(rows: int, total_rows: int, max_dma_tokens: int) -> bool:
+    """Whether a guarded collective takes the one-shot DMA path.
+
+    ``rows`` is the per-shard row count compared with ``max_dma_tokens``;
+    ``total_rows`` is the row count summed over the axis.
+    """
+    return rows <= max_dma_tokens and total_rows <= _ONE_SHOT_MAX_TOTAL_ROWS
+
+
 def kimi_guarded_all_gather_rows(
     x: jax.Array,
     axis_name: str | Sequence[str],
@@ -1007,11 +1030,11 @@ def kimi_guarded_all_gather_rows(
     recv_memory_space: str = "auto",
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
 ) -> jax.Array:
-    """JAX-internal width-guarded row all-gather (1-shot Pallas for ``<= max_dma_tokens``)."""
+    """Row all-gather: one-shot DMA for ``<= max_dma_tokens`` rows, else lax."""
     axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows = x.shape[0]
-    if rows <= max_dma_tokens and rows * axis_size <= 1024:
+    if _use_one_shot(rows, rows * axis_size, max_dma_tokens):
         rmem = _resolve_recv_memory_space(
             recv_memory_space, rows, x.shape[-1], axis_size, x.dtype
         )
@@ -1032,11 +1055,11 @@ def kimi_guarded_all_gather_cols(
     recv_memory_space: str = "auto",
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
 ) -> jax.Array:
-    """JAX-internal width-guarded column all-gather (1-shot Pallas for ``<= max_dma_tokens``)."""
+    """Column all-gather: one-shot DMA for ``<= max_dma_tokens`` rows, else lax."""
     axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows = x.shape[0]
-    if rows <= max_dma_tokens and rows * axis_size <= 1024:
+    if _use_one_shot(rows, rows * axis_size, max_dma_tokens):
         rmem = _resolve_recv_memory_space(
             recv_memory_space, rows, x.shape[-1], axis_size, x.dtype
         )
@@ -1058,11 +1081,11 @@ def kimi_guarded_psum(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
     vmem_max_tokens: int = DEFAULT_VMEM_MAX_TOKENS,
 ) -> jax.Array:
-    """JAX-internal width-guarded all-reduce (1-shot Pallas for ``<= max_dma_tokens``)."""
+    """All-reduce: one-shot DMA for ``<= max_dma_tokens`` rows, else lax."""
     axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows = x.shape[0]
-    if rows <= max_dma_tokens and rows * axis_size <= 1024:
+    if _use_one_shot(rows, rows * axis_size, max_dma_tokens):
         rmem = _resolve_recv_memory_space(
             recv_memory_space,
             rows,
@@ -1090,11 +1113,11 @@ def kimi_guarded_psum_scatter_rows(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
     vmem_max_tokens: int = DEFAULT_VMEM_MAX_TOKENS,
 ) -> jax.Array:
-    """JAX-internal width-guarded row reduce-scatter (1-shot Pallas for ``<= max_dma_tokens``)."""
+    """Row reduce-scatter: one-shot DMA for ``<= max_dma_tokens`` output rows."""
     axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows_out = x.shape[0] // axis_size
-    if rows_out <= max_dma_tokens and x.shape[0] <= 1024:
+    if _use_one_shot(rows_out, x.shape[0], max_dma_tokens):
         rmem = _resolve_recv_memory_space(
             recv_memory_space,
             rows_out,

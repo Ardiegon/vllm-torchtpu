@@ -11,41 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kimi K3 Phase O2 packed DP dispatch & 1-shot Pallas ``latency_*`` collectives.
+"""Kimi K3 packed DP dispatch and one-shot Pallas DMA collective bundle.
 
 Provides:
-  1. FTZ-safe, zero-ULP byte-valued ``bfloat16`` packing/unpacking of
-     ``(latent_bf16, topk_ids_i32, topk_weights_bf16)`` into a single
-     ``[B_dp, latent_dim + 3 * K]`` ``bfloat16`` tensor (cutting per-layer
-     ``DP`` ``all_gather`` calls ``3 -> 1``: ``276 -> 92`` on ``93L``,
-     ``12 -> 4`` on ``4``-MoE ``L5``).
-  2. Warm-cache-safe custom-op variant tagging (`D87`) encoding all active
-     `O2` environment toggles directly into `pallas::kimi_*` custom-op names.
-  3. Pre-built `@jax_op` bundle (`KimiDmaCollectives`) with JAX-internal
-     ``T_padded <= max_dma_tokens`` width guards (`T_padded <= 64` 1-shot Pallas
-     remote-DMA, `T_padded > 64` `jax.lax.*` ring fallback inside JAX — zero
-     Python branching on symbolic `num_tokens`) across the non-overlapping
-     `collective_id` `0..5` barrier registry:
-       - `cid=0` (`'tp'`): `KimiMoE` `routed_down_local` 1-shot `all_gather_cols`
-       - `cid=1` (`'dp'` or `('dp', 'tp')`): packed `DP` (or flat `world`)
-         EP dispatch `all_gather_rows`
-       - `cid=2` (`'dp'`): post-MoE `DP` combine `psum_scatter_rows`
-       - `cid=3` (`'tp'`): `KimiMoE` `routed_out` deterministic 1-shot `psum`
-       - `cid=4` (`'tp'`): `KDA`/`MLA` `o_proj` + `L0` `KimiMLP.down_proj`
-         deterministic 1-shot `psum`
-       - `cid=5` (`'tp'`): `KimiMoE` `packed_moe_out` deterministic 1-shot `psum`
+  1. FTZ-safe, exact byte-valued ``bfloat16`` packing of
+     ``(latent_bf16, topk_ids_i32, topk_weights_bf16)`` into one
+     ``[B_dp, latent_dim + 3 * K]`` ``bfloat16`` tensor, so the MoE dispatch
+     needs one DP all-gather per layer instead of three.
+  2. A custom-op variant tag that encodes every active Kimi DMA/kernel-variant
+     env value in the ``pallas::kimi_*`` op names, so a warm compile cache
+     never serves a stale variant.
+  3. ``KimiDmaCollectives``: the ``@jax_op`` collectives built once at model
+     load and attached to the Kimi modules. Each one takes the one-shot
+     Pallas DMA path for small (decode) batches and the ``jax.lax``
+     collective otherwise; the choice is made at trace time from static
+     shapes. Barrier ids (see ``kernels/kimi_k3/pallas_dma.py``):
+       - ``cid=0`` ('tp'): KimiMoE routed_down_local column all-gather
+       - ``cid=1`` ('dp'): packed MoE dispatch row all-gather
+       - ``cid=2`` ('dp'): post-MoE combine reduce-scatter
+       - ``cid=3`` ('tp'): KimiMoE routed_out psum
+       - ``cid=4`` ('tp'): KDA/MLA o_proj and layer-0 KimiMLP down_proj psum
+       - ``cid=5`` ('tp'): KimiMoE packed_moe_out psum
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from jax.sharding import Mesh
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dp_tp_mesh import validate_dp_tp_group_ranks
 from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
     build_kimi_moe_ep_overlap_op,
     normalize_exit_fold_mode,
@@ -107,7 +106,11 @@ def normalize_latency_tp_psum_mode(raw: str | None) -> str:
 
 
 def kimi_dma_variant_tag() -> str:
-    """Return a cache-safe variant tag encoding all active O2/O4/O5 env flags (`D87`)."""
+    """Variant tag for the custom-op names, encoding every active Kimi knob.
+
+    The "o2_" prefix and the field layout are part of the cached op names;
+    changing them invalidates warm compile caches.
+    """
     tp_mode = normalize_latency_tp_psum_mode(envs.TPU_KIMI_OPT_LATENCY_TP_PSUM)
     raw_ef = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
     ef_mode = normalize_exit_fold_mode(raw_ef)
@@ -141,15 +144,15 @@ def pack_dispatch_metadata(
     topk_ids_i32: torch.Tensor,
     topk_weights_bf16: torch.Tensor,
 ) -> torch.Tensor:
-    """Pack ``topk_ids[B, K]`` (int32) + ``topk_weights[B, K]`` (bf16) into ``[B, 3*K]`` bf16.
+    """Pack ``topk_ids[B, K]`` (int32) and ``topk_weights[B, K]`` into ``[B, 3K]`` bf16.
 
     Why byte-valued normal ``bfloat16`` lanes instead of raw ``.view(torch.bfloat16)``:
     TPU floating-point / padding operations flush ``bfloat16`` subnormals to signed
     zero (FTZ), which corrupts raw-bitcast ``int32`` expert IDs ``1..127``
     (``0x0001..0x007F``) to ``0`` and canonicalizes ``-1`` (``0xFFFFFFFF``) NaN bits.
     Encoding signed 16-bit IDs (`-32768..32767`, covering `-1` and `0..895`) into two
-    unsigned byte-valued ``bfloat16`` lanes ``0..255`` (matching
-    ``kernels/kimi_k3/collectives.py:133-153``) uses the exact same ``2 * K`` ``bf16``
+    unsigned byte-valued ``bfloat16`` lanes ``0..255`` (matching the byte
+    packing in ``kernels/kimi_k3/collectives.py``) uses the same ``2 * K`` ``bf16``
     lanes with ``0`` ULP error and complete immunity to FTZ and NaN canonicalization.
     """
     ids_i32 = (
@@ -172,7 +175,7 @@ def pack_dp_dispatch(
     topk_ids_i32: torch.Tensor,
     topk_weights_bf16: torch.Tensor,
 ) -> torch.Tensor:
-    """Pack ``(latent[B, D], topk_ids[B, K], topk_weights[B, K])`` -> ``[B, D + 3*K]`` bf16."""
+    """Pack ``(latent[B, D], topk_ids[B, K], topk_weights[B, K])`` as ``[B, D+3K]``."""
     x_bf16 = (
         latent_bf16
         if latent_bf16.dtype == torch.bfloat16
@@ -187,7 +190,7 @@ def unpack_dp_dispatch(
     latent_dim: int,
     topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Unpack ``[B_global, D + 3*K]`` bf16 -> ``(latent_bf16, topk_ids_i32, topk_weights_bf16)``."""
+    """Unpack ``[B, D + 3K]`` bf16 into ``(latent, topk_ids_i32, topk_weights)``."""
     latent = packed_bf16[:, :latent_dim]
     low_i32 = packed_bf16[:, latent_dim : latent_dim + topk].to(torch.int32)
     high_i32 = packed_bf16[:, latent_dim + topk : latent_dim + 2 * topk].to(torch.int32)
@@ -198,7 +201,7 @@ def unpack_dp_dispatch(
 
 @dataclass(frozen=True)
 class KimiDmaCollectives:
-    """Pre-built Phase O2/O4 `@jax_op` callables attached at model load time."""
+    """``@jax_op`` collectives built at model load and attached to Kimi modules."""
 
     variant_tag: str
     dp_size: int
@@ -233,52 +236,36 @@ class KimiDmaCollectives:
         moe_module._dma_dp_combine_rs_op = self.dp_combine_rs_op
         moe_module._dma_tp_routed_psum_op = self.tp_routed_psum_op
         moe_module._dma_tp_moe_exit_psum_op = self.tp_moe_exit_psum_op
+        w_shared_gu = getattr(moe_module, "w_shared_gu", None)
         can_attach_ep_overlap = (
             self.exit_fold_mode != "off"
             and self.mesh is not None
             and getattr(moe_module, "w_routed_down_tp", None) is not None
-            and getattr(moe_module, "w_shared_gu", None) is not None
+            and w_shared_gu is not None
             and getattr(moe_module, "packed_moe_out_weight", None) is not None
             and bool(getattr(moe_module, "use_ep", False))
         )
-        if can_attach_ep_overlap:
-            tp_rank = (
-                int(torch.distributed.get_rank()) % self.tp_size
-                if torch.distributed.is_initialized()
-                else 0
-            )
-            dev = torch.device("cpu")
-            for buf in (
-                getattr(moe_module, "w_shared_gu", None),
-                getattr(moe_module, "packed_moe_out_weight", None),
-            ):
-                if isinstance(buf, torch.Tensor) and buf.numel() > 0:
-                    dev = buf.device
-                    break
-            else:
-                for p in moe_module.parameters():
-                    if p.numel() > 0:
-                        dev = p.device
-                        break
-            moe_module.register_buffer(
-                "_dma_tp_rank_buf",
-                torch.tensor([[tp_rank]], dtype=torch.int32, device=dev),
-                persistent=False,
-            )
-        else:
+        if not can_attach_ep_overlap:
             moe_module._dma_tp_rank_buf = None
-
-        if can_attach_ep_overlap:
-            assert self.mesh is not None
-            moe_module._ep_overlap_op = build_kimi_moe_ep_overlap_op(
-                self.mesh,
-                moe_module,
-                exit_fold_mode=self.exit_fold_mode,
-                max_dma_tokens=self.max_dma_tokens,
-                variant_tag=self.variant_tag,
-            )
-        else:
             moe_module._ep_overlap_op = None
+            return
+
+        assert self.mesh is not None and w_shared_gu is not None
+        # The fused MoE op reads this rank's TP index from a runtime buffer so
+        # every rank traces the same program.
+        _, tp_rank = validate_dp_tp_group_ranks(self.dp_size, self.tp_size)
+        moe_module.register_buffer(
+            "_dma_tp_rank_buf",
+            torch.tensor([[tp_rank]], dtype=torch.int32, device=w_shared_gu.device),
+            persistent=False,
+        )
+        moe_module._ep_overlap_op = build_kimi_moe_ep_overlap_op(
+            self.mesh,
+            moe_module,
+            exit_fold_mode=self.exit_fold_mode,
+            max_dma_tokens=self.max_dma_tokens,
+            variant_tag=self.variant_tag,
+        )
 
     def attach_to_attn(self, attn_module: Any) -> None:
         attn_module._tp_exit_psum_op = self.tp_attn_mlp_psum_op
@@ -295,17 +282,50 @@ class KimiDmaCollectives:
             mlp_module._tp_exit_psum_op = self.tp_attn_mlp_psum_op
 
 
+class _TpPsumPlan(NamedTuple):
+    """Which TP psums take the one-shot DMA path, and their row cap."""
+
+    routed: bool
+    all_exits: bool
+    max_dma_tokens: int
+
+
+# "tp16" mode: only at TP >= this size, with this row cap (decode batches only).
+_TP16_MIN_TP_SIZE = 16
+_TP16_MAX_DMA_TOKENS = 8
+
+
+def _resolve_tp_psum_plan(
+    tp_psum_mode: str, tp_size: int, max_dma_tokens: int
+) -> _TpPsumPlan:
+    """TP psum plan for a normalized ``TPU_KIMI_OPT_LATENCY_TP_PSUM`` mode."""
+    if tp_size <= 1 or tp_psum_mode == "off":
+        return _TpPsumPlan(False, False, max_dma_tokens)
+    if tp_psum_mode == "tp16":
+        if tp_size >= _TP16_MIN_TP_SIZE:
+            return _TpPsumPlan(True, True, _TP16_MAX_DMA_TOKENS)
+        return _TpPsumPlan(False, False, max_dma_tokens)
+    if tp_psum_mode == "routed_only":
+        return _TpPsumPlan(True, False, max_dma_tokens)
+    if tp_psum_mode == "all":
+        return _TpPsumPlan(True, True, max_dma_tokens)
+    if tp_psum_mode.isdigit():
+        return _TpPsumPlan(True, True, int(tp_psum_mode))
+    return _TpPsumPlan(False, False, max_dma_tokens)
+
+
 def build_kimi_dma_collectives(
     mesh: Mesh,
     *,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
 ) -> KimiDmaCollectives:
-    """Pre-build active O2/O4 `@jax_op` callables outside `torch.compile`."""
+    """Build the active Kimi DMA collectives; call outside ``torch.compile``."""
     dp_size, tp_size, _ = mesh_shape_and_ids(mesh)
     vtag = kimi_dma_variant_tag()
     use_lat = bool(envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES)
     tp_psum_mode = normalize_latency_tp_psum_mode(envs.TPU_KIMI_OPT_LATENCY_TP_PSUM)
     ef_mode = normalize_exit_fold_mode(envs.TPU_KIMI_OPT_EXIT_FOLD)
+    common = {"recv_memory_space": "auto", "variant_tag": vtag}
 
     tp_latent_ag_op = None
     dp_packed_ag_op = None
@@ -314,85 +334,57 @@ def build_kimi_dma_collectives(
     tp_attn_mlp_psum_op = None
     tp_moe_exit_psum_op = None
 
-    if ef_mode == "off":
-        if use_lat:
-            if tp_size > 1:
-                tp_latent_ag_op = build_pallas_all_gather_cols_op(
-                    mesh,
-                    axis_name=TP_AXIS_NAME,
-                    collective_id=COLLECTIVE_ID_MOE_TP_LATENT_AG,
-                    recv_memory_space="auto",
-                    max_dma_tokens=max_dma_tokens,
-                    variant_tag=vtag,
-                )
-            if dp_size > 1:
-                dp_packed_ag_op = build_pallas_all_gather_rows_op(
-                    mesh,
-                    axis_name=DP_AXIS_NAME,
-                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                    input_sharding="dp_replicated",
-                    recv_memory_space="auto",
-                    max_dma_tokens=max_dma_tokens,
-                    variant_tag=vtag,
-                )
-
-        if use_lat and dp_size > 1:
+    # With exit fold on, the fused MoE op does its own dispatch and combine.
+    if ef_mode == "off" and use_lat:
+        if tp_size > 1:
+            tp_latent_ag_op = build_pallas_all_gather_cols_op(
+                mesh,
+                axis_name=TP_AXIS_NAME,
+                collective_id=COLLECTIVE_ID_MOE_TP_LATENT_AG,
+                max_dma_tokens=max_dma_tokens,
+                **common,
+            )
+        if dp_size > 1:
+            dp_packed_ag_op = build_pallas_all_gather_rows_op(
+                mesh,
+                axis_name=DP_AXIS_NAME,
+                collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+                input_sharding="dp_replicated",
+                max_dma_tokens=max_dma_tokens,
+                **common,
+            )
             dp_combine_rs_op = build_pallas_psum_scatter_rows_op(
                 mesh,
                 axis_name=DP_AXIS_NAME,
                 collective_id=COLLECTIVE_ID_MOE_DP_COMBINE_RS,
-                recv_memory_space="auto",
                 max_dma_tokens=max_dma_tokens,
-                variant_tag=vtag,
+                **common,
             )
 
-    if tp_size > 1 and tp_psum_mode != "off":
-        enable_routed = False
-        enable_all_exits = False
-        psum_cap = max_dma_tokens
-        if tp_psum_mode == "tp16":
-            if tp_size >= 16:
-                enable_routed = True
-                enable_all_exits = True
-                psum_cap = 8
-        elif tp_psum_mode == "routed_only":
-            enable_routed = True
-            psum_cap = max_dma_tokens
-        elif tp_psum_mode == "all":
-            enable_routed = True
-            enable_all_exits = True
-            psum_cap = max_dma_tokens
-        elif tp_psum_mode.isdigit():
-            enable_routed = True
-            enable_all_exits = True
-            psum_cap = int(tp_psum_mode)
-
-        if enable_routed and ef_mode == "off":
-            tp_routed_psum_op = build_pallas_psum_op(
-                mesh,
-                axis_name=TP_AXIS_NAME,
-                collective_id=COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
-                recv_memory_space="auto",
-                max_dma_tokens=psum_cap,
-                variant_tag=vtag,
-            )
-        if enable_all_exits:
-            tp_attn_mlp_psum_op = build_pallas_psum_op(
-                mesh,
-                axis_name=TP_AXIS_NAME,
-                collective_id=COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
-                recv_memory_space="auto",
-                max_dma_tokens=psum_cap,
-                variant_tag=vtag,
-            )
-            tp_moe_exit_psum_op = build_pallas_psum_op(
-                mesh,
-                axis_name=TP_AXIS_NAME,
-                collective_id=COLLECTIVE_ID_MOE_TP_EXIT_PSUM,
-                recv_memory_space="auto",
-                max_dma_tokens=psum_cap,
-                variant_tag=vtag,
-            )
+    plan = _resolve_tp_psum_plan(tp_psum_mode, tp_size, max_dma_tokens)
+    if plan.routed and ef_mode == "off":
+        tp_routed_psum_op = build_pallas_psum_op(
+            mesh,
+            axis_name=TP_AXIS_NAME,
+            collective_id=COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
+            max_dma_tokens=plan.max_dma_tokens,
+            **common,
+        )
+    if plan.all_exits:
+        tp_attn_mlp_psum_op = build_pallas_psum_op(
+            mesh,
+            axis_name=TP_AXIS_NAME,
+            collective_id=COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM,
+            max_dma_tokens=plan.max_dma_tokens,
+            **common,
+        )
+        tp_moe_exit_psum_op = build_pallas_psum_op(
+            mesh,
+            axis_name=TP_AXIS_NAME,
+            collective_id=COLLECTIVE_ID_MOE_TP_EXIT_PSUM,
+            max_dma_tokens=plan.max_dma_tokens,
+            **common,
+        )
 
     bundle = KimiDmaCollectives(
         variant_tag=vtag,
@@ -410,8 +402,9 @@ def build_kimi_dma_collectives(
     )
     if bundle.has_any_op:
         logger.info(
-            "Armed Kimi O2/O4 collectives | variant=%s | mesh=(dp=%d, tp=%d) | "
-            "exit_fold=%s tp_lat_ag=%s dp_pack_ag=%s dp_rs=%s tp_psum=(routed=%s, exit=%s)",
+            "Armed Kimi DMA collectives | variant=%s | mesh=(dp=%d, tp=%d) | "
+            "exit_fold=%s tp_lat_ag=%s dp_pack_ag=%s dp_rs=%s "
+            "tp_psum=(routed=%s, exit=%s)",
             vtag,
             dp_size,
             tp_size,
