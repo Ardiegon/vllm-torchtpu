@@ -14,7 +14,6 @@
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
 import dataclasses
-import functools
 import math
 from collections.abc import Callable
 from typing import TypeVar
@@ -22,8 +21,6 @@ from typing import TypeVar
 import jax
 import jax.numpy as jnp
 import torch
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 
@@ -36,6 +33,10 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
+from vllm_torchtpu.kernels.gdn.v3.gated_output_norm import (
+    gated_output_norm as _gated_output_norm,
+)
+from vllm_torchtpu.kernels.gdn.v3.gated_output_norm import gated_output_norm_2d
 from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cond, use_kda_glue
 from vllm_torchtpu.logger import init_logger
 
@@ -248,93 +249,6 @@ def _short_conv_tokens(
 # ===========================================================================
 # Shared KDA helpers
 # ===========================================================================
-
-
-def _gated_output_norm(
-    output: jax.Array,  # [num_rows, H, D]
-    output_gate: jax.Array,  # [num_rows, H * D] raw gate
-    norm_weight: jax.Array,  # [D]
-    eps: float,
-    activation_dtype,
-) -> jax.Array:
-    """Per-head ``o_norm`` followed by the sigmoid output gate."""
-    output = output.astype(activation_dtype).astype(jnp.float32)
-    output *= jax.lax.rsqrt(jnp.mean(output * output, axis=-1, keepdims=True) + eps)
-    output = (output * norm_weight.astype(jnp.float32)).astype(activation_dtype)
-    return output * jax.nn.sigmoid(output_gate.reshape(output.shape))
-
-
-def _gated_output_norm_2d_kernel(
-    x_ref: jax.Ref,
-    g_ref: jax.Ref,
-    w_ref: jax.Ref,
-    o_ref: jax.Ref,
-    *,
-    eps: float,
-    num_heads: int,
-    head_dim: int,
-) -> None:
-    w = w_ref[...].astype(jnp.float32)
-    for h in range(num_heads):
-        sl = slice(h * head_dim, (h + 1) * head_dim)
-        x = x_ref[:, sl].astype(jnp.float32)
-        inv_rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
-        y = (x * inv_rms * w).astype(o_ref.dtype)
-        o_ref[:, sl] = y * jax.nn.sigmoid(g_ref[:, sl].astype(o_ref.dtype))
-
-
-def _pallas_gated_output_norm_2d(
-    out_2d: jax.Array,  # [num_rows, H * D]
-    output_gate: jax.Array,  # [num_rows, H * D]
-    norm_weight: jax.Array,  # [D]
-    eps: float,
-    activation_dtype,
-    *,
-    num_heads: int,
-    head_dim: int,
-) -> jax.Array:
-    """Sublane-preserving 2D Pallas ``o_norm`` + sigmoid gate (`O5-3` `kda_glue`).
-
-    Keeps ``num_rows`` on sublanes and ``head_dim`` (128) on lanes so XLA never
-    emits ``2D <-> 3D`` sublane relayout transposes before or after ``o_norm``.
-    """
-    num_rows, total_dim = out_2d.shape
-    if head_dim % 128 != 0:
-        return _gated_output_norm(
-            out_2d.reshape(num_rows, num_heads, head_dim),
-            output_gate,
-            norm_weight,
-            eps,
-            activation_dtype,
-        ).reshape(num_rows, total_dim)
-
-    x_in = out_2d.astype(activation_dtype)
-    g_in = output_gate.astype(activation_dtype)
-    padded_rows = max(8, ((num_rows + 7) // 8) * 8)
-    pad_rows = padded_rows - num_rows
-    if pad_rows > 0:
-        x_in = jnp.pad(x_in, ((0, pad_rows), (0, 0)))
-        g_in = jnp.pad(g_in, ((0, pad_rows), (0, 0)))
-
-    block_rows = math.gcd(padded_rows, 256)
-    row_block = pl.BlockSpec((block_rows, total_dim), lambda i: (i, 0))
-    weight_block = pl.BlockSpec((1, head_dim), lambda i: (0, 0))
-    out_spec = jax.ShapeDtypeStruct((padded_rows, total_dim), activation_dtype)
-    res = pl.pallas_call(
-        functools.partial(
-            _gated_output_norm_2d_kernel,
-            eps=eps,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        ),
-        grid=(padded_rows // block_rows,),
-        in_specs=[row_block, row_block, weight_block],
-        out_specs=row_block,
-        out_shape=out_spec,
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name=f"kimi_kda_gated_output_norm_2d_h{num_heads}_d{head_dim}",
-    )(x_in, g_in, norm_weight.reshape(1, head_dim))
-    return res[:num_rows] if pad_rows > 0 else res
 
 
 def _check_kda_abi(
@@ -994,7 +908,7 @@ def _pooled_kda_core(
 
         new_pool, out = _run_direct(batched_only=False, prefill_only=False)
         if resolved_kda_glue:
-            output = _pallas_gated_output_norm_2d(
+            output = gated_output_norm_2d(
                 out,
                 output_gate,
                 norm_weight,
