@@ -281,6 +281,7 @@ def _draft_tokens(draft, *, reqs, block, sample_from_anchor, position_major, tp=
         draft_model=draft,
         sample_from_anchor=sample_from_anchor,
         _position_major_logits=position_major,
+        _request_tile_rows=8,
         _markov_w2_local=draft.w2_local if tp > 1 else None,
         _markov_vocab_start=draft.vocab_start,
         _markov_tp=tp,

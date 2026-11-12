@@ -109,6 +109,11 @@ class DSparkProposer(DFlashProposer):
         # Position-major draft logits (see `_dflash_forward_and_sample`);
         # `load_model` derives it from the draft's lm_head layout.
         self._position_major_logits = False
+        # Rows of one aligned tile of position-major requests. Resolved here
+        # because the drafting forward is traced.
+        self._request_tile_rows = pltpu.get_tpu_info_for_chip(
+            get_chip_version(), 1
+        ).num_sublanes
         # Vocab-parallel Markov head state, set by `_shard_markov_head`.
         self._markov_w2_local: torch.Tensor | None = None
         self._markov_vocab_start = 0
@@ -264,7 +269,7 @@ class DSparkProposer(DFlashProposer):
 
         if self._position_major_logits:
             flat_pm, prev, reqs_tile = self._position_major_hidden(
-                valid_hidden, ids_3d[:, 0], block_size
+                valid_hidden, ids_3d[:, 0], block_size, self._request_tile_rows
             )
             w2_local = self._markov_w2_local
             if w2_local is not None:
@@ -313,23 +318,25 @@ class DSparkProposer(DFlashProposer):
 
     @staticmethod
     def _position_major_hidden(
-        valid_hidden: torch.Tensor, anchor_ids: torch.Tensor, block_size: int
+        valid_hidden: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        block_size: int,
+        tile_rows: int,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Reorder ``[reqs * block, H]`` hidden rows position-major.
 
         Viewing the ``[rows, vocab]`` logits as ``[reqs, block, vocab]``
         relayouts the whole full-vocab tensor (a ~1.3 ms
         while/dynamic-update-slice loop per draft on v6e when ``reqs`` is
-        not a multiple of the sublane tile). Reordering the small hidden rows
-        instead, with requests padded to the tile, makes each position's
-        logits one aligned ``[reqs_tile, vocab]`` slab. Returns the flat
-        ``[block * reqs_tile, H]`` hidden rows, the anchor ids padded to
-        ``reqs_tile``, and ``reqs_tile``.
+        not a multiple of the ``tile_rows``-row sublane tile). Reordering the
+        small hidden rows instead, with requests padded to the tile, makes
+        each position's logits one aligned ``[reqs_tile, vocab]`` slab.
+        Returns the flat ``[block * reqs_tile, H]`` hidden rows, the anchor
+        ids padded to ``reqs_tile``, and ``reqs_tile``.
         """
         padded_num_reqs = valid_hidden.shape[0] // block_size
         hidden_size = valid_hidden.shape[-1]
-        sublane_rows = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_sublanes
-        reqs_tile = round_up(padded_num_reqs, sublane_rows)
+        reqs_tile = round_up(padded_num_reqs, tile_rows)
         hidden_pm = valid_hidden.view(
             padded_num_reqs, block_size, hidden_size
         ).transpose(0, 1)
