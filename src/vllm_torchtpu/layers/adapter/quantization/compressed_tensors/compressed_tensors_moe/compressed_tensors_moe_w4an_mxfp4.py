@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    is_supported_by_planar_t_b11,
+)
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -189,11 +192,17 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         hidden = w13_weight_packed.shape[-1] * 2
         inter = w2_weight_packed.shape[-1] * 2
+        # Resolved before choosing the layout: the planar_t kernels serve only
+        # SiTU and SiLU experts, and their layout cannot fall back later.
+        activation_str = self._set_tpu_activation(layer)
         is_v6e_planar_t_eligible = (
             requant_block is None
-            and get_chip_version().value == "v6e"
-            and hidden % 512 == 0
-            and inter % 512 == 0
+            and is_supported_by_planar_t_b11(
+                hidden,
+                inter,
+                chip_version=get_chip_version(),
+                activation=activation_str,
+            )
         )
 
         if is_v6e_planar_t_eligible:
@@ -283,7 +292,6 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         release_memory_to_os()
 
-        activation_str = self._set_tpu_activation(layer)
         use_ep = layer.moe_config.moe_parallel_config.use_ep
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)

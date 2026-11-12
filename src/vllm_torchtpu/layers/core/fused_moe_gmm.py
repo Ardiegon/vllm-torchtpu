@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     FUSED_VERIFY_MOE_MAX_TOKENS,
     can_use_fused_decode_moe_v6e_planar_t_b11,
     fused_decode_moe_v6e_planar_t_b11,
+    is_planar_t_b11_layout,
     moe_gmm_v6e_planar_t_b11,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
@@ -448,12 +449,13 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    if (
-        w1.dtype == jnp.uint8
-        and w1_scale is not None
-        and w1_scale.dtype == jnp.uint8
-        and rhs_quant_dtype is None
-    ):
+    if is_planar_t_b11_layout(w1, w1_scale, rhs_quant_dtype=rhs_quant_dtype):
+        # No other kernel can read the planar_t layout, so unsupported
+        # operands must fail here rather than fall back.
+        if w1_bias is not None or w2_bias is not None:
+            raise NotImplementedError(
+                "The planar_t MXFP4 MoE kernel does not support expert biases."
+            )
         gmm2_res = moe_gmm_v6e_planar_t_b11(
             x,
             w1,

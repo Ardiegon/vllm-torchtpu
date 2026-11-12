@@ -50,6 +50,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.megablox.gmm_v2 import parse_situ, situ_and_mul
+
 # Nibble/scale stacks are handled on device (jax arrays and tracers) and on
 # the host (numpy) by the load-time layout helpers.
 _NibbleArray = jax.Array | np.ndarray
@@ -87,8 +89,16 @@ SCALE_GROUP = 32
 PLANAR_WINDOW = 512
 
 # TPU lane count: a Pallas block's minor dim must be a multiple of it
-# (or the whole array dim).
+# (or the whole array dim). A constant rather than
+# `pltpu.get_tpu_info().num_lanes` because the tiling and VMEM models also
+# run off TPU (interpret mode, CPU tests), where that query is unavailable.
 _LANES = 128
+
+
+def _round_up(x: int, multiple: int) -> int:
+    """Smallest multiple of `multiple` that is >= `x`."""
+    return ((x + multiple - 1) // multiple) * multiple
+
 
 # Per grid step VMEM to stay under. Half of a 128 MiB budget, leaving
 # the rest for Mosaic's own scratch and any spill the scheduler needs.
@@ -834,10 +844,22 @@ def _situ_f32(
     u = up.astype(jnp.float32)
     if beta == 0.0:
         return jax.nn.silu(g) * u
-    a = beta * jnp.tanh(g / beta) * jax.nn.sigmoid(g)
-    if linear_beta is not None:
-        u = linear_beta * jnp.tanh(u / linear_beta)
-    return a * u
+    return situ_and_mul(g, u, beta, linear_beta)
+
+
+def _group_row_mask(
+    shape: tuple[int, ...], *, row0: jax.Array, start: jax.Array, end: jax.Array
+) -> jax.Array:
+    """Rows of a `[tm, tn]` output tile that belong to the visited group.
+
+    A row tile straddling a group boundary is visited once per group it
+    touches; each visit may write only the rows in `[start, end)` and must
+    keep what earlier visits of the same tile wrote (or start from zero on
+    the tile's first visit, `start <= row0`). Rows outside every group are
+    left unspecified.
+    """
+    row = lax.broadcasted_iota(jnp.int32, shape, 0) + row0
+    return jnp.logical_and(row >= start, row < end)
 
 
 def _validate(
@@ -1138,8 +1160,7 @@ def _deep_planar_t_b11_call(
                     )
                 else:
                     value = accs[0]
-                row = lax.broadcasted_iota(jnp.int32, (tm, tn), 0) + row0
-                mask = jnp.logical_and(row >= start, row < end)
+                mask = _group_row_mask((tm, tn), row0=row0, start=start, end=end)
                 first_of_tile = start <= row0
                 old = jnp.where(
                     first_of_tile,
@@ -1422,8 +1443,7 @@ def mxfp4_gmm(
         start = group_offsets[group_id]
         end = group_offsets[group_id + 1]
         row0 = m_tile_ids[grid_id] * tm
-        row = lax.broadcasted_iota(jnp.int32, acc.shape, 0) + row0
-        mask = jnp.logical_and(row >= start, row < end)
+        mask = _group_row_mask(acc.shape, row0=row0, start=start, end=end)
         old_f32 = jnp.where(start <= row0, 0.0, out_ref[...].astype(jnp.float32))
         out_ref[...] = jnp.where(mask, acc[...], old_f32).astype(preferred_element_type)
 
@@ -1621,6 +1641,10 @@ V6E_DEEP_VMEM_BUDGET = 3 * _SCOPED_VMEM_LIMIT // 4
 # schedule and 32-row alignment; larger (prefill) batches use the rolled
 # schedule and 128-row alignment.
 _MOE_GMM_DEEP_MAX_ROWS = 2048
+# Routed-row padding of `moe_gmm_v6e_planar_t_b11`: decode-sized batches
+# pad to a multiple of 32 rows, prefill-sized ones to 128.
+_MOE_GMM_DECODE_ROW_ALIGN = 32
+_MOE_GMM_PREFILL_ROW_ALIGN = 128
 # Expert-parallel shard count assumed when sizing the row tile: each
 # shard expects to own about `padded_m / _MOE_GMM_EP_SHARDS` of the routed
 # rows (`default_tiling(expected_rows=...)`).
@@ -1630,6 +1654,78 @@ _MOE_GMM_EP_SHARDS = 8
 def _as_rank3_scales(scale: jax.Array) -> jax.Array:
     """Drops the singleton axis 2 of `[E, rows, 1, N]` scales (rank-3 as is)."""
     return jnp.squeeze(scale, axis=2) if scale.ndim == 4 else scale
+
+
+def is_planar_t_b11_layout(
+    w1: jax.Array, w1_scale: jax.Array | None, *, rhs_quant_dtype: jnp.dtype | None
+) -> bool:
+    """Whether MoE weights are in the planar_t MXFP4 layout this module serves.
+
+    The planar_t loader (`repack_w13_planar_t` / `repack_w2_planar_t`) is the
+    only one that stores uint8 weights with uint8 e8m0 scales and no logical
+    quant dtype. Such weights cannot be read by any other MoE kernel, so a
+    caller that sees this layout must use `moe_gmm_v6e_planar_t_b11`.
+    """
+    return (
+        w1.dtype == jnp.uint8
+        and w1_scale is not None
+        and w1_scale.dtype == jnp.uint8
+        and rhs_quant_dtype is None
+    )
+
+
+def is_supported_by_planar_t_b11(
+    hidden: int, inter: int, *, chip_version: pltpu.ChipVersion, activation: str
+) -> bool:
+    """Whether an MXFP4 MoE layer can be served by this module's kernels.
+
+    Args:
+      hidden: model (contraction) width of the gate+up projection.
+      inter: expert intermediate width.
+      chip_version: TPU generation; the b11 decode relies on TPU v6e's
+        hardware float8_e4m3b11fnuz expansion.
+      activation: expert activation string (see `parse_situ_activation`).
+
+    Returns:
+      True for TPU v6e, PLANAR_WINDOW-aligned widths and a SiTU or SiLU
+      activation.
+    """
+    return (
+        chip_version == pltpu.ChipVersion.TPU_V6E
+        and hidden % PLANAR_WINDOW == 0
+        and inter % PLANAR_WINDOW == 0
+        and (activation == "silu" or activation.startswith("situ:"))
+    )
+
+
+def _check_planar_t_moe_operands(
+    lhs: jax.Array,
+    w13_pt: jax.Array,
+    w13_sc_3d: jax.Array,
+    w2_pt: jax.Array,
+    w2_sc_3d: jax.Array,
+) -> None:
+    """Rejects operands outside the planar_t MoE envelope, with the shapes."""
+    if w13_pt.ndim != 3 or w2_pt.ndim != 3:
+        raise ValueError(
+            f"planar_t weights must be rank 3, got w13 {w13_pt.shape} and"
+            f" w2 {w2_pt.shape}."
+        )
+    num_groups, k, n = w13_pt.shape
+    if (
+        lhs.shape[1] != k
+        or k % PLANAR_WINDOW
+        or n % PLANAR_WINDOW
+        or w2_pt.shape != (num_groups, n // 2, k)
+        or w13_sc_3d.shape != (num_groups, 2 * (k // SCALE_GROUP), n)
+        or w2_sc_3d.shape != (num_groups, n // SCALE_GROUP, k)
+    ):
+        raise ValueError(
+            "planar_t MoE operands outside the supported envelope (K and N"
+            f" multiples of {PLANAR_WINDOW}, w13 [E, K, N], w2 [E, N/2, K]):"
+            f" lhs {lhs.shape}, w13 {w13_pt.shape}, w13 scales"
+            f" {w13_sc_3d.shape}, w2 {w2_pt.shape}, w2 scales {w2_sc_3d.shape}."
+        )
 
 
 def repack_w13_planar_t(
@@ -1691,10 +1787,7 @@ def parse_situ_activation(activation: str) -> tuple[float, float | None]:
       NotImplementedError: for any other activation.
     """
     if activation.startswith("situ:"):
-        _, beta_str, lin_str = activation.split(":")
-        beta = float(beta_str)
-        linear_beta = None if lin_str == "none" else float(lin_str)
-        return beta, linear_beta
+        return parse_situ(activation)
     if activation == "silu":
         return 0.0, None
     raise NotImplementedError(
@@ -1840,8 +1933,7 @@ def _run_fused_gate_up_5d(
         start = group_offsets[group_id]
         end = group_offsets[group_id + 1]
         row0 = m_tile_ids[grid_id] * tm
-        row = lax.broadcasted_iota(jnp.int32, h.shape, 0) + row0
-        mask = jnp.logical_and(row >= start, row < end)
+        mask = _group_row_mask(h.shape, row0=row0, start=start, end=end)
         old_f32 = jnp.where(start <= row0, 0.0, out_ref[...].astype(jnp.float32))
         out_ref[...] = jnp.where(mask, h, old_f32).astype(preferred_element_type)
 
@@ -1949,16 +2041,21 @@ def moe_gmm_v6e_planar_t_b11(
 
     w13_sc_3d = _as_rank3_scales(w13_scale_pt)
     w2_sc_3d = _as_rank3_scales(w2_scale_pt)
+    _check_planar_t_moe_operands(lhs, w13_pt, w13_sc_3d, w2_pt, w2_sc_3d)
 
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
-    # Pad M to a multiple of 32 (or 128 for large prefill) so tm divides it.
-    align_m = 32 if orig_m <= _MOE_GMM_DEEP_MAX_ROWS else 128
-    padded_m = ((orig_m + align_m - 1) // align_m) * align_m
+    # Pad M to the row alignment so the row tile divides it.
+    align_m = (
+        _MOE_GMM_DECODE_ROW_ALIGN
+        if orig_m <= _MOE_GMM_DEEP_MAX_ROWS
+        else _MOE_GMM_PREFILL_ROW_ALIGN
+    )
+    padded_m = _round_up(orig_m, align_m)
     if padded_m != orig_m:
         lhs = jnp.pad(lhs, ((0, padded_m - orig_m), (0, 0)))
 
-    expected_rows = max(32, -(-padded_m // _MOE_GMM_EP_SHARDS))
+    expected_rows = max(_MIN_EXPECTED_TM, -(-padded_m // _MOE_GMM_EP_SHARDS))
     dequant = (
         DEQUANT_PLANAR_T_B11_DEEP
         if padded_m <= _MOE_GMM_DEEP_MAX_ROWS
@@ -2045,13 +2142,35 @@ _FUSED_VERIFY_MOE_VMEM_BUDGET = 46 * 1024 * 1024
 _FUSED_DECODE_MOE_VMEM_LIMIT = 48 * 1024 * 1024
 
 
+# Expert slabs (w13 plus w2 of one expert) above this many bytes do not fit
+# the fused kernel's VMEM.
+_FUSED_DECODE_MAX_SLAB_BYTES = 30 * 1024 * 1024
+# From this intermediate width on, the fused kernel single-buffers the w2
+# slab (fetched during the expert's own gate+up compute instead of one
+# expert ahead) to stay inside its VMEM limit.
+_FUSED_DECODE_W2_SINGLE_BUFFER_MIN_N = 3072
+# Rows per tile of the rank-3 scale buffers (`rank3_scales`).
+_RANK3_SCALE_TILE_ROWS = 32
+
+
+def _w13_slab_bytes(k: int, n: int) -> int:
+    """Bytes of one expert's planar_t gate+up nibbles plus scales."""
+    return 2 * (k + 2 * (k // SCALE_GROUP)) * n
+
+
+def _w2_slab_bytes(k: int, n: int) -> int:
+    """Bytes of one expert's planar_t down-projection nibbles plus scales."""
+    return (n // 2 + n // SCALE_GROUP) * k
+
+
+def _fused_decode_w2_depth(n: int) -> int:
+    """Number of w2 slab buffers the fused kernel uses for width `n`."""
+    return 1 if n >= _FUSED_DECODE_W2_SINGLE_BUFFER_MIN_N else 2
+
+
 def _fused_verify_moe_vmem_bytes(m: int, k: int, n: int, num_groups: int) -> int:
     """Upper-bound VMEM estimate of the multi-tray kernel at `m` padded rows."""
-    depth_w2 = 1 if n >= 3072 else 2
-    weights = (
-        2 * (k * n + 2 * (k // SCALE_GROUP) * n)
-        + depth_w2 * (n // 2 + n // SCALE_GROUP) * k
-    )
+    weights = _w13_slab_bytes(k, n) + _fused_decode_w2_depth(n) * _w2_slab_bytes(k, n)
     accs = 3 * m * PLANAR_WINDOW * 4 + m * n * 2 + m * k * 4
     io = m * k * 2 + num_groups * m * _LANES * 4 + m * k * 2
     return weights + accs + io
@@ -2113,18 +2232,121 @@ def can_use_fused_decode_moe_v6e_planar_t_b11(
         return False
     if w2.shape != (num_groups, n // 2, k):
         return False
-    slab_bytes = 2 * (k + 2 * (k // SCALE_GROUP)) * n + (n // 2 + n // SCALE_GROUP) * k
-    if slab_bytes > 30 * 1024 * 1024:
+    if _w13_slab_bytes(k, n) + _w2_slab_bytes(k, n) > _FUSED_DECODE_MAX_SLAB_BYTES:
         return False
     m = hidden_states.shape[0]
     if m > FUSED_DECODE_MOE_MAX_TOKENS:
-        tray_m = FUSED_VERIFY_MOE_TRAY_M
-        padded_m = ((m + tray_m - 1) // tray_m) * tray_m
+        padded_m = _round_up(m, FUSED_VERIFY_MOE_TRAY_M)
         return (
             _fused_verify_moe_vmem_bytes(padded_m, k, n, num_groups)
             <= _FUSED_VERIFY_MOE_VMEM_BUDGET
         )
     return True
+
+
+def _resolve_token_trays(m: int, token_trays_mode: str) -> tuple[bool, int, int, int]:
+    """Row loop of the fused kernel for `m` tokens.
+
+    Returns:
+      `(use_trays, padded_m, tray_m, num_trays)`. Verify batches
+      (`m > FUSED_DECODE_MOE_MAX_TOKENS`) always use FUSED_VERIFY_MOE_TRAY_M-row
+      trays; smaller batches follow `token_trays_mode` (see
+      `fused_decode_moe_v6e_planar_t_b11`).
+
+    Raises:
+      ValueError: for more than FUSED_VERIFY_MOE_MAX_TOKENS tokens or an
+        unknown `token_trays_mode`.
+    """
+    trays_norm = (token_trays_mode or "off").strip().lower()
+    if m > FUSED_DECODE_MOE_MAX_TOKENS:
+        if m > FUSED_VERIFY_MOE_MAX_TOKENS:
+            raise ValueError(
+                f"fused_decode_moe_v6e_planar_t_b11 supports at most "
+                f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {m}."
+            )
+        tray_m = FUSED_VERIFY_MOE_TRAY_M
+        use_trays = True
+        padded_m = _round_up(m, tray_m)
+        num_trays = padded_m // tray_m
+    elif trays_norm == "off":
+        use_trays = False
+        padded_m = max(16, _round_up(m, 8))
+        tray_m = padded_m
+        num_trays = 1
+    elif trays_norm == "trays":
+        use_trays = True
+        padded_m = max(16, _round_up(m, 16))
+        tray_m = 16
+        num_trays = padded_m // tray_m
+    elif trays_norm == "trays2":
+        use_trays = True
+        padded_m = max(16, _round_up(m, 16))
+        tray_m = 32 if padded_m >= 64 else 16
+        num_trays = padded_m // tray_m
+    elif trays_norm == "trays32":
+        if m <= 16:
+            use_trays = False
+            padded_m = 16
+            tray_m = 16
+            num_trays = 1
+        else:
+            use_trays = True
+            padded_m = _round_up(m, 16)
+            tray_m = 16
+            num_trays = padded_m // tray_m
+    else:
+        raise ValueError(
+            f"Invalid token_trays_mode={token_trays_mode!r}; expected 'off', "
+            "'trays', 'trays2', or 'trays32'."
+        )
+    return use_trays, padded_m, tray_m, num_trays
+
+
+def _fused_decode_routing(
+    hidden_states: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    *,
+    padded_m: int,
+    num_groups: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Pads the batch and turns the top-k routing into per-expert weights.
+
+    Returns:
+      `(lhs, active_ids, num_active, w_expert)`: the padded `[padded_m, K]`
+      activations (rows with no valid assignment zeroed), the expert ids with
+      any routed weight first, their count, and the `[E, padded_m, 128]`
+      lane-broadcast routing weights.
+    """
+    orig_m = hidden_states.shape[0]
+    # Padded rows get expert id -1 and weight 0, so no expert visits them.
+    if padded_m != orig_m:
+        lhs = jnp.pad(hidden_states, ((0, padded_m - orig_m), (0, 0)))
+        topk_w = jnp.pad(topk_weights, ((0, padded_m - orig_m), (0, 0)))
+        topk_i = jnp.pad(topk_ids, ((0, padded_m - orig_m), (0, 0)), constant_values=-1)
+    else:
+        lhs = hidden_states
+        topk_w = topk_weights
+        topk_i = topk_ids
+
+    topk_w_f32 = jnp.where(
+        jnp.isfinite(topk_w), topk_w.astype(lhs.dtype).astype(jnp.float32), 0.0
+    )
+    row_valid = jnp.any(
+        (topk_i >= 0) & (topk_i < num_groups) & (topk_w_f32 != 0.0),
+        axis=-1,
+        keepdims=True,
+    )
+    lhs = jnp.where(row_valid & jnp.isfinite(lhs), lhs, 0)
+
+    e_ids = jnp.arange(num_groups, dtype=jnp.int32)[:, None, None]
+    match = (topk_i[None, :, :] == e_ids) & (topk_w_f32[None, :, :] != 0.0)
+    w_em = jnp.sum(jnp.where(match, topk_w_f32[None, :, :], 0.0), axis=2)
+    active_mask = jnp.any(w_em != 0.0, axis=1)
+    num_active = jnp.sum(active_mask.astype(jnp.int32))[None]
+    active_ids = jnp.argsort(~active_mask).astype(jnp.int32)
+    w_expert = jnp.broadcast_to(w_em[:, :, None], (num_groups, padded_m, _LANES))
+    return lhs, active_ids, num_active, w_expert
 
 
 def fused_decode_moe_v6e_planar_t_b11(
@@ -2191,74 +2413,12 @@ def fused_decode_moe_v6e_planar_t_b11(
 
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
-    trays_norm = (token_trays_mode or "off").strip().lower()
-    if orig_m > FUSED_DECODE_MOE_MAX_TOKENS:
-        if orig_m > FUSED_VERIFY_MOE_MAX_TOKENS:
-            raise ValueError(
-                f"fused_decode_moe_v6e_planar_t_b11 supports at most "
-                f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {orig_m}."
-            )
-        tray_m = FUSED_VERIFY_MOE_TRAY_M
-        use_trays = True
-        padded_m = ((orig_m + tray_m - 1) // tray_m) * tray_m
-        num_trays = padded_m // tray_m
-    elif trays_norm == "off":
-        use_trays = False
-        padded_m = max(16, ((orig_m + 7) // 8) * 8)
-        tray_m = padded_m
-        num_trays = 1
-    elif trays_norm == "trays":
-        use_trays = True
-        padded_m = max(16, ((orig_m + 15) // 16) * 16)
-        tray_m = 16
-        num_trays = padded_m // tray_m
-    elif trays_norm == "trays2":
-        use_trays = True
-        padded_m = max(16, ((orig_m + 15) // 16) * 16)
-        tray_m = 32 if padded_m >= 64 else 16
-        num_trays = padded_m // tray_m
-    elif trays_norm == "trays32":
-        if orig_m <= 16:
-            use_trays = False
-            padded_m = 16
-            tray_m = 16
-            num_trays = 1
-        else:
-            use_trays = True
-            padded_m = ((orig_m + 15) // 16) * 16
-            tray_m = 16
-            num_trays = padded_m // tray_m
-    else:
-        raise ValueError(
-            f"Invalid token_trays_mode={token_trays_mode!r}; expected 'off', "
-            "'trays', 'trays2', or 'trays32'."
-        )
-    if padded_m != orig_m:
-        lhs = jnp.pad(hidden_states, ((0, padded_m - orig_m), (0, 0)))
-        topk_w = jnp.pad(topk_weights, ((0, padded_m - orig_m), (0, 0)))
-        topk_i = jnp.pad(topk_ids, ((0, padded_m - orig_m), (0, 0)), constant_values=-1)
-    else:
-        lhs = hidden_states
-        topk_w = topk_weights
-        topk_i = topk_ids
-
-    topk_w_f32 = jnp.where(
-        jnp.isfinite(topk_w), topk_w.astype(lhs.dtype).astype(jnp.float32), 0.0
+    use_trays, padded_m, tray_m, num_trays = _resolve_token_trays(
+        orig_m, token_trays_mode
     )
-    row_valid = jnp.any(
-        (topk_i >= 0) & (topk_i < num_groups) & (topk_w_f32 != 0.0),
-        axis=-1,
-        keepdims=True,
+    lhs, active_ids, num_active, w_expert = _fused_decode_routing(
+        hidden_states, topk_weights, topk_ids, padded_m=padded_m, num_groups=num_groups
     )
-    lhs = jnp.where(row_valid & jnp.isfinite(lhs), lhs, 0)
-
-    e_ids = jnp.arange(num_groups, dtype=jnp.int32)[:, None, None]
-    match = (topk_i[None, :, :] == e_ids) & (topk_w_f32[None, :, :] != 0.0)
-    w_em = jnp.sum(jnp.where(match, topk_w_f32[None, :, :], 0.0), axis=2)
-    active_mask = jnp.any(w_em != 0.0, axis=1)
-    num_active = jnp.sum(active_mask.astype(jnp.int32))[None]
-    active_ids = jnp.argsort(~active_mask).astype(jnp.int32)
-    w_expert = jnp.broadcast_to(w_em[:, :, None], (num_groups, padded_m, _LANES))
 
     chunk = PLANAR_WINDOW
     tn13 = PLANAR_WINDOW
@@ -2270,10 +2430,14 @@ def fused_decode_moe_v6e_planar_t_b11(
     plane_rows = chunk // 2
     scale_rows = chunk // SCALE_GROUP
     depth_w13 = 2
-    depth_w2 = 1 if n >= 3072 else 2
+    depth_w2 = _fused_decode_w2_depth(n)
 
-    use_rank3_w13 = bool(rank3_scales and (w13_sc_3d.shape[1] % 32 == 0))
-    use_rank3_w2 = bool(rank3_scales and (w2_sc_3d.shape[1] % 32 == 0))
+    use_rank3_w13 = bool(
+        rank3_scales and (w13_sc_3d.shape[1] % _RANK3_SCALE_TILE_ROWS == 0)
+    )
+    use_rank3_w2 = bool(
+        rank3_scales and (w2_sc_3d.shape[1] % _RANK3_SCALE_TILE_ROWS == 0)
+    )
 
     w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
     w13_scales_in = (
@@ -2340,18 +2504,18 @@ def fused_decode_moe_v6e_planar_t_b11(
         def get_w13_scale(slot, gate_or_up, cs, sl):
             if use_rank3_w13:
                 r0 = (gate_or_up * steps_13 + cs) * scale_rows
-                tile_r0 = (r0 // 32) * 32
+                tile_r0 = (r0 // _RANK3_SCALE_TILE_ROWS) * _RANK3_SCALE_TILE_ROWS
                 sub_r0 = r0 - tile_r0
-                tile32 = w13_sbuf[slot, pl.ds(tile_r0, 32), sl]
+                tile32 = w13_sbuf[slot, pl.ds(tile_r0, _RANK3_SCALE_TILE_ROWS), sl]
                 return tile32[sub_r0 : sub_r0 + scale_rows, :]
             return w13_sbuf[slot, gate_or_up, cs, :, sl]
 
         def get_w2_scale(slot2, cs, sl2):
             if use_rank3_w2:
                 r0 = cs * scale_rows
-                tile_r0 = (r0 // 32) * 32
+                tile_r0 = (r0 // _RANK3_SCALE_TILE_ROWS) * _RANK3_SCALE_TILE_ROWS
                 sub_r0 = r0 - tile_r0
-                tile32 = w2_sbuf[slot2, pl.ds(tile_r0, 32), sl2]
+                tile32 = w2_sbuf[slot2, pl.ds(tile_r0, _RANK3_SCALE_TILE_ROWS), sl2]
                 return tile32[sub_r0 : sub_r0 + scale_rows, :]
             return w2_sbuf[slot2, cs, :, sl2]
 

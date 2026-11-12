@@ -49,6 +49,15 @@ def silu_and_mul_with_clamp(
     return jax.nn.silu(gate) * up
 
 
+def parse_situ(fuse_act: str) -> tuple[float, float | None]:
+    """Parses a `'situ:<beta>:<linear_beta>'` activation into its clamps.
+
+    `linear_beta` may be spelled `none`, which returns None.
+    """
+    _, beta, linear_beta = fuse_act.split(":")
+    return float(beta), None if linear_beta == "none" else float(linear_beta)
+
+
 def situ_and_mul(
     gate: jax.Array, up: jax.Array, beta: float, linear_beta: float | None
 ) -> jax.Array:
@@ -115,9 +124,8 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         case "silu_and_mul_with_clamp":
             return silu_and_mul_with_clamp(acc_gate, acc_up)
         case str() if fuse_act.startswith("situ:"):
-            _, beta, linear_beta = fuse_act.split(":")
-            linear_beta = None if linear_beta == "none" else float(linear_beta)
-            return situ_and_mul(acc_gate, acc_up, float(beta), linear_beta)
+            beta, linear_beta = parse_situ(fuse_act)
+            return situ_and_mul(acc_gate, acc_up, beta, linear_beta)
         case _:
             raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
