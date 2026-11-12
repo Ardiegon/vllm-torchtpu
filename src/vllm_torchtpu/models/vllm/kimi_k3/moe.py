@@ -187,6 +187,7 @@ class KimiMoE(nn.Module):
         self.register_buffer("packed_moe_out_scale", None, persistent=False)
         self.register_buffer("w_routed_down_tp", None, persistent=False)
         self.register_buffer("w_shared_gu", None, persistent=False)
+        self.register_buffer("_dma_tp_rank_buf", None, persistent=False)
         # Column layout of the packed projections (set by prepare_moe_projections).
         self._moe_in_shared_cols = 0
         self._moe_in_down_cols = 0

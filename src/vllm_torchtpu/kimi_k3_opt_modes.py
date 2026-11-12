@@ -23,6 +23,16 @@ unknown value raises `ValueError`.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
+
+class DSparkTapMode(StrEnum):
+    """Target auxiliary hidden-state tap mode for the Kimi K3 DSpark drafter."""
+
+    PREFIX = "prefix"
+    ATTN_RES = "attn_res"
+
+
 # Spellings that mean "disabled" for every Kimi mode env.
 OFF_TOKENS: frozenset[str] = frozenset({"", "0", "false", "no", "off", "none"})
 

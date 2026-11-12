@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import ExitStack
 from functools import cache
 from typing import cast
@@ -23,6 +24,7 @@ from unittest.mock import patch
 import jax
 import torch
 from torch import nn
+from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -34,37 +36,37 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.kimi_k3.attention_residual import (
+    attention_residual,
+    attention_residual_bt,
+)
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import TokenShardCollectives
 
 
+def _eps_op_suffix(eps: float) -> str:
+    return float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
+
+
 @cache
 def _build_attention_residual_op(eps: float):
-    from torch_tpu._internal import pallas
-
-    from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual
-
     def core(prefix: jax.Array, history: jax.Array, weight: jax.Array) -> jax.Array:
         return attention_residual(prefix, history, weight, eps=eps)
 
-    suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
-    op = pallas.jax_op(f"pallas::kimi_attention_residual_{suffix}", core)
+    op = pallas.jax_op(f"pallas::kimi_attention_residual_{_eps_op_suffix(eps)}", core)
     op.register_fake(lambda prefix, history, weight: torch.empty_like(prefix))
     return op
 
 
 @cache
 def _build_attention_residual_bt_op(eps: float):
-    from torch_tpu._internal import pallas
-
-    from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual_bt
-
     def core(prefix: jax.Array, history_bt: jax.Array, weight: jax.Array) -> jax.Array:
         return attention_residual_bt(prefix, history_bt, weight, eps=eps)
 
-    suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
-    op = pallas.jax_op(f"pallas::kimi_attention_residual_bt_{suffix}", core)
+    op = pallas.jax_op(
+        f"pallas::kimi_attention_residual_bt_{_eps_op_suffix(eps)}", core
+    )
     op.register_fake(lambda prefix, history_bt, weight: torch.empty_like(prefix))
     return op
 
@@ -92,6 +94,8 @@ class SituAndMul(nn.Module):
 class KimiMLP(nn.Module):
     """The standard vLLM merged-projection gated MLP."""
 
+    _tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -107,6 +111,7 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_group = tp_group
+        self._tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.sp_group = (
             TokenShardCollectives(tp_group or get_tp_group())
             if envs.TPU_K3_SP_PREFILL
@@ -173,7 +178,7 @@ class KimiMLP(nn.Module):
                 return group.reduce_scatter(hidden_states, dim=0)
             assert self.tp_group is not None
             return self.tp_group.all_reduce(hidden_states)
-        tp_exit_psum_op = getattr(self, "_tp_exit_psum_op", None)
+        tp_exit_psum_op = self._tp_exit_psum_op
         if tp_exit_psum_op is not None:
             assert self.down_proj.quant_method is not None
             hidden_states = self.down_proj.quant_method.apply(

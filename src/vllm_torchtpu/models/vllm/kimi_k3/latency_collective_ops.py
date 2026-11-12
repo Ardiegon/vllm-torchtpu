@@ -244,7 +244,7 @@ class KimiDmaCollectives:
         attn_module._tp_exit_psum_op = self.tp_attn_mlp_psum_op
 
     def attach_to_mlp(self, mlp_module: Any) -> None:
-        # Only attach full-TP cid=4 psum to standard TP-wide row-parallel MLPs
+        # Only attach the full-TP exit psum to standard TP-wide row-parallel MLPs
         # (Layer-0 dense KimiMLP where tp_group is None and down_proj reduces).
         if (
             getattr(mlp_module, "tp_group", None) is None
