@@ -38,7 +38,6 @@ from vllm_torchtpu.kernels.gdn.v3.gated_output_norm import (
     gated_output_norm as _gated_output_norm,
 )
 from vllm_torchtpu.kernels.gdn.v3.gated_output_norm import gated_output_norm_2d
-from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cond, use_kda_glue
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -1153,17 +1152,20 @@ def build_kimi_pooled_kda_op(
     eps: float,
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
+    kda_glue: bool = False,
+    kda_cond: bool = False,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
     Same torch-level contract as the dense dispatched op, except the two
     state caches are replaced by the single attention-shaped pool buffer,
-    and the output is [T, H, D] -- or [T, H * D] when the kda_glue polish is
-    active, whose 2D gated norm avoids the 2D <-> 3D relayout (callers
-    flatten the output either way). The state regions are streamed through
-    (or gathered out of the pool into) the fused conv1d + GDN v3 kernel (the
-    only kernel the pooled path supports — the unfused core is not available
-    here) and written back.
+    and the output is [T, H, D] -- or [T, H * D] when `kda_glue` is set and
+    the op takes the direct-streaming K = 0 path, whose 2D gated norm avoids
+    the 2D <-> 3D relayout (callers flatten the output either way). The state
+    regions are streamed through (or gathered out of the pool into) the fused
+    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
+    unfused core is not available here) and written back. `kda_cond` skips
+    the empty PER_SEQ kernel pass with a `lax.cond` on that path too.
 
     The manager block size (``cache_config.block_size``) lets the op size
     the state regions against the manager block and derive the
@@ -1191,13 +1193,13 @@ def build_kimi_pooled_kda_op(
     # Read once here and passed down: the op body runs under trace, where an
     # env read would be captured silently.
     direct_pool_streaming = tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING
-    # The compute-polish variants exist only on the direct-streaming K = 0
-    # path.
+    # The glue fusion and the PER_SEQ skip exist only on the
+    # direct-streaming K = 0 path.
     direct_eligible = (
         direct_pool_streaming and conv_shard_heads is None and num_spec_tokens == 0
     )
-    kda_glue_active = bool(use_kda_glue() and direct_eligible)
-    kda_cond_active = bool(use_kda_cond() and direct_eligible)
+    kda_glue_active = bool(kda_glue and direct_eligible)
+    kda_cond_active = bool(kda_cond and direct_eligible)
 
     def pooled_core(
         mixed_qkv: jax.Array,

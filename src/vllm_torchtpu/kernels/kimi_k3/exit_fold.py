@@ -84,6 +84,11 @@ from vllm_torchtpu.kernels.kimi_k3.polish import (
     use_copy_opt,
     vmem_chain_mode,
 )
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    FUSED_DECODE_MOE_MAX_TOKENS,
+    FUSED_VERIFY_MOE_MAX_TOKENS,
+)
 
 Ref = Any
 
@@ -1071,6 +1076,11 @@ def _make_moe_ep_overlap_jax_fn(
     polish_trays = active_trays_mode()
     polish_vmem = vmem_chain_mode()
     polish_copy = use_copy_opt()
+    fused_decode_max_tokens = (
+        FUSED_VERIFY_MOE_MAX_TOKENS
+        if use_spec_o6b()
+        else FUSED_DECODE_MOE_MAX_TOKENS
+    )
 
     world_axis: str | tuple[str, str] = (
         TP_AXIS_NAME if dp_size == 1 else (DP_AXIS_NAME, TP_AXIS_NAME)
@@ -1453,6 +1463,7 @@ def _make_moe_ep_overlap_jax_fn(
                 skip_padded_tokens=skip_padded,
                 token_trays_mode=polish_trays,
                 rank3_scales=polish_copy,
+                fused_decode_max_tokens=fused_decode_max_tokens,
             )
 
             # 3. Mathematically Exact Combine + `RMSNorm(latent_dim)` + `[latent_local]` Exit-Fold

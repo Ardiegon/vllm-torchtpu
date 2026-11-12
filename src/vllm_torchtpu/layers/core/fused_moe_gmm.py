@@ -23,12 +23,9 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.kimi_k3.polish import active_trays_mode, use_copy_opt
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     FUSED_DECODE_MOE_MAX_TOKENS,
-    FUSED_VERIFY_MOE_MAX_TOKENS,
     can_use_fused_decode_moe_v6e_planar_t_b11,
     fused_decode_moe_v6e_planar_t_b11,
     is_planar_t_b11_layout,
@@ -605,79 +602,6 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
-def fused_moe_func(
-    hidden_states: jax.Array,
-    w1: jax.Array,
-    w2: jax.Array,
-    w1_scale: jax.Array | None,
-    w2_scale: jax.Array | None,
-    w1_bias: jax.Array | None,
-    w2_bias: jax.Array | None,
-    topk_weights: jax.Array,
-    topk_ids: jax.Array,
-    experts_start: jax.Array | None = None,
-    topk: int = 1,
-    activation: str = "silu",
-    use_ep: bool = False,
-    use_sparse_core: bool = True,
-    onehot_moe_permute_threshold: int = 0,
-    rhs_quant_dtype: jnp.dtype | None = None,
-    skip_padded_tokens: bool = False,
-    token_trays_mode: str | None = None,
-    rank3_scales: bool | None = None,
-    fused_decode_max_tokens: int | None = None,
-) -> jax.Array:
-    """Run MoE with precomputed expert ids and weights.
-
-    Resolves the process-wide fused-decode knobs, then calls the jitted
-    implementation (see `_fused_moe_func_jitted` for the operand contract);
-    the arguments not listed below are passed through unchanged.
-
-    Args:
-      token_trays_mode: row-loop mode of the fused small-batch MXFP4 kernel;
-        None reads it from the compute-polish setting (`active_trays_mode`).
-      rank3_scales: rank-3 scale buffers in that kernel; None reads it from
-        the compute-polish setting (`use_copy_opt`).
-      fused_decode_max_tokens: largest batch the fused small-batch kernel
-        serves. None selects FUSED_VERIFY_MOE_MAX_TOKENS when speculative
-        verify batches use it (`use_spec_o6b`), else
-        FUSED_DECODE_MOE_MAX_TOKENS.
-    """
-    # Speculative-verify batches (65..256 tokens) take the multi-tray fused
-    # small-batch kernel instead of the routed GMM.
-    resolved_max_tokens = (
-        (FUSED_VERIFY_MOE_MAX_TOKENS if use_spec_o6b() else FUSED_DECODE_MOE_MAX_TOKENS)
-        if fused_decode_max_tokens is None
-        else fused_decode_max_tokens
-    )
-    resolved_trays = (
-        active_trays_mode() if token_trays_mode is None else token_trays_mode
-    )
-    resolved_rank3 = use_copy_opt() if rank3_scales is None else rank3_scales
-    return _fused_moe_func_jitted(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        topk_weights,
-        topk_ids,
-        experts_start,
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-        token_trays_mode=resolved_trays,
-        rank3_scales=resolved_rank3,
-        fused_decode_max_tokens=resolved_max_tokens,
-    )
-
-
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -693,7 +617,7 @@ def fused_moe_func(
         "fused_decode_max_tokens",
     ),
 )
-def _fused_moe_func_jitted(
+def fused_moe_func(
     hidden_states: jax.Array,
     w1: jax.Array,
     w2: jax.Array,
@@ -733,6 +657,11 @@ def _fused_moe_func_jitted(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    `token_trays_mode`, `rank3_scales` and `fused_decode_max_tokens` configure
+    the fused small-batch MXFP4 kernel (planar_t weights only): its row-loop
+    mode, rank-3 scale buffers, and the largest batch it serves (larger
+    batches take the routed GMM path). Callers resolve them outside the trace.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]

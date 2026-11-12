@@ -52,7 +52,11 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.kimi_k3.polish import use_kda_cw_f32, use_kda_glue
+from vllm_torchtpu.kernels.kimi_k3.polish import (
+    use_kda_cond,
+    use_kda_cw_f32,
+    use_kda_glue,
+)
 from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_kda_o6a
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
@@ -644,6 +648,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
+            kda_glue=self._kda_glue_enabled,
+            kda_cond=use_kda_cond(),
         )
         # Kimi K3 Cycle 3 Phase O6a (`TPU_KIMI_OPT_SPEC_KDA="o6a"`, K > 0):
         # the unified-pool KDA runs a side-effect-free W = 1 + K verify that

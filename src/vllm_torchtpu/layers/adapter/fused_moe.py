@@ -22,7 +22,11 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.kimi_k3.polish import active_trays_mode, use_copy_opt
+from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    FUSED_DECODE_MOE_MAX_TOKENS,
+    FUSED_VERIFY_MOE_MAX_TOKENS,
     repack_w2_planar_t,
     repack_w13_planar_t,
 )
@@ -36,7 +40,10 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_FusedDecodeOptions = tuple[str, bool, int]
+_fused_moe_kernel_cache: dict[
+    tuple[int, str, bool, Any, bool, _FusedDecodeOptions], Callable
+] = {}
 _load_kmajor_fp4_op = None
 _planar_t_load_ops: dict[str, Callable] = {}
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
@@ -230,12 +237,29 @@ def _allocate_kernel_instance_id() -> int:
     return kernel_instance_id
 
 
+def _resolve_fused_decode_options() -> _FusedDecodeOptions:
+    """Settings of the fused small-batch MXFP4 MoE kernel.
+
+    Returns `(token_trays_mode, rank3_scales, fused_decode_max_tokens)` for
+    `fused_moe_func`, read from the Kimi K3 `TPU_KIMI_OPT_COMPUTE_POLISH`
+    and `TPU_KIMI_OPT_SPEC_KDA` (`"o6b"` lets the kernel serve speculative
+    verify batches of up to FUSED_VERIFY_MOE_MAX_TOKENS tokens). Resolved
+    when the op is built, outside the trace, and part of the op cache key.
+    """
+    return (
+        active_trays_mode(),
+        use_copy_opt(),
+        FUSED_VERIFY_MOE_MAX_TOKENS if use_spec_o6b() else FUSED_DECODE_MOE_MAX_TOKENS,
+    )
+
+
 def _build_fused_moe_custom_op(
     *,
     topk: int,
     activation: str,
     use_ep: bool,
     skip_padded_tokens: bool,
+    fused_decode_options: _FusedDecodeOptions,
     rhs_quant_dtype=None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
@@ -249,6 +273,8 @@ def _build_fused_moe_custom_op(
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
 
+    token_trays_mode, rank3_scales, fused_decode_max_tokens = fused_decode_options
+
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
@@ -261,6 +287,9 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        token_trays_mode=token_trays_mode,
+        rank3_scales=rank3_scales,
+        fused_decode_max_tokens=fused_decode_max_tokens,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -272,7 +301,14 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        fused_decode_options,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -287,7 +323,15 @@ def _get_fused_moe_custom_op(
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    fused_decode_options = _resolve_fused_decode_options()
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        fused_decode_options,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -297,6 +341,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        fused_decode_options=fused_decode_options,
     )
 
 
