@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import torch
 from vllm.distributed import parallel_state
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
@@ -108,7 +109,7 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
         )
 
 
-def shard_group_or_none(output_size: int):
+def shard_group_or_none(output_size: int) -> GroupCoordinator | None:
     """The chip group to shard ``output_size`` across, or ``None`` to replicate.
 
     Separated from layer construction so the decision -- the part with all the
@@ -141,7 +142,7 @@ def shard_group_or_none(output_size: int):
     return group
 
 
-def tp_shard_group_or_none(output_size: int):
+def tp_shard_group_or_none(output_size: int) -> GroupCoordinator | None:
     """The TP group to shard ``output_size`` across on single-core-per-chip TPUs.
 
     On TPU v6e (1 core/chip), ``get_intra_chip_group()`` returns ``None``,

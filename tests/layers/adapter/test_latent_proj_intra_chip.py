@@ -289,3 +289,67 @@ def test_shards_when_everything_lines_up(monkeypatch):
 
     assert mod.shard_group_or_none(3584) is group
     assert mod.shard_group_or_none(7168) is group
+
+
+def _patch_tp_state(monkeypatch, mod, *, initialized: bool, group) -> None:
+    """Replace the module's view of vLLM's parallel state, every field explicit."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        mod,
+        "parallel_state",
+        SimpleNamespace(
+            model_parallel_is_initialized=lambda: initialized,
+            get_tp_group=lambda: group,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "flag,initialized,group,why",
+    [
+        (False, True, _FakeGroup(4), "flag off"),
+        (True, False, _FakeGroup(4), "model parallel not initialized"),
+        (True, True, None, "no TP group"),
+        (True, True, _FakeGroup(1), "TP world size 1"),
+    ],
+)
+def test_tp_shard_declines_silently(monkeypatch, flag, initialized, group, why):
+    """Expected states of a default-on knob: replicate without a warning."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", flag)
+    _patch_tp_state(monkeypatch, mod, initialized=initialized, group=group)
+    monkeypatch.setattr(mod, "_warned", False)
+
+    assert mod.tp_shard_group_or_none(3584) is None, why
+    assert mod._warned is False, why
+
+
+def test_tp_shard_declines_uneven_output_with_one_warning(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(3))
+    monkeypatch.setattr(mod, "_warned", False)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        mod.logger, "warning", lambda message, *args: warnings.append(message)
+    )
+
+    assert mod.tp_shard_group_or_none(3584) is None
+    assert mod.tp_shard_group_or_none(3584) is None
+    assert len(warnings) == 1
+
+
+def test_tp_shard_uses_the_tp_group_when_output_divides(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    group = _FakeGroup(16, rank_in_group=3)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=group)
+
+    assert mod.tp_shard_group_or_none(3584) is group
