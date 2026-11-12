@@ -45,6 +45,7 @@ from packaging import version
 from vllm.config import (
     CUDAGraphMode,
     ParallelConfig,
+    SchedulerConfig,
     VllmConfig,
     get_layers_from_vllm_config,
     set_current_vllm_config,
@@ -454,13 +455,28 @@ def _spec_warmup_num_output_tokens(
     """
     if not getattr(runner, "use_async_scheduling", False):
         return list(fallback_counts)
-    reqs = getattr(runner, "requests", None) or {}
-    out: list[int] = []
-    for rid, fb in zip(req_ids, fallback_counts):
-        rs = reqs.get(rid)
-        n_cur = len(rs.output_token_ids) if rs is not None else 0
-        out.append(max(int(fb), n_cur))
-    return out
+    requests = getattr(runner, "requests", None) or {}
+    counts: list[int] = []
+    for req_id, fallback in zip(req_ids, fallback_counts):
+        req_state = requests.get(req_id)
+        num_outputs = len(req_state.output_token_ids) if req_state is not None else 0
+        counts.append(max(fallback, num_outputs))
+    return counts
+
+
+def _spec_warmup_max_reqs(
+    max_num_reqs: int, scheduler_config: SchedulerConfig | None
+) -> int:
+    """Largest request count a synthetic spec-decode warmup batch may use.
+
+    The scheduler never sends more than `max_num_seqs` requests, which can be
+    below the runner's padded `max_num_reqs` (`MIN_NUM_SEQS`). Layers size
+    per-request buffers by `max_num_seqs`, so warming more requests than that
+    would index past them.
+    """
+    if scheduler_config is None:
+        return int(max_num_reqs)
+    return min(int(max_num_reqs), int(scheduler_config.max_num_seqs))
 
 
 @contextmanager
@@ -7149,12 +7165,7 @@ class TPUModelRunner(GPUModelRunner):
         drafter = self.drafter
         block = int(getattr(drafter, "block_size", K + 1))
         pad_max_reqs = int(self.max_num_reqs)
-        sched_max_reqs = (
-            int(self.scheduler_config.max_num_seqs)
-            if getattr(self, "scheduler_config", None) is not None
-            else pad_max_reqs
-        )
-        max_reqs = min(pad_max_reqs, sched_max_reqs)
+        max_reqs = _spec_warmup_max_reqs(pad_max_reqs, self.scheduler_config)
         budget = int(self.max_num_tokens)
         pads = list(self.num_tokens_paddings)
 
@@ -7214,12 +7225,8 @@ class TPUModelRunner(GPUModelRunner):
 
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
-        sched_max_reqs = (
-            int(self.scheduler_config.max_num_seqs)
-            if getattr(self, "scheduler_config", None) is not None
-            else int(self.max_num_reqs)
-        )
-        if R > sched_max_reqs:
+        max_reqs = _spec_warmup_max_reqs(self.max_num_reqs, self.scheduler_config)
+        if max_reqs < R:
             return
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
@@ -7305,7 +7312,7 @@ class TPUModelRunner(GPUModelRunner):
                 nct = [x + 1 for x in nct]
             if (
                 mixed
-                and min(int(self.max_num_reqs), sched_max_reqs) >= R + 1
+                and max_reqs >= R + 1
                 and int(self.max_num_tokens) - R * (1 + K) >= P
             ):
                 # Mixed verify+prefill steps at the full step budget: R verify
@@ -7324,10 +7331,7 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 mix_nblk = max(mix_nblks)
                 variants = [[P_mix]]
-                if (
-                    min(int(self.max_num_reqs), sched_max_reqs) >= R + 2
-                    and P_mix >= 2 * P
-                ):
+                if max_reqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk

@@ -443,6 +443,7 @@ def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int])
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         drafter=SimpleNamespace(block_size=block),
         max_num_reqs=max_reqs,
+        scheduler_config=SimpleNamespace(max_num_seqs=max_reqs),
         max_num_tokens=budget,
         num_tokens_paddings=paddings,
     )
