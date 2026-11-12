@@ -36,7 +36,6 @@ from __future__ import annotations
 import torch
 from vllm.config import VllmConfig
 
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
@@ -98,14 +97,13 @@ class DSparkProposer(DFlashProposer):
                 self.block_size,
                 trained_block,
             )
-        # Phase O6b (`TPU_KIMI_OPT_SPEC_KDA="o6b"`): position-major draft
-        # logits (see `_dflash_forward_and_sample`).
-        self._position_major_logits = use_spec_o6b()
+        # Position-major draft logits (see `_dflash_forward_and_sample`) are
+        # opt-in per draft model; `load_model` reads the draft's choice.
+        self._position_major_logits = False
         logger.info(
-            "DSpark: sample_from_anchor=%s, K=%d, position_major_logits=%s.",
+            "DSpark: sample_from_anchor=%s, K=%d.",
             self.sample_from_anchor,
             K,
-            self._position_major_logits,
         )
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
@@ -136,11 +134,19 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        # Optional draft-model hook: a draft model opts in to position-major
+        # draft logits by defining `position_major_draft_logits()`. Draft
+        # models without it keep the request-major path.
+        if hasattr(self.draft_model, "position_major_draft_logits"):
+            self._position_major_logits = bool(
+                self.draft_model.position_major_draft_logits()
+            )
         self._markov_w2_local = None
         if self._position_major_logits:
             self._markov_w2_local = self._shard_markov_head()
         logger.info(
-            "DSpark: vocab-parallel Markov sampling=%s.",
+            "DSpark: position_major_logits=%s, vocab-parallel Markov sampling=%s.",
+            self._position_major_logits,
             self._markov_w2_local is not None,
         )
 

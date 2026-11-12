@@ -361,6 +361,14 @@ class K3DSparkForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
 
+    def position_major_draft_logits(self) -> bool:
+        """Whether the DSpark proposer computes draft logits position-major.
+
+        Read by ``DSparkProposer.load_model``. Enabled together with the
+        TP-sharded context projections by ``TPU_KIMI_OPT_SPEC_KDA``.
+        """
+        return use_spec_o6b()
+
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lm_head is not None
         return self.logits_processor(self.lm_head, hidden_states)
