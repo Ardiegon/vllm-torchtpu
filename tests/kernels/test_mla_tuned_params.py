@@ -98,3 +98,31 @@ def test_k3_mixed_tuned_params_require_matching_geometry(
     assert tuned.num_kv_pages_per_block == 1
     assert tuned.num_queries_per_block == 16
     assert tuned.q_split == 1
+
+
+def test_untuned_batched_decode_warns_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_logger = MagicMock()
+    monkeypatch.setattr(tuned_params, "logger", mock_logger)
+    key = TuningKey(
+        case="batched_decode",
+        max_num_tokens=64,
+        actual_num_q_heads=64,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=256,
+        kv_packing=4,
+        max_num_seqs=2,
+        pages_per_seq=9,
+    )
+
+    tuned = get_tuned_params(key)
+
+    mock_logger.warning_once.assert_called_once()
+    assert mock_logger.warning_once.call_args.args[-1] == key
+    assert tuned.num_kv_pages_per_block == 3
+    assert tuned.num_queries_per_block == 1
+    assert tuned.decode_batch_size == 4
+    assert tuned.vmem_limit_bytes == 60 * 1024 * 1024
