@@ -72,6 +72,44 @@ def _duplicate_context_kv_weights(
         yield f"context_kv_proj.{param_name}", duplicate
 
 
+def _context_tp_shards(tp_size: int, hidden_size: int, kv_width: int) -> int:
+    """TP shard count of the context projections (1 means replicated).
+
+    With ``TPU_KIMI_OPT_SPEC_KDA`` selecting it, the two context projections
+    are sharded over TP by output rows and their (small) outputs
+    all-gathered instead of replicating the weights. Every output element is
+    still one full-K dot product on one chip, so the values match the
+    replicated layers. Both output widths must divide by ``tp_size``.
+    """
+    if (
+        use_spec_o6b()
+        and tp_size > 1
+        and hidden_size % tp_size == 0
+        and kv_width % tp_size == 0
+    ):
+        return tp_size
+    return 1
+
+
+def _layer_major_context_kv(
+    all_kv: torch.Tensor, shards: int, num_layers: int, kv_width: int
+) -> torch.Tensor:
+    """``[tokens, num_layers * kv_width]`` context KV as ``[tokens, layer, kv]``.
+
+    A TP-sharded ``context_kv_proj`` gathers its output rank-major
+    (``[rank][layer][kv_width / shards]``); reorder it to the layer-major
+    layout of the replicated projection.
+    """
+    num_tokens = all_kv.shape[0]
+    if shards > 1:
+        return (
+            all_kv.view(num_tokens, shards, num_layers, kv_width // shards)
+            .transpose(1, 2)
+            .reshape(num_tokens, num_layers, kv_width)
+        )
+    return all_kv.view(num_tokens, num_layers, kv_width)
+
+
 class K3DSparkDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -131,22 +169,11 @@ class K3DSparkModel(nn.Module):
 
         # Aliased to the target embedding after the draft checkpoint loads.
         self.embed_tokens: nn.Module | None = None
-        # Phase O6b (`TPU_KIMI_OPT_SPEC_KDA="o6b"`, D90): shard the two
-        # context projections over TP by output rows and all-gather the
-        # (small) outputs instead of replicating the weights. Every output
-        # element is still one full-K dot product on one chip, so the values
-        # match the replicated layers.
-        tp_size = get_tensor_model_parallel_world_size()
         kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
-        self.context_tp_shards = (
-            tp_size
-            if (
-                use_spec_o6b()
-                and tp_size > 1
-                and self.config.hidden_size % tp_size == 0
-                and kv_width % tp_size == 0
-            )
-            else 1
+        self.context_tp_shards = _context_tp_shards(
+            get_tensor_model_parallel_world_size(),
+            self.config.hidden_size,
+            kv_width,
         )
         context_in = self.config.target_hidden_size * self.config.num_target_layers
         if self.context_tp_shards > 1:
@@ -221,16 +248,9 @@ class K3DSparkModel(nn.Module):
         num_tokens = context.shape[0]
         num_layers = len(self.layers)
         kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
-        shards = self.context_tp_shards
-        if shards > 1:
-            # The gathered output is rank-major: [rank][layer][kv_width/tp].
-            all_kv = (
-                all_kv.view(num_tokens, shards, num_layers, kv_width // shards)
-                .transpose(1, 2)
-                .reshape(num_tokens, num_layers, kv_width)
-            )
-        else:
-            all_kv = all_kv.view(num_tokens, num_layers, kv_width)
+        all_kv = _layer_major_context_kv(
+            all_kv, self.context_tp_shards, num_layers, kv_width
+        )
 
         for layer_idx, layer in enumerate(
             cast("Iterable[K3DSparkDecoderLayer]", self.layers)
