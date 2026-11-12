@@ -1342,8 +1342,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         decode_batch_size=1,
         q_split=2,
     ),
-    # Kimi K3 TP8 (12 heads) & TP16 (6 heads) on TPU v6e, unified KDA+MLA BF16
-    # pool (648-token pages).
+    # 12 and 6 local heads on TPU v6e, BF16 KV pool with 648-token pages.
     TuningKey(
         case="mixed",
         max_num_tokens=1024,
@@ -1461,49 +1460,75 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 }
 
 
+# Element budgets of the tiles the large-page "mixed" model sizes: the bf16
+# query tile [bq * heads, lkv_dim] (4 MiB) and the f32 score tile
+# [bq * heads, bkvp * page_size] (16 MiB). Larger tiles fail to compile with a
+# scoped VMEM OOM under the 60 MiB kernel limit.
+_MIXED_QUERY_TILE_ELEMENTS = 1 << 21
+_MIXED_SCORE_TILE_ELEMENTS = 1 << 22
+_MIXED_MAX_QUERIES_PER_BLOCK = 512
+_MIXED_MIN_QUERIES_PER_BLOCK = 16
+# Smallest batch the model covers; smaller ones keep the default tile.
+_MIXED_MIN_TOKENS = 64
+# Pages up to this many tokens are the geometries the tuned table and its
+# default cover.
+_MIXED_TABLE_PAGE_MAX_TOKENS = 128
+# A page of at least this many tokens fills a KV block on its own.
+_MIXED_SINGLE_PAGE_BLOCK_TOKENS = 512
+
+
+def _floor_power_of_two(value: int) -> int:
+    return 1 << (value.bit_length() - 1)
+
+
+def _large_page_mixed_params(tuning_key: TuningKey) -> TunableParams | None:
+    """Cost-model "mixed" block sizes for large KV pages.
+
+    Covers pools whose pages hold more tokens than the tuned table's (pages
+    that also carry per-sequence state), for any table shape. Returns None
+    outside that envelope.
+    """
+    page_size = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+    if (
+        tuning_key.case != "mixed"
+        or page_size <= _MIXED_TABLE_PAGE_MAX_TOKENS
+        or tuning_key.max_num_tokens < _MIXED_MIN_TOKENS
+    ):
+        return None
+    heads = tuning_key.actual_num_q_heads
+    query_rows = _MIXED_QUERY_TILE_ELEMENTS // (heads * tuning_key.actual_lkv_dim)
+    if query_rows < _MIXED_MIN_QUERIES_PER_BLOCK:
+        return None
+    bq = min(
+        _MIXED_MAX_QUERIES_PER_BLOCK,
+        _floor_power_of_two(query_rows),
+        1 << (tuning_key.max_num_tokens - 1).bit_length(),
+    )
+    if page_size >= _MIXED_SINGLE_PAGE_BLOCK_TOKENS:
+        bkvp = 1
+    else:
+        bkvp = 4 if tuning_key.max_num_tokens <= 1024 else 8
+    while (
+        bq > _MIXED_MIN_QUERIES_PER_BLOCK
+        and bq * heads * bkvp * page_size > _MIXED_SCORE_TILE_ELEMENTS
+    ):
+        bq //= 2
+    return TunableParams(
+        num_kv_pages_per_block=bkvp,
+        num_queries_per_block=bq,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    )
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
 
-    # Kimi K3 unified KDA+MLA pool geometry (page_size=1296/1294/648/324 for BF16 or
-    # FP8 across TP=4/8/16) across arbitrary (max_num_seqs, pages_per_seq) table shapes.
-    if (
-        tuning_key.case == "mixed"
-        and tuning_key.actual_lkv_dim == 512
-        and tuning_key.actual_r_dim == 64
-        and tuning_key.actual_num_q_heads <= 24
-        and tuning_key.page_size_per_kv_packing in (648, 647, 324, 162, 81)
-        and tuning_key.max_num_tokens >= 64
-    ):
-        page_size = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
-        max_bq = (
-            128
-            if tuning_key.actual_num_q_heads > 16
-            else (256 if tuning_key.actual_num_q_heads > 8 else 512)
-        )
-        bq = min(max_bq, 1 << (tuning_key.max_num_tokens - 1).bit_length())
-        bkvp = (
-            1 if page_size >= 512 else (4 if tuning_key.max_num_tokens <= 1024 else 8)
-        )
-        # Cap the f32 score tile (bq * heads x bkvp * page) to the largest one
-        # the K3 target uses (24 heads x 128 q x 1294-token TP4 page = 3.97 M
-        # elements). 16 local heads with the TP4 page (the 64-head DSpark draft
-        # at TP4) otherwise picks bq=256 and fails with e1001 scoped VMEM OOM;
-        # every existing BF16 target key stays under the cap and is unchanged
-        # (FP8-KV geometries are left as they were).
-        while (
-            tuning_key.kv_packing == 2
-            and bq > 16
-            and bq * tuning_key.actual_num_q_heads * bkvp * page_size > (1 << 22)
-        ):
-            bq //= 2
-        return TunableParams(
-            num_kv_pages_per_block=bkvp,
-            num_queries_per_block=bq,
-            vmem_limit_bytes=62914560,
-            decode_batch_size=1,
-            q_split=2,
-        )
+    large_page_params = _large_page_mixed_params(tuning_key)
+    if large_page_params is not None:
+        return large_page_params
 
     logger.warning_once(
         "MLA v2: no tuned parameters for %s; using defaults", tuning_key

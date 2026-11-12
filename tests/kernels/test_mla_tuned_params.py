@@ -126,3 +126,63 @@ def test_untuned_batched_decode_warns_and_falls_back(
     assert tuned.num_queries_per_block == 1
     assert tuned.decode_batch_size == 4
     assert tuned.vmem_limit_bytes == 60 * 1024 * 1024
+
+
+def _large_page_mixed_key(
+    heads: int, page_size_per_kv_packing: int, max_num_tokens: int
+) -> TuningKey:
+    return TuningKey(
+        case="mixed",
+        max_num_tokens=max_num_tokens,
+        actual_num_q_heads=heads,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        page_size_per_kv_packing=page_size_per_kv_packing,
+        kv_packing=2,
+        max_num_seqs=32,
+        pages_per_seq=26,
+    )
+
+
+@pytest.mark.parametrize(
+    ("heads", "page_size_per_kv_packing", "max_num_tokens", "bkvp", "bq"),
+    [
+        # One 1294-token page per block; 16 heads hit the score-tile cap.
+        (24, 647, 4096, 1, 128),
+        (16, 647, 4096, 1, 128),
+        (16, 647, 64, 1, 64),
+        # 648-token pages.
+        (12, 324, 2048, 1, 256),
+        (8, 324, 8192, 1, 512),
+        # 324-token pages are grouped; 8 per block hits the score-tile cap.
+        (6, 162, 1024, 4, 512),
+        (6, 162, 8192, 8, 256),
+        (6, 81, 512, 4, 512),
+    ],
+)
+def test_untuned_large_page_mixed_uses_cost_model(
+    heads: int, page_size_per_kv_packing: int, max_num_tokens: int, bkvp: int, bq: int
+) -> None:
+    key = _large_page_mixed_key(heads, page_size_per_kv_packing, max_num_tokens)
+    assert key not in tuned_params.tuned_params_mapping
+
+    tuned = get_tuned_params(key)
+
+    assert tuned.num_kv_pages_per_block == bkvp
+    assert tuned.num_queries_per_block == bq
+    assert tuned.q_split == 2
+    assert tuned.decode_batch_size == 1
+
+
+def test_large_page_mixed_below_min_tokens_keeps_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tuned_params, "logger", MagicMock())
+
+    tuned = get_tuned_params(_large_page_mixed_key(12, 324, 32))
+
+    assert tuned.num_kv_pages_per_block == 1
+    assert tuned.num_queries_per_block == 16
+    assert tuned.q_split == 1
