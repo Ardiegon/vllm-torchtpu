@@ -37,7 +37,7 @@ def compute_batched_seq_metadata(
     `state_indices[s] + read_offsets[s]` and one state checkpoint per window
     position is written back to `state_indices[s] + t`.
 
-    `window_lens` (Kimi K3 O6a masked commit) overrides each row's real size
+    `window_lens` (masked commit) overrides each row's real size
     (`<=` its query length) while keeping the row's token base and its
     `has_initial_state` from the verify step's query layout: rows past
     `window_lens[s]` become masked no-op tokens.

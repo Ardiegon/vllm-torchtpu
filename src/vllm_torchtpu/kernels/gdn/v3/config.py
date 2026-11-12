@@ -38,6 +38,24 @@ class GDNMode(enum.StrEnum):
     PER_SEQ = enum.auto()
 
 
+class StateWrite(enum.StrEnum):
+    """Which window checkpoints copy_out writes back to an external state
+    source (pooled path only)."""
+
+    # One checkpoint per valid window position: vLLM's checkpoint-selection
+    # rollback scheme.
+    ALL = enum.auto()
+    # Nothing: a side-effect-free verify that streams the committed state in
+    # and leaves the source bytes untouched.
+    NONE = enum.auto()
+    # Only window position `window_size - 1`, written to the sequence's own
+    # state block (checkpoint 0). With ragged real sizes the masked tail
+    # tokens are exact no-ops (unit decay, zero k/v/beta, frozen conv shift),
+    # so that position holds the state after the sequence's last real token:
+    # a masked commit of the accepted prefix.
+    LAST = enum.auto()
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Dtypes:
@@ -123,18 +141,8 @@ class GDNConfig:
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
     # Which window checkpoints copy_out writes back to an external state
-    # source (pooled path only; Kimi K3 Phase O6a side-effect-free verify +
-    # masked commit):
-    #   * "all"  -- one checkpoint per valid window position (the default,
-    #     vLLM's checkpoint-selection rollback scheme);
-    #   * "none" -- nothing: a side-effect-free verify that streams the
-    #     committed state in and leaves the source bytes untouched;
-    #   * "last" -- only window position `window_size - 1`, written to the
-    #     sequence's own state block (checkpoint 0). With ragged real sizes
-    #     the masked tail tokens are exact no-ops (unit decay, zero k/v/beta,
-    #     frozen conv shift), so that position holds the state after the
-    #     sequence's last real token: a masked commit of the accepted prefix.
-    state_write: str = "all"
+    # source (pooled path only); see `StateWrite`.
+    state_write: StateWrite = StateWrite.ALL
 
     @property
     def chunk_size(self) -> int:
@@ -228,22 +236,39 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        if self.state_write != "all":
+        if self.state_write != StateWrite.ALL:
             suffix += f"_sw{self.state_write}"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
         )
 
+    def stored_window_positions(self) -> range:
+        """Window positions whose checkpoint the kernel encodes for copy_out.
+
+        The single source of truth for `state_write`: every position under
+        `ALL`, none for a side-effect-free verify (`NONE`), and only the final
+        position for a masked commit (`LAST`).
+        """
+        if self.state_write == StateWrite.NONE:
+            return range(0)
+        if self.state_write == StateWrite.LAST:
+            return range(self.window_size - 1, self.window_size)
+        return range(self.window_size)
+
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
         ret = {}
         for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
-            if key == "state_write" and val == "all":
-                # Default checkpoint write-back: omitted so kernels that do
-                # not use O6a keep their exact pre-O6a custom-call metadata.
-                continue
+            if key == "state_write":
+                if val == StateWrite.ALL:
+                    # Omit the default so kernels that keep every checkpoint
+                    # have unchanged custom-call metadata (and compile-cache
+                    # keys).
+                    continue
+                # Record the plain value string, not the enum member.
+                val = str(val)
             if not isinstance(val, str | int | float):
                 val = str(val)
             ret[key] = val
