@@ -371,11 +371,11 @@ def outer_kernel(
 )
 def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
-    b: jax.Array,  # [batch_size, n_v]
+    b: jax.Array,  # [batch_size, n_v] or [batch_size, aligned_num_v_heads]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
     recurrent_state: jax.Array | None,  # [num_seqs + 1, nv, dk, dv]
-    conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
+    conv_weight: jax.Array,  # [dim_size, 1, kernel_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
     dt_bias: jax.Array,  # [n_v] for GDN, [n_v, d_k] for KDA
@@ -413,7 +413,9 @@ def fused_conv1d_gdn(
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
             where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
-        b: b tensor (for beta) of shape [batch_size, n_v].
+        b: b tensor (for beta) of shape [batch_size, n_v], or
+            [batch_size, aligned_num_v_heads] if the caller already padded the
+            heads to a lane multiple.
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
             kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
@@ -424,7 +426,9 @@ def fused_conv1d_gdn(
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
             sequence. None when `state_source` carries the states.
-        conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
+        conv_weight: Convolution weight tensor of shape [dim_size, 1,
+            kernel_size], or [kernel_size, 1, dim_size] (the kernel's own
+            layout) when `conv_weight_is_kernel_layout` is set.
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].
         dt_bias: dt_bias tensor of shape [n_v]; [n_v, d_k] under KDA, whose
@@ -479,6 +483,11 @@ def fused_conv1d_gdn(
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        conv_weight_is_kernel_layout: `conv_weight` is already
+            [kernel_size, 1, dim_size] (kernel layout) instead of
+            [dim_size, 1, kernel_size], so no transpose is needed.
+        skip_empty_per_seq: Pooled path only. Skip the PER_SEQ pallas_call
+            (via `lax.cond`) when the batch has no prefill/mixed sequences.
         batched_state_write: Which BATCHED-segment window checkpoints are
             written back to `state_source` (see `config.StateWrite`):
             `ALL` (default), `NONE` (side-effect-free verify) or `LAST`
