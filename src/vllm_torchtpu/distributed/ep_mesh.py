@@ -180,6 +180,10 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     With MOE_FUSED_EP_SORTED_GATHER the mesh stays in rank order too, and the
     activation all-gather gets the device-id order on its own instead; see
     `ep_sorted_gather_group`.
+
+    The mesh also stays in rank order when the Kimi K3 options that build the
+    rank-ordered ('dp', 'tp') mesh are on (`dp_tp_mesh.kimi_use_2d_ep_mesh`):
+    its Pallas DMA kernels share the compiled module with the EP kernels.
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
@@ -201,15 +205,14 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
 def ep_rank_order() -> tuple[int, ...] | None:
     """EP rank at each mesh index, or None when EP is off.
 
-    With the mesh in ascending device-id order (PCP and DCP off; see
-    `_ep_mesh_order`)
+    With the mesh in ascending device-id order (see `_ep_mesh_order`),
     mesh index i is not EP rank i on a host whose PCI enumeration differs from
     its device ids -- every tpu7x host, where local ranks 0..7 land on devices
     `[0, 1, 4, 5, 6, 7, 2, 3]` -- so the shard at mesh index i owns the experts
     of EP rank `ep_rank_order()[i]`. The caller has to say so -- see
     `fused_moe_ep._mesh_expert_order` -- because the kernel reads a token's
-    expert id as `mesh_index * experts_per_shard + j`. With PCP or DCP on it is
-    the identity.
+    expert id as `mesh_index * experts_per_shard + j`. When the mesh is in rank
+    order it is the identity.
     """
     device_ids = ep_device_ids()
     if device_ids is None:
@@ -270,8 +273,8 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     """A one-axis JAX mesh over the EP group, or None when EP is off.
 
     The devices are Torchtpu's ``get_pallas_mesh`` ones, put in the order
-    `_ep_mesh_order` picks: ascending device id, or rank order when PCP or DCP
-    is on.
+    `_ep_mesh_order` picks: rank order when PCP, DCP, the sorted gather or a
+    rank-ordered (dp, tp) mesh needs it, otherwise ascending device id.
     `ep_rank_order` has the permutation this introduces and the consequence
     for the caller.
 
