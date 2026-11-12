@@ -32,107 +32,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.linear_common import (
-    KEEP_VLLM_LAYOUT_ATTR,
-    WEIGHT_FLIPPED_ATTR,
-)
-from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.utils import fresh_buffer
 
-from torch_tpu._internal import pallas
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
-
 from .collective_ops import TokenShardCollectives
-
-
-def _w8a16_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
-    return xla_quantized_matmul(x, w_q, w_s, quantize_activation=False)
-
-
-_w8a16_matmul_op = pallas.jax_op("pallas::kimi_w8a16_matmul", _w8a16_matmul_jax)
-_w8a16_matmul_op.register_fake(
-    lambda x, w_q, w_s: torch.empty(
-        (x.shape[0], w_q.shape[1]), dtype=x.dtype, device=x.device
-    )
-)
-
-
-def w8a16_matmul(
-    x: torch.Tensor,
-    w_q: torch.Tensor,
-    w_scale: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Execute weight-only W8A16 matmul (quantize_activation=False)."""
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, orig_shape[-1])
-    if x_2d.device.type == "tpu":
-        out_2d = _w8a16_matmul_op(x_2d, w_q, w_scale)
-    else:
-        out_2d = (torch.matmul(x_2d.float(), w_q.float()) * w_scale.unsqueeze(0)).to(
-            x.dtype
-        )
-    if bias is not None:
-        out_2d = out_2d + bias
-    return out_2d.reshape(*orig_shape[:-1], w_q.shape[1])
-
-
-def quantize_weight_w8a16(
-    w_kn: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a [K, N] weight tensor per-output-channel (axis=0) for W8A16."""
-    w_q, w_scale = quantize_tensor(w_kn, torch.int8, axis=0)
-    return fresh_buffer(w_q), fresh_buffer(w_scale)
-
-
-class W8A16LinearMethod(QuantizeMethodBase):
-    """Weight-only W8A16 linear method for Kimi K3 dense projections."""
-
-    supports_pre_processed_weights = True
-
-    def create_weights(self, *args, **kwargs) -> None:
-        raise NotImplementedError
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        pass
-
-    def apply(
-        self,
-        layer: nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        w_q = cast(torch.Tensor, layer.weight)
-        w_scale = cast(torch.Tensor, layer.weight_scale)
-        return w8a16_matmul(x, w_q, w_scale, bias)
-
-
-def quantize_linear_layer_w8a16(layer: nn.Module | None) -> list[torch.Tensor]:
-    """Convert a loaded LinearBase or ParallelLMHead layer to W8A16 in-place."""
-    if layer is None:
-        return []
-    weight = getattr(layer, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.numel() == 0:
-        return []
-    if weight.dtype == torch.int8:
-        scale = getattr(layer, "weight_scale", None)
-        return [weight, scale] if isinstance(scale, torch.Tensor) else [weight]
-    w_data = weight.data
-    is_flipped = getattr(layer, WEIGHT_FLIPPED_ATTR, False) and not getattr(
-        layer, KEEP_VLLM_LAYOUT_ATTR, False
-    )
-    w_kn = w_data if is_flipped else w_data.t().contiguous()
-    w_q, w_scale = quantize_weight_w8a16(w_kn)
-    weight.data = torch.empty(0, dtype=w_data.dtype, device=w_data.device)
-    del w_data, w_kn
-    layer.weight = nn.Parameter(w_q, requires_grad=False)
-    layer.register_parameter("weight_scale", nn.Parameter(w_scale, requires_grad=False))
-    setattr(layer, WEIGHT_FLIPPED_ATTR, True)
-    layer.quant_method = W8A16LinearMethod()
-    return [layer.weight, layer.weight_scale]
 
 
 @cache

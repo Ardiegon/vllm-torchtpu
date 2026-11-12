@@ -75,13 +75,17 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
+    quantize_linear_layer_w8a16,
+    synchronize_quantized_weights,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
-from .layers import AttentionResidual, KimiMLP, quantize_linear_layer_w8a16
+from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
 
 logger = init_logger(__name__)
@@ -467,10 +471,6 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         dma_collectives.attach_to_mlp(module)
 
         if envs.TPU_KIMI_DENSE_W8A16_B11:
-            from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
-                release_memory_to_os,
-            )
-
             to_sync: list[torch.Tensor] = []
             for module in self.modules():
                 if isinstance(module, KimiDecoderLayer):
@@ -534,14 +534,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         )
             if not getattr(self.config, "tie_word_embeddings", False):
                 to_sync.extend(quantize_linear_layer_w8a16(self.lm_head))
-            tpu_tensors = [
-                t
-                for t in to_sync
-                if isinstance(t, torch.Tensor) and t.device.type == "tpu"
-            ]
-            if tpu_tensors:
-                synchronize_tensors(tpu_tensors)
-                release_memory_to_os()
+            synchronize_quantized_weights(to_sync)
 
     @classmethod
     def get_mamba_state_dtype_from_config(

@@ -47,6 +47,10 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
 )
+from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
+    quantize_weight_w8a16,
+    w8a16_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
@@ -56,7 +60,7 @@ from .latency_collective_ops import (
     pack_dp_dispatch,
     unpack_dp_dispatch,
 )
-from .layers import KimiMLP, quantize_weight_w8a16, w8a16_matmul
+from .layers import KimiMLP
 from .opt_flags import is_exit_fold_active
 
 if TYPE_CHECKING:

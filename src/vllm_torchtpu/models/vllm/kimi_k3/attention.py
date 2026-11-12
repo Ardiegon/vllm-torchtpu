@@ -58,6 +58,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_pooled_kda_verify_commit_ops,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
+    quantize_weight_w8a16,
+    w8a16_matmul,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
@@ -66,7 +70,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
-from .layers import quantize_weight_w8a16, w8a16_matmul
 from .opt_flags import use_kda_glue, use_spec_kda_verify
 
 logger = init_logger(__name__)
