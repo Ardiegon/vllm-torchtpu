@@ -659,6 +659,8 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
+    # jnp.pad emits a pad op even for zero widths, so skip it when there is
+    # nothing to pad (keeps the traced program free of no-op pads).
     if batch_padding_size:
         qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     if batch_padding_size or num_v_padding_size:
@@ -677,8 +679,7 @@ def fused_conv1d_gdn(
         conv_state_shape = cast(jax.Array, conv_state).shape
         conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
     if conv_weight_is_kernel_layout:
-        if conv_weight.dtype != jnp.float32:
-            conv_weight = conv_weight.astype(jnp.float32)
+        conv_weight = conv_weight.astype(jnp.float32)
     else:
         conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
