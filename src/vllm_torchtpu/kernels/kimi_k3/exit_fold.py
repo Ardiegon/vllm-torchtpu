@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -95,15 +94,8 @@ DEFAULT_C2_COMBINE_KIND = "o4b"
 DEFAULT_C2_DISPATCH_KIND = "axial"
 
 
-def resolve_effective_exit_fold_plan(
-    mode: str,
-    *,
-    dp_size: int,
-    tp_size: int,
-    b_dp: int,
-) -> tuple[str, bool, str]:
+def resolve_effective_exit_fold_plan(mode: str) -> tuple[str, bool, str]:
     """Map canonical ``exit_fold_mode`` + static shape to ``(combine_kind, async_dispatch, dispatch_kind)``."""
-    del dp_size, tp_size, b_dp
     norm = normalize_exit_fold_mode(mode)
     if norm == "o4a":
         return "o4a", True, "world"
@@ -120,23 +112,6 @@ def resolve_effective_exit_fold_plan(
     if norm == "c2":
         return DEFAULT_C2_COMBINE_KIND, True, DEFAULT_C2_DISPATCH_KIND
     raise ValueError(f"resolve_effective_exit_fold_plan called with inactive mode={mode!r}")
-
-
-def resolve_effective_exit_fold_mode(
-    mode: str,
-    *,
-    dp_size: int,
-    tp_size: int,
-    b_dp: int,
-) -> tuple[str, bool]:
-    """Map canonical ``exit_fold_mode`` + static shape to ``(combine_kind, async_dispatch)``."""
-    combine_kind, async_dispatch, _ = resolve_effective_exit_fold_plan(
-        mode,
-        dp_size=dp_size,
-        tp_size=tp_size,
-        b_dp=b_dp,
-    )
-    return combine_kind, async_dispatch
 
 
 # =============================================================================
@@ -1130,12 +1105,7 @@ def _make_moe_ep_overlap_jax_fn(
             zero_wait_copy = polish_vmem in ("vmem_chain", "vmem_src")
 
             combine_kind, async_dispatch, dispatch_kind = (
-                resolve_effective_exit_fold_plan(
-                    exit_fold_mode,
-                    dp_size=dp_size,
-                    tp_size=tp_size,
-                    b_dp=b_dp,
-                )
+                resolve_effective_exit_fold_plan(exit_fold_mode)
             )
 
             # 1. Dispatch + Shared Gate/Up Compute:
@@ -1532,7 +1502,7 @@ def build_kimi_moe_ep_overlap_op(
     )
 
     combine_kind_sig, _, dispatch_kind_sig = resolve_effective_exit_fold_plan(
-        norm_mode, dp_size=dp_size, tp_size=tp_size, b_dp=1
+        norm_mode
     )
     impl_tag = (
         f"_{dispatch_kind_sig}_{combine_kind_sig}"
@@ -1643,273 +1613,3 @@ def build_kimi_moe_ep_overlap_op(
 
     _call._qualname = op_name  # type: ignore[attr-defined]
     return _call
-
-
-def _audit_hlo_text(
-    hlo_txt: str,
-    *,
-    mode: str,
-    dp_size: int,
-    b_dp: int,
-    is_post_scheduler_hlo: bool,
-) -> dict[str, Any]:
-    """Parse computation instructions in scheduled order from HLO text."""
-    lines = hlo_txt.splitlines()
-    if is_post_scheduler_hlo:
-        entry_start = 0
-        for idx, ln in enumerate(lines):
-            if ln.lstrip().startswith("ENTRY "):
-                entry_start = idx
-                break
-        scan_lines = lines[entry_start:]
-    else:
-        # Pre-optimization GSPMD HLO emits `%shmap_body...` as a sub-computation called by `ENTRY`:
-        scan_lines = lines
-
-    idx_start = -1
-    idx_dot = -1
-    idx_wait = -1
-    ar_count = 0
-    ag_count = 0
-    rs_count = 0
-    has_o4a_combine = False
-    has_o4a_seam = False
-    has_tp_latent_ag_cid0 = False
-    has_dp_combine_rs_cid2 = False
-    has_tp_routed_psum_cid3 = False
-    transpose_4d_world_count = 0
-    o4a_retile_128_count = 0
-
-    world_4d_re = re.compile(rf"\bbf16\[{dp_size},\d+,\d+,\d+\]")
-
-    for i, ln in enumerate(scan_lines):
-        s = ln.strip()
-        if (
-            "kimi_ep_dispatch_start" in s
-            and "custom-call(" in s
-            and "s32[1]" in s
-            and idx_start < 0
-        ) or ("kimi_ep_dispatch_start" in s and not is_post_scheduler_hlo and idx_start < 0):
-            idx_start = i
-        if "kimi_ep_dispatch_wait" in s and idx_wait < 0:
-            idx_wait = i
-        if "kimi_o4a_owner_combine" in s:
-            has_o4a_combine = True
-        if "kimi_o4a_seam_exit_split" in s:
-            has_o4a_seam = True
-        if "latency_all_gather_cols" in s:
-            has_tp_latent_ag_cid0 = True
-        if "latency_psum_scatter_rows" in s:
-            has_dp_combine_rs_cid2 = True
-        if "latency_psum/" in s or "latency_psum:" in s:
-            has_tp_routed_psum_cid3 = True
-        if dp_size > 1 and ("transpose(" in s or " copy(" in s) and world_4d_re.search(s):
-            transpose_4d_world_count += 1
-        if "bf16[128,1,2,1792]" in s:
-            o4a_retile_128_count += 1
-        is_dot = (
-            ("kimi_shared_gu_dot" in s and (" dot(" in s or "dot_general" in s))
-            or ((" = bf16[" in s or " = f32[" in s) and " dot(" in s)
-            or ("stablehlo.dot_general" in s)
-        )
-        if is_dot and idx_start >= 0 and idx_dot < 0:
-            idx_dot = i
-        if " all-reduce(" in s or " all-reduce-start(" in s or "stablehlo.all_reduce" in s:
-            ar_count += 1
-        if " all-gather(" in s or " all-gather-start(" in s or "stablehlo.all_gather" in s:
-            ag_count += 1
-        if (
-            " reduce-scatter(" in s
-            or " reduce-scatter-start(" in s
-            or "stablehlo.reduce_scatter" in s
-        ):
-            rs_count += 1
-
-    return {
-        "mode": mode,
-        "is_post_scheduler_hlo": is_post_scheduler_hlo,
-        "b_dp": b_dp,
-        "b_global": dp_size * b_dp,
-        "entry_line_count": len(scan_lines),
-        "idx_dispatch_start": idx_start,
-        "idx_shared_dot": idx_dot,
-        "idx_dispatch_wait": idx_wait,
-        "start_before_shared_dot": (idx_start >= 0 and idx_dot > idx_start),
-        "shared_dot_before_wait": (idx_dot >= 0 and idx_wait > idx_dot),
-        "all_reduce_count": ar_count,
-        "all_gather_count": ag_count,
-        "reduce_scatter_count": rs_count,
-        "has_xla_fallback_collective": (ar_count + ag_count + rs_count) > 0,
-        "has_o4a_owner_combine": has_o4a_combine,
-        "has_o4a_seam_exit_split": has_o4a_seam,
-        "has_tp_latent_ag_cid0": has_tp_latent_ag_cid0,
-        "has_dp_combine_rs_cid2": has_dp_combine_rs_cid2,
-        "has_tp_routed_psum_cid3": has_tp_routed_psum_cid3,
-        "transpose_4d_world_count": transpose_4d_world_count,
-        "o4a_retile_128_count": o4a_retile_128_count,
-    }
-
-
-def inspect_kimi_moe_ep_overlap_hlo(
-    moe_module: Any,
-    mesh: Mesh,
-    *,
-    b_dp: int,
-    exit_fold_mode: str | None = None,
-    max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-) -> dict[str, Any]:
-    """Lower (or compile when `mesh` holds real `jax.Device`s) SPMD JAX HLO and audit ordering."""
-    from torch_tpu._internal.pallas import pallas as pallas_impl
-
-    from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
-        mesh_shape_and_ids,
-    )
-
-    mode = normalize_exit_fold_mode(
-        envs.TPU_KIMI_OPT_EXIT_FOLD if exit_fold_mode is None else exit_fold_mode
-    )
-    dp_size, tp_size, _ = mesh_shape_and_ids(mesh)
-    cfg = _extract_moe_overlap_config(moe_module)
-    jax_fn, in_specs, out_spec, _ = _make_moe_ep_overlap_jax_fn(
-        mesh,
-        dp_size=dp_size,
-        tp_size=tp_size,
-        exit_fold_mode=mode,
-        max_dma_tokens=max_dma_tokens,
-        cfg=cfg,
-    )
-
-    routed = moe_module.experts.routed_experts
-    h_dim = int(moe_module.w_shared_gu.shape[0])
-    d_local = int(moe_module.w_routed_down_tp.shape[1])
-    topk = int(cfg["topk"])
-    meta_cols = 3 * topk
-    m_per_tp = (meta_cols + tp_size - 1) // tp_size
-    m_padded = m_per_tp * tp_size
-    dev = moe_module.w_shared_gu.device
-
-    sample_torch_args: list[torch.Tensor] = [
-        torch.empty((b_dp, h_dim), dtype=torch.bfloat16, device=dev),
-        torch.empty((b_dp, d_local), dtype=torch.bfloat16, device=dev),
-        torch.empty((b_dp, m_padded), dtype=torch.bfloat16, device=dev),
-        moe_module.w_shared_gu,
-        routed.w13_weight.unsqueeze(0).unsqueeze(0),
-        routed.w2_weight.unsqueeze(0).unsqueeze(0),
-    ]
-    if cfg["has_scales"]:
-        sample_torch_args.append(routed.w13_weight_scale.unsqueeze(0).unsqueeze(0))
-        sample_torch_args.append(routed.w2_weight_scale.unsqueeze(0).unsqueeze(0))
-    if cfg["has_bias"]:
-        sample_torch_args.append(routed.w13_bias.unsqueeze(0).unsqueeze(0))
-        sample_torch_args.append(routed.w2_bias.unsqueeze(0).unsqueeze(0))
-    if cfg["use_norm"]:
-        sample_torch_args.append(moe_module.routed_expert_norm.weight)
-    sample_torch_args.append(routed._experts_start.reshape(1, 1))
-    sample_torch_args.append(moe_module._dma_tp_rank_buf)
-
-    jax_avals = pallas_impl.jax_placeholders(
-        sample_torch_args, mesh=mesh, partition_specs=in_specs
-    )
-    in_shardings = tuple(NamedSharding(mesh, s) for s in in_specs)
-    out_sharding = NamedSharding(mesh, out_spec)
-    lowered = jax.jit(jax_fn, in_shardings=in_shardings, out_shardings=out_sharding).lower(
-        *jax_avals
-    )
-    has_real_jax_devices = all(isinstance(d, jax.Device) for d in mesh.devices.flat)
-    if has_real_jax_devices:
-        hlo_txt = lowered.compile().as_text()
-    else:
-        hlo_txt = lowered.as_text("stablehlo")
-
-    return _audit_hlo_text(
-        hlo_txt,
-        mode=mode,
-        dp_size=dp_size,
-        b_dp=b_dp,
-        is_post_scheduler_hlo=has_real_jax_devices,
-    )
-
-
-def compile_post_scheduler_entry_hlo_audit(
-    *,
-    dp_size: int,
-    tp_size: int,
-    b_dp: int,
-    exit_fold_mode: str,
-    hidden_size: int = 3584,
-    latent_dim: int = 1792,
-    shared_inter_size: int = 3584,
-    num_experts: int = 32,
-    moe_inter_size: int = 256,
-    topk: int = 16,
-    max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-) -> dict[str, Any]:
-    """Compile `kimi_moe_ep_overlap` with real `jax.devices()` and audit post-scheduler ENTRY HLO."""
-    import numpy as np
-
-    devs = jax.devices()
-    world = dp_size * tp_size
-    if len(devs) < world:
-        raise RuntimeError(f"Need {world} real JAX devices for post-scheduler HLO compile, got {len(devs)}")
-    mesh = Mesh(np.array(devs[:world]).reshape(dp_size, tp_size), (DP_AXIS_NAME, TP_AXIS_NAME))
-    mode = normalize_exit_fold_mode(exit_fold_mode)
-    cfg: dict[str, Any] = {
-        "moe_act_str": "silu",
-        "topk": topk,
-        "has_scales": False,
-        "has_bias": False,
-        "use_norm": True,
-        "rms_eps": 1e-5,
-        "shared_act_kind": "situ",
-        "situ_beta": 4.0,
-        "situ_linear_beta": 25.0,
-        "use_sparse_core": False,
-        "onehot_thresh": 1024,
-        "skip_padded": True,
-    }
-    jax_fn, in_specs, out_spec, _ = _make_moe_ep_overlap_jax_fn(
-        mesh,
-        dp_size=dp_size,
-        tp_size=tp_size,
-        exit_fold_mode=mode,
-        max_dma_tokens=max_dma_tokens,
-        cfg=cfg,
-    )
-    in_shardings = tuple(NamedSharding(mesh, s) for s in in_specs)
-    out_sharding = NamedSharding(mesh, out_spec)
-
-    d_local = latent_dim // tp_size
-    meta_cols = 3 * topk
-    m_per_tp = (meta_cols + tp_size - 1) // tp_size
-    m_padded = m_per_tp * tp_size
-    s_gu_global = 2 * shared_inter_size
-    e_local = num_experts // world
-
-    global_shapes_dtypes = [
-        ((dp_size * b_dp, hidden_size), jnp.bfloat16),
-        ((dp_size * b_dp, latent_dim), jnp.bfloat16),
-        ((dp_size * b_dp, m_padded), jnp.bfloat16),
-        ((hidden_size, s_gu_global), jnp.bfloat16),
-        ((dp_size, tp_size, e_local, latent_dim, 2 * moe_inter_size), jnp.bfloat16),
-        ((dp_size, tp_size, e_local, moe_inter_size, latent_dim), jnp.bfloat16),
-        ((latent_dim,), jnp.bfloat16),
-        ((dp_size, tp_size), jnp.int32),
-        ((dp_size, tp_size), jnp.int32),
-    ]
-    jax_avals = [
-        jax.ShapeDtypeStruct(shape, dt, sharding=sh)
-        for (shape, dt), sh in zip(global_shapes_dtypes, in_shardings, strict=True)
-    ]
-    compiled = (
-        jax.jit(jax_fn, in_shardings=in_shardings, out_shardings=out_sharding)
-        .lower(*jax_avals)
-        .compile()
-    )
-    hlo_txt = compiled.as_text()
-    return _audit_hlo_text(
-        hlo_txt,
-        mode=mode,
-        dp_size=dp_size,
-        b_dp=b_dp,
-        is_post_scheduler_hlo=True,
-    )
