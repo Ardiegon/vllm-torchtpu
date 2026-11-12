@@ -59,7 +59,6 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
-    prepare_routes,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
@@ -352,79 +351,32 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
+        layer = cast("TpuRoutedExperts", layer)
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
-        # The routes go to the kernel as `route` returns them, without the
-        # casts and padding mask of `apply_with_routing`.
-        return _run_unquantized_experts(
-            layer,
-            x,
-            topk_weights,
-            topk_ids,
-            activation_str=self._tpu_activation_str,
-            pipelined=enable_pipelined_collective_and_compute(),
-        )
 
-    def apply_with_routing(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        *,
-        pipelined: bool = False,
-        mask_padding: bool = True,
-    ) -> torch.Tensor:
-        """Run the unquantized GMM kernel on pre-routed (x, topk_weights, topk_ids).
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": None,
+            "w2_scale": None,
+            "w1_bias": getattr(layer, "w13_bias", None),
+            "w2_bias": getattr(layer, "w2_bias", None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
 
-        Casts the routes and, with `mask_padding`, zeroes the routing weights of
-        padded tokens (`prepare_routes`).
-        """
-        topk_weights, topk_ids = prepare_routes(
-            x, topk_weights, topk_ids, pipelined=pipelined, mask_padding=mask_padding
-        )
-        return _run_unquantized_experts(
-            layer,
-            x,
-            topk_weights,
-            topk_ids,
-            activation_str=self._tpu_activation_str,
-            pipelined=pipelined,
-        )
-
-
-def _run_unquantized_experts(
-    layer: RoutedExperts,
-    x: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    *,
-    activation_str: str | None,
-    pipelined: bool,
-) -> torch.Tensor:
-    """Dispatch routed tokens to the (pipelined) unquantized fused MoE bridge."""
-    layer = cast("TpuRoutedExperts", layer)
-    assert activation_str is not None, (
-        "[moe] process_weights_after_loading did not run for this layer"
-    )
-    kwargs = {
-        "hidden_states": x,
-        "w1": layer.w13_weight,
-        "w2": layer.w2_weight,
-        "w1_scale": None,
-        "w2_scale": None,
-        "w1_bias": getattr(layer, "w13_bias", None),
-        "w2_bias": getattr(layer, "w2_bias", None),
-        "topk_weights": topk_weights,
-        "topk_ids": topk_ids,
-        "experts_start": layer._experts_start,
-        "topk": layer.moe_config.experts_per_token,
-        "activation": activation_str,
-    }
-    if pipelined:
-        return pipelined_fused_moe_gmm(**kwargs)
-
-    return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(**kwargs)

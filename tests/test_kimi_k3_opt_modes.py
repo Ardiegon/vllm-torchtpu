@@ -24,7 +24,6 @@ from vllm_torchtpu.kimi_k3_opt_modes import (
     normalize_exit_fold_mode,
     normalize_spec_kda_mode,
 )
-from vllm_torchtpu.layers.adapter import fused_moe
 from vllm_torchtpu.models.vllm.kimi_k3 import moe_ep_overlap_op, opt_flags
 
 _OFF_SPELLINGS = [None, *sorted(OFF_TOKENS), " Off ", "NONE"]
@@ -185,26 +184,6 @@ def test_is_exit_fold_active_explicit_value(monkeypatch):
     _set_modes(monkeypatch, exit_fold="c2")
     assert not opt_flags.is_exit_fold_active("off")
     assert opt_flags.is_exit_fold_active("o4d")
-
-
-@pytest.mark.parametrize(
-    "polish,spec_kda,expected",
-    [
-        ("c2", "o6b", ("off", False, fused_moe.FUSED_VERIFY_MOE_MAX_TOKENS)),
-        ("c2", "off", ("off", False, fused_moe.FUSED_DECODE_MOE_MAX_TOKENS)),
-        (
-            "trays+copy_opt",
-            "o6a",
-            ("trays", True, fused_moe.FUSED_DECODE_MOE_MAX_TOKENS),
-        ),
-        (None, None, ("off", False, fused_moe.FUSED_DECODE_MOE_MAX_TOKENS)),
-    ],
-)
-def test_fused_moe_adapter_resolves_fused_decode_options(
-    monkeypatch, polish, spec_kda, expected
-):
-    _set_modes(monkeypatch, polish=polish, spec_kda=spec_kda)
-    assert fused_moe._resolve_fused_decode_options() == expected
 
 
 def test_exit_fold_plan_is_axial_async_hierarchical():

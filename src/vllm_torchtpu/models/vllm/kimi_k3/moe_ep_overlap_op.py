@@ -82,8 +82,6 @@ from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
     sanitize_tag,
 )
 from vllm_torchtpu.models.vllm.kimi_k3.opt_flags import (
-    active_trays_mode,
-    use_copy_opt,
     use_spec_verify_extensions,
     vmem_chain_mode,
 )
@@ -140,9 +138,7 @@ class MoeOverlapConfig:
     use_sparse_core: bool
     onehot_thresh: int
     skip_padded: bool
-    # Fused small-batch MXFP4 MoE kernel settings (see `fused_moe_func`).
-    token_trays_mode: str
-    rank3_scales: bool
+    # Largest batch the fused small-batch MXFP4 MoE kernel serves.
     fused_decode_max_tokens: int
     # Leave the gathered rows in the dispatch receive buffer and let the
     # combine collectives receive into VMEM.
@@ -212,8 +208,6 @@ def _extract_moe_overlap_config(moe_module: Any) -> MoeOverlapConfig:
         use_sparse_core=use_sparse_core,
         onehot_thresh=onehot_thresh,
         skip_padded=skip_padded,
-        token_trays_mode=active_trays_mode(),
-        rank3_scales=use_copy_opt(),
         fused_decode_max_tokens=(
             FUSED_VERIFY_MOE_MAX_TOKENS
             if use_spec_verify_extensions()
@@ -408,8 +402,6 @@ def _make_moe_ep_overlap_jax_fn(
                 onehot_moe_permute_threshold=cfg.onehot_thresh,
                 rhs_quant_dtype=None,
                 skip_padded_tokens=cfg.skip_padded,
-                token_trays_mode=cfg.token_trays_mode,
-                rank3_scales=cfg.rank3_scales,
                 fused_decode_max_tokens=cfg.fused_decode_max_tokens,
             )
 

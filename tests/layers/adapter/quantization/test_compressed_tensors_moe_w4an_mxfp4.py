@@ -203,7 +203,7 @@ def test_mxfp4_apply_masks_padded_token_routes():
             return_value=(topk_weights, topk_ids),
         ),
         patch(
-            "vllm_torchtpu.layers.adapter.token_padding.zero_routing_weights_for_padding",
+            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.token_padding.zero_routing_weights_for_padding",
             return_value=(topk_ids.to(torch.int32), masked_weights),
         ) as mock_mask,
         patch(
@@ -624,7 +624,6 @@ def test_mxfp4_requantize_block():
 def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     from types import SimpleNamespace
 
-    from vllm_torchtpu.layers.adapter import token_padding
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
         compressed_tensors_moe_w4an_mxfp4 as module,
     )
@@ -657,7 +656,7 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
         weights[-1] = 0
         return ids, weights
 
-    monkeypatch.setattr(token_padding, "zero_routing_weights_for_padding", mask)
+    monkeypatch.setattr(module.token_padding, "zero_routing_weights_for_padding", mask)
     monkeypatch.setattr(
         module, "enable_pipelined_collective_and_compute", lambda: False
     )

@@ -612,8 +612,6 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
-        "token_trays_mode",
-        "rank3_scales",
         "fused_decode_max_tokens",
     ),
 )
@@ -635,8 +633,6 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-    token_trays_mode: str = "off",
-    rank3_scales: bool = False,
     fused_decode_max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
@@ -658,10 +654,9 @@ def fused_moe_func(
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
 
-    `token_trays_mode`, `rank3_scales` and `fused_decode_max_tokens` configure
-    the fused small-batch MXFP4 kernel (planar_t weights only): its row-loop
-    mode, rank-3 scale buffers, and the largest batch it serves (larger
-    batches take the routed GMM path). Callers resolve them outside the trace.
+    `fused_decode_max_tokens` is the largest batch the fused small-batch MXFP4
+    kernel serves (planar_t weights only); larger batches take the routed GMM
+    path.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -727,8 +722,6 @@ def fused_moe_func(
             topk_ids,
             activation=activation,
             preferred_element_type=hidden_states.dtype,
-            token_trays_mode=token_trays_mode,
-            rank3_scales=rank3_scales,
         )
 
     # Decode services also compile large prefill buckets. Apply the token

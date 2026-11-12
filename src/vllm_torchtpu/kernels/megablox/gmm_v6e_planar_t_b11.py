@@ -88,11 +88,15 @@ SCALE_GROUP = 32
 # are self-contained only when the chunk IS a window.
 PLANAR_WINDOW = 512
 
+# These kernels serve TPU v6e only (`is_supported_by_planar_t_b11`). Their
+# tiling and VMEM models read the v6e table rather than
+# `pltpu.get_tpu_info()` because they also run off TPU (interpret mode, CPU
+# tests), where the device query is unavailable.
+_V6E_INFO = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
+
 # TPU lane count: a Pallas block's minor dim must be a multiple of it
-# (or the whole array dim). A constant rather than
-# `pltpu.get_tpu_info().num_lanes` because the tiling and VMEM models also
-# run off TPU (interpret mode, CPU tests), where that query is unavailable.
-_LANES = 128
+# (or the whole array dim).
+_LANES = _V6E_INFO.num_lanes
 
 
 def _round_up(x: int, multiple: int) -> int:
@@ -100,9 +104,9 @@ def _round_up(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
-# Per grid step VMEM to stay under. Half of a 128 MiB budget, leaving
+# Per grid step VMEM to stay under. Half of the chip's VMEM, leaving
 # the rest for Mosaic's own scratch and any spill the scheduler needs.
-_VMEM_BUDGET = 64 * 1024 * 1024
+_VMEM_BUDGET = _V6E_INFO.vmem_capacity_bytes // 2
 
 # Mosaic's default per-kernel stack ("scoped vmem") limit, from
 # --xla_tpu_scoped_vmem_limit_kib=32768. A kernel whose live
@@ -615,7 +619,7 @@ def _b11_relabel_table(tn: int) -> jax.Array:
 # exponent-field subtraction on the e4m3b11 byte, so it is exact while the
 # folded code stays normal; e2m1's smallest magnitude (0.5) encodes at
 # E = 10, leaving 9 octaves of headroom. `planar_t_b11_window_ok` checks
-# it on concrete scales (the Kimi K3 checkpoint's 99th-percentile spread
+# it on concrete scales (a real checkpoint's 99th-percentile spread
 # is 2).
 B11_FOLD_WINDOW = 9
 
@@ -2140,6 +2144,8 @@ FUSED_VERIFY_MOE_TRAY_M = 128
 _FUSED_VERIFY_MOE_VMEM_BUDGET = 46 * 1024 * 1024
 # Per-kernel VMEM limit requested by the fused decode/verify kernel.
 _FUSED_DECODE_MOE_VMEM_LIMIT = 48 * 1024 * 1024
+# Fewest rows the single-tile variant is compiled for.
+_MIN_FUSED_DECODE_ROWS = 16
 
 
 # Expert slabs (w13 plus w2 of one expert) above this many bytes do not fit
@@ -2149,8 +2155,6 @@ _FUSED_DECODE_MAX_SLAB_BYTES = 30 * 1024 * 1024
 # slab (fetched during the expert's own gate+up compute instead of one
 # expert ahead) to stay inside its VMEM limit.
 _FUSED_DECODE_W2_SINGLE_BUFFER_MIN_N = 3072
-# Rows per tile of the rank-3 scale buffers (`rank3_scales`).
-_RANK3_SCALE_TILE_ROWS = 32
 
 
 def _w13_slab_bytes(k: int, n: int) -> int:
@@ -2244,62 +2248,25 @@ def can_use_fused_decode_moe_v6e_planar_t_b11(
     return True
 
 
-def _resolve_token_trays(m: int, token_trays_mode: str) -> tuple[bool, int, int, int]:
-    """Row loop of the fused kernel for `m` tokens.
+def _fused_decode_rows(m: int) -> tuple[int, int]:
+    """Row loop of the fused kernel for `m` tokens: `(padded_m, tray_m)`.
 
-    Returns:
-      `(use_trays, padded_m, tray_m, num_trays)`. Verify batches
-      (`m > FUSED_DECODE_MOE_MAX_TOKENS`) always use FUSED_VERIFY_MOE_TRAY_M-row
-      trays; smaller batches follow `token_trays_mode` (see
-      `fused_decode_moe_v6e_planar_t_b11`).
+    Up to FUSED_DECODE_MOE_MAX_TOKENS rows run as one tile
+    (`tray_m == padded_m`); verify batches above it run in
+    FUSED_VERIFY_MOE_TRAY_M-row trays.
 
     Raises:
-      ValueError: for more than FUSED_VERIFY_MOE_MAX_TOKENS tokens or an
-        unknown `token_trays_mode`.
+      ValueError: for more than FUSED_VERIFY_MOE_MAX_TOKENS tokens.
     """
-    trays_norm = (token_trays_mode or "off").strip().lower()
-    if m > FUSED_DECODE_MOE_MAX_TOKENS:
-        if m > FUSED_VERIFY_MOE_MAX_TOKENS:
-            raise ValueError(
-                f"fused_decode_moe_v6e_planar_t_b11 supports at most "
-                f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {m}."
-            )
-        tray_m = FUSED_VERIFY_MOE_TRAY_M
-        use_trays = True
-        padded_m = _round_up(m, tray_m)
-        num_trays = padded_m // tray_m
-    elif trays_norm == "off":
-        use_trays = False
-        padded_m = max(16, _round_up(m, 8))
-        tray_m = padded_m
-        num_trays = 1
-    elif trays_norm == "trays":
-        use_trays = True
-        padded_m = max(16, _round_up(m, 16))
-        tray_m = 16
-        num_trays = padded_m // tray_m
-    elif trays_norm == "trays2":
-        use_trays = True
-        padded_m = max(16, _round_up(m, 16))
-        tray_m = 32 if padded_m >= 64 else 16
-        num_trays = padded_m // tray_m
-    elif trays_norm == "trays32":
-        if m <= 16:
-            use_trays = False
-            padded_m = 16
-            tray_m = 16
-            num_trays = 1
-        else:
-            use_trays = True
-            padded_m = _round_up(m, 16)
-            tray_m = 16
-            num_trays = padded_m // tray_m
-    else:
+    if m > FUSED_VERIFY_MOE_MAX_TOKENS:
         raise ValueError(
-            f"Invalid token_trays_mode={token_trays_mode!r}; expected 'off', "
-            "'trays', 'trays2', or 'trays32'."
+            f"fused_decode_moe_v6e_planar_t_b11 supports at most "
+            f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {m}."
         )
-    return use_trays, padded_m, tray_m, num_trays
+    if m > FUSED_DECODE_MOE_MAX_TOKENS:
+        return _round_up(m, FUSED_VERIFY_MOE_TRAY_M), FUSED_VERIFY_MOE_TRAY_M
+    padded_m = max(_MIN_FUSED_DECODE_ROWS, _round_up(m, _V6E_INFO.num_sublanes))
+    return padded_m, padded_m
 
 
 def _fused_decode_routing(
@@ -2360,8 +2327,6 @@ def fused_decode_moe_v6e_planar_t_b11(
     *,
     activation: str,
     preferred_element_type: jax.typing.DTypeLike | None = None,
-    token_trays_mode: str = "off",
-    rank3_scales: bool = False,
 ) -> jax.Array:
     """Single-kernel routed MoE on TPU v6e for small token batches.
 
@@ -2373,8 +2338,7 @@ def fused_decode_moe_v6e_planar_t_b11(
 
     For speculative-decoding verify batches
     (`FUSED_DECODE_MOE_MAX_TOKENS < M <= FUSED_VERIFY_MOE_MAX_TOKENS`) the
-    row loop always runs in `FUSED_VERIFY_MOE_TRAY_M`-row trays and
-    `token_trays_mode` is ignored.
+    row loop runs in `FUSED_VERIFY_MOE_TRAY_M`-row trays.
 
     Args:
       hidden_states: `[M, K]` activations.
@@ -2387,18 +2351,12 @@ def fused_decode_moe_v6e_planar_t_b11(
         assignments this shard does not own).
       activation: expert activation (`'situ:<beta>:<linear_beta>'` or `'silu'`).
       preferred_element_type: output dtype (defaults to the activation dtype).
-      token_trays_mode: row loop for `M <= FUSED_DECODE_MOE_MAX_TOKENS`: 'off'
-        (one tile), 'trays' (16-row trays), 'trays2' (32-row trays from 64
-        rows) or 'trays32' (16-row trays above 16 rows).
-      rank3_scales: read the scales through rank-3 VMEM buffers when their row
-        count is a multiple of 32.
 
     Returns:
       `[M, K]` combined expert outputs.
 
     Raises:
-      ValueError: for more than `FUSED_VERIFY_MOE_MAX_TOKENS` tokens or an
-        unknown `token_trays_mode`.
+      ValueError: for more than `FUSED_VERIFY_MOE_MAX_TOKENS` tokens.
     """
     orig_m, k = hidden_states.shape
     num_groups, _, n = w13_pt.shape
@@ -2413,9 +2371,9 @@ def fused_decode_moe_v6e_planar_t_b11(
 
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
-    use_trays, padded_m, tray_m, num_trays = _resolve_token_trays(
-        orig_m, token_trays_mode
-    )
+    padded_m, tray_m = _fused_decode_rows(orig_m)
+    num_trays = padded_m // tray_m
+    use_trays = orig_m > FUSED_DECODE_MOE_MAX_TOKENS
     lhs, active_ids, num_active, w_expert = _fused_decode_routing(
         hidden_states, topk_weights, topk_ids, padded_m=padded_m, num_groups=num_groups
     )
@@ -2432,35 +2390,10 @@ def fused_decode_moe_v6e_planar_t_b11(
     depth_w13 = 2
     depth_w2 = _fused_decode_w2_depth(n)
 
-    use_rank3_w13 = bool(
-        rank3_scales and (w13_sc_3d.shape[1] % _RANK3_SCALE_TILE_ROWS == 0)
-    )
-    use_rank3_w2 = bool(
-        rank3_scales and (w2_sc_3d.shape[1] % _RANK3_SCALE_TILE_ROWS == 0)
-    )
-
     w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
-    w13_scales_in = (
-        w13_sc_3d
-        if use_rank3_w13
-        else w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
-    )
+    w13_scales_in = w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
     w2_packed_4d = w2_pt.reshape(num_groups, steps_2, plane_rows, k)
-    w2_scales_in = (
-        w2_sc_3d
-        if use_rank3_w2
-        else w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
-    )
-    w13_sbuf_shape = (
-        (depth_w13, w13_sc_3d.shape[1], n)
-        if use_rank3_w13
-        else (depth_w13, 2, steps_13, scale_rows, n)
-    )
-    w2_sbuf_shape = (
-        (depth_w2, w2_sc_3d.shape[1], k)
-        if use_rank3_w2
-        else (depth_w2, steps_2, scale_rows, k)
-    )
+    w2_scales_in = w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
 
     fold_chunk = _planar_t_fold_chunk(DEQUANT_PLANAR_T_B11)
     dims = (((1,), (0,)), ((), ()))
@@ -2500,24 +2433,6 @@ def fused_decode_moe_v6e_planar_t_b11(
         else:
             out_acc[...] = jnp.zeros_like(out_acc)
             lhs_tile = lhs_ref[...]
-
-        def get_w13_scale(slot, gate_or_up, cs, sl):
-            if use_rank3_w13:
-                r0 = (gate_or_up * steps_13 + cs) * scale_rows
-                tile_r0 = (r0 // _RANK3_SCALE_TILE_ROWS) * _RANK3_SCALE_TILE_ROWS
-                sub_r0 = r0 - tile_r0
-                tile32 = w13_sbuf[slot, pl.ds(tile_r0, _RANK3_SCALE_TILE_ROWS), sl]
-                return tile32[sub_r0 : sub_r0 + scale_rows, :]
-            return w13_sbuf[slot, gate_or_up, cs, :, sl]
-
-        def get_w2_scale(slot2, cs, sl2):
-            if use_rank3_w2:
-                r0 = cs * scale_rows
-                tile_r0 = (r0 // _RANK3_SCALE_TILE_ROWS) * _RANK3_SCALE_TILE_ROWS
-                sub_r0 = r0 - tile_r0
-                tile32 = w2_sbuf[slot2, pl.ds(tile_r0, _RANK3_SCALE_TILE_ROWS), sl2]
-                return tile32[sub_r0 : sub_r0 + scale_rows, :]
-            return w2_sbuf[slot2, cs, :, sl2]
 
         def copy_w13_expert(g, slot):
             return (
@@ -2586,7 +2501,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                         k_sl = pl.ds(cs * chunk, chunk)
                         # One weight unpack per chunk, shared by all trays.
                         g_codes, g_wscale = fold_chunk(
-                            w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
+                            w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
                         )
                         for tr in range(num_trays):
                             r_sl = pl.ds(tr * tray_m, tray_m)
@@ -2601,7 +2516,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                                 * g_wscale
                             )
                         u_codes, u_wscale = fold_chunk(
-                            w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
+                            w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
                         )
                         for tr in range(num_trays):
                             r_sl = pl.ds(tr * tray_m, tray_m)
@@ -2637,7 +2552,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                         n_sl = pl.ds(cs * chunk, chunk)
                         # One weight unpack per chunk, shared by all trays.
                         codes2, wscale2 = fold_chunk(
-                            w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
+                            w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
                         )
                         for tr in range(num_trays):
                             r_sl = pl.ds(tr * tray_m, tray_m)
@@ -2671,7 +2586,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                     for cs in range(steps_13):
                         lhs_chunk = tile[:, cs * chunk : (cs + 1) * chunk]
                         g_codes, g_wscale = fold_chunk(
-                            w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
+                            w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
                         )
                         gate_acc[...] += (
                             lax.dot_general(
@@ -2683,7 +2598,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                             * g_wscale
                         )
                         u_codes, u_wscale = fold_chunk(
-                            w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
+                            w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
                         )
                         up_acc[...] += (
                             lax.dot_general(
@@ -2713,7 +2628,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                     for cs in range(steps_2):
                         h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
                         codes2, wscale2 = fold_chunk(
-                            w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
+                            w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
                         )
                         w2_acc[...] += (
                             lax.dot_general(
@@ -2741,9 +2656,9 @@ def fused_decode_moe_v6e_planar_t_b11(
 
     scratch_shapes = [
         pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
-        pltpu.VMEM(w13_sbuf_shape, jnp.uint8),
+        pltpu.VMEM((depth_w13, 2, steps_13, scale_rows, n), jnp.uint8),
         pltpu.VMEM((depth_w2, steps_2, plane_rows, k), jnp.uint8),
-        pltpu.VMEM(w2_sbuf_shape, jnp.uint8),
+        pltpu.VMEM((depth_w2, steps_2, scale_rows, k), jnp.uint8),
         pltpu.VMEM((padded_m, tn13), jnp.float32),
         pltpu.VMEM((padded_m, tn13), jnp.float32),
         pltpu.VMEM((padded_m, tn2), jnp.float32),
@@ -2762,8 +2677,6 @@ def fused_decode_moe_v6e_planar_t_b11(
     kname = f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}"
     if use_trays:
         kname += f"_trays{num_trays}x{tray_m}"
-    if use_rank3_w13 or use_rank3_w2:
-        kname += "_s3d"
 
     out = pl.pallas_call(
         kernel,

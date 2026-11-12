@@ -289,11 +289,8 @@ def _fused_reference(weights, x, tw, ti):
     return out
 
 
-@pytest.mark.parametrize(
-    "m, num_pad, trays",
-    [(1, 0, "off"), (8, 2, "off"), (40, 0, "trays2"), (72, 4, "off")],
-)
-def test_fused_decode_matches_reference(weights, m, num_pad, trays):
+@pytest.mark.parametrize("m, num_pad", [(1, 0), (8, 2), (40, 0), (72, 4)])
+def test_fused_decode_matches_reference(weights, m, num_pad):
     x = _lhs(m, 400 + m)
     tw, ti = _routing(m, 500 + m, num_pad=num_pad)
     with pltpu.force_tpu_interpret_mode():
@@ -305,7 +302,6 @@ def test_fused_decode_matches_reference(weights, m, num_pad, trays):
             ti,
             activation=ACT,
             preferred_element_type=jnp.bfloat16,
-            token_trays_mode=trays,
         )
     assert out.shape == (m, K)
     _assert_close(out, _fused_reference(weights, x, tw, ti), rel=3e-2)
@@ -313,17 +309,7 @@ def test_fused_decode_matches_reference(weights, m, num_pad, trays):
         np.testing.assert_array_equal(np.asarray(out[m - num_pad :]), 0)
 
 
-def test_fused_decode_rejects_bad_requests(weights):
-    tw, ti = _routing(8, 1)
-    with pytest.raises(ValueError, match="token_trays_mode"):
-        gmm.fused_decode_moe_v6e_planar_t_b11(
-            _lhs(8, 1),
-            *weights["planar_t"],
-            tw,
-            ti,
-            activation=ACT,
-            token_trays_mode="trays4",
-        )
+def test_fused_decode_rejects_oversized_batches(weights):
     m = gmm.FUSED_VERIFY_MOE_MAX_TOKENS + 1
     tw, ti = _routing(m, 2)
     with pytest.raises(ValueError, match="at most"):
