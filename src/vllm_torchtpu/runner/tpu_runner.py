@@ -220,9 +220,7 @@ class ExecuteModelState:
     # metadata dict of the verify forward, so sample_tokens can commit each
     # request's accepted KDA prefix once rejection sampling is done. None
     # entries when O6a is inactive.
-    kda_commit_metadata_list: list[dict[str, Any] | None] = field(
-        default_factory=list
-    )
+    kda_commit_metadata_list: list[dict[str, Any] | None] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -2167,9 +2165,7 @@ class TPUModelRunner(GPUModelRunner):
         state_t = self._upload_host_temporary(
             torch.tensor(state_srcs, dtype=torch.long)
         )
-        ckpt_t = self._upload_host_temporary(
-            torch.tensor(ckpt_rows, dtype=torch.int32)
-        )
+        ckpt_t = self._upload_host_temporary(torch.tensor(ckpt_rows, dtype=torch.int32))
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
@@ -4772,9 +4768,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
-        kda_md_list = state.kda_commit_metadata_list or [None] * len(
-            state.logits_list
-        )
+        kda_md_list = state.kda_commit_metadata_list or [None] * len(state.logits_list)
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
