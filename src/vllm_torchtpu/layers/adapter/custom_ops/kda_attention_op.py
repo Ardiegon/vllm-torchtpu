@@ -27,6 +27,7 @@ from vllm.config import VllmConfig
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
     pooled_gdn_state_itemsize,
 )
@@ -520,7 +521,7 @@ def build_kimi_dispatched_kda_op(
 class _KdaPoolGeometry:
     """Static byte geometry of the KDA state regions inside one pool block."""
 
-    layout: object
+    layout: PooledGDNStateLayout
     tok_bytes: int
     split: int
     conv_shards: int
