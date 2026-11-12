@@ -1342,7 +1342,8 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         decode_batch_size=1,
         q_split=2,
     ),
-    # Kimi K3 TP8 (12 heads) & TP16 (6 heads) on TPU v6e, unified KDA+MLA BF16 pool (648-token pages).
+    # Kimi K3 TP8 (12 heads) & TP16 (6 heads) on TPU v6e, unified KDA+MLA BF16
+    # pool (648-token pages).
     TuningKey(
         case="mixed",
         max_num_tokens=1024,
@@ -1499,7 +1500,9 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
             else (256 if tuning_key.actual_num_q_heads > 8 else 512)
         )
         bq = min(max_bq, 1 << (tuning_key.max_num_tokens - 1).bit_length())
-        bkvp = 1 if page_size >= 512 else (4 if tuning_key.max_num_tokens <= 1024 else 8)
+        bkvp = (
+            1 if page_size >= 512 else (4 if tuning_key.max_num_tokens <= 1024 else 8)
+        )
         # Cap the f32 score tile (bq * heads x bkvp * page) to the largest one
         # the K3 target uses (24 heads x 128 q x 1294-token TP4 page = 3.97 M
         # elements). 16 local heads with the TP4 page (the 64-head DSpark draft
