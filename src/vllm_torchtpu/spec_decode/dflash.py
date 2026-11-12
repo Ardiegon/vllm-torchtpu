@@ -204,14 +204,6 @@ class DFlashProposer:
         )
 
         self._load_draft_model()
-        assert self.draft_model is not None
-        draft_param_bytes = sum(
-            t.numel() * t.element_size() for t in self.draft_model.parameters()
-        )
-        logger.info(
-            "Draft model weights (local shard, before target sharing): %.1f MiB/chip.",
-            draft_param_bytes / 2**20,
-        )
 
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config, AttentionLayerBase
