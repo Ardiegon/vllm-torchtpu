@@ -39,18 +39,18 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     DEFAULT_MAX_DMA_TOKENS,
     DP_AXIS_NAME,
     TP_AXIS_NAME,
-    _axis_tuple,
-    _normalize_axis_name,
+    axis_tuple,
     kimi_guarded_all_gather_cols,
     kimi_guarded_all_gather_rows,
     kimi_guarded_psum,
     kimi_guarded_psum_scatter_rows,
+    normalize_axis_name,
 )
 
-_REGISTERED_TORCH_OPS: dict[tuple[Any, ...], Callable[[torch.Tensor], torch.Tensor]] = {}
+REGISTERED_OPS: dict[tuple[Any, ...], Callable[[torch.Tensor], torch.Tensor]] = {}
 
 
-def _sanitize_tag(tag: str) -> str:
+def sanitize_tag(tag: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", tag)
     return cleaned or "v1"
 
@@ -68,17 +68,17 @@ def format_pallas_dma_op_name(
     variant_tag: str,
 ) -> str:
     """Construct a unique ``pallas::...`` custom-op name encoding all variant knobs (D87)."""
-    ax_str = "_".join(_axis_tuple(axis_name))
-    v_str = _sanitize_tag(variant_tag)
-    rmem_str = _sanitize_tag(recv_memory_space)
+    ax_str = "_".join(axis_tuple(axis_name))
+    v_str = sanitize_tag(variant_tag)
+    rmem_str = sanitize_tag(recv_memory_space)
     return (
-        f"pallas::kimi_{_sanitize_tag(kind)}_{_sanitize_tag(spec_tag)}"
+        f"pallas::kimi_{sanitize_tag(kind)}_{sanitize_tag(spec_tag)}"
         f"_ax_{ax_str}_cid{int(collective_id)}_rmem_{rmem_str}"
         f"_cap{int(max_dma_tokens)}_dp{int(dp_size)}_tp{int(tp_size)}_{v_str}"
     )
 
 
-def _mesh_shape_and_ids(mesh: Mesh) -> tuple[int, int, tuple[int, ...]]:
+def mesh_shape_and_ids(mesh: Mesh) -> tuple[int, int, tuple[int, ...]]:
     if tuple(mesh.axis_names) != (DP_AXIS_NAME, TP_AXIS_NAME):
         raise ValueError(
             f"Expected mesh.axis_names == ('dp', 'tp'), got {mesh.axis_names}"
@@ -100,7 +100,7 @@ def build_pallas_all_gather_cols_op(
     """Build ``PartitionSpec('dp', 'tp') -> PartitionSpec('dp', None)`` column all-gather."""
     if axis_name != TP_AXIS_NAME:
         raise ValueError(f"all_gather_cols expects axis_name='tp', got {axis_name!r}")
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
+    dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
     in_spec = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME)
     out_spec = PartitionSpec(DP_AXIS_NAME, None)
     out_sharding = NamedSharding(mesh, out_spec)
@@ -117,8 +117,8 @@ def build_pallas_all_gather_cols_op(
         variant_tag=variant_tag,
     )
     cache_key = ("ag_cols", op_name, dev_ids)
-    if cache_key in _REGISTERED_TORCH_OPS:
-        return _REGISTERED_TORCH_OPS[cache_key]
+    if cache_key in REGISTERED_OPS:
+        return REGISTERED_OPS[cache_key]
 
     def _ag_cols_jax(x: jax.Array) -> jax.Array:
         def _local(part: jax.Array) -> jax.Array:
@@ -152,7 +152,7 @@ def build_pallas_all_gather_cols_op(
         return raw_op(x)
 
     _call._qualname = op_name  # type: ignore[attr-defined]
-    _REGISTERED_TORCH_OPS[cache_key] = _call
+    REGISTERED_OPS[cache_key] = _call
     return _call
 
 
@@ -177,9 +177,9 @@ def build_pallas_all_gather_rows_op(
         ``(dp, tp)`` rank holds its own independent ``[B_in, D]`` rows, passed
         via zero-copy ``x.unsqueeze(1)`` with ``PartitionSpec('dp', 'tp', None)``.
     """
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
-    axis_key = _normalize_axis_name(axis_name)
-    axes_t = _axis_tuple(axis_key)
+    dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
+    axis_key = normalize_axis_name(axis_name)
+    axes_t = axis_tuple(axis_key)
     if axes_t == (DP_AXIS_NAME,):
         gather_factor = dp_size
     elif axes_t == (TP_AXIS_NAME,):
@@ -211,8 +211,8 @@ def build_pallas_all_gather_rows_op(
         variant_tag=variant_tag,
     )
     cache_key = ("ag_rows", op_name, dev_ids)
-    if cache_key in _REGISTERED_TORCH_OPS:
-        return _REGISTERED_TORCH_OPS[cache_key]
+    if cache_key in REGISTERED_OPS:
+        return REGISTERED_OPS[cache_key]
 
     if input_sharding == "dp_replicated":
         in_spec = PartitionSpec(DP_AXIS_NAME, None)
@@ -253,7 +253,7 @@ def build_pallas_all_gather_rows_op(
             return raw_op(x)
 
         _call_dp_rep._qualname = op_name  # type: ignore[attr-defined]
-        _REGISTERED_TORCH_OPS[cache_key] = _call_dp_rep
+        REGISTERED_OPS[cache_key] = _call_dp_rep
         return _call_dp_rep
 
     # rank_unshared: 3D view [B_in, 1, D] partitioned across ('dp', 'tp', None).
@@ -310,7 +310,7 @@ def build_pallas_all_gather_rows_op(
         return y.squeeze(1) if squeeze_out else y
 
     _call_unshared._qualname = op_name  # type: ignore[attr-defined]
-    _REGISTERED_TORCH_OPS[cache_key] = _call_unshared
+    REGISTERED_OPS[cache_key] = _call_unshared
     return _call_unshared
 
 
@@ -324,9 +324,9 @@ def build_pallas_psum_op(
     variant_tag: str = "opt2d_1",
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build deterministic 1-shot Pallas ``psum`` over ``'tp'``, ``'dp'``, or ``('dp', 'tp')``."""
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
-    axis_key = _normalize_axis_name(axis_name)
-    axes_t = _axis_tuple(axis_key)
+    dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
+    axis_key = normalize_axis_name(axis_name)
+    axes_t = axis_tuple(axis_key)
 
     in_spec_3d = PartitionSpec(DP_AXIS_NAME, TP_AXIS_NAME, None)
     if axes_t == (TP_AXIS_NAME,):
@@ -353,8 +353,8 @@ def build_pallas_psum_op(
         variant_tag=variant_tag,
     )
     cache_key = ("psum", op_name, dev_ids)
-    if cache_key in _REGISTERED_TORCH_OPS:
-        return _REGISTERED_TORCH_OPS[cache_key]
+    if cache_key in REGISTERED_OPS:
+        return REGISTERED_OPS[cache_key]
 
     out_sharding = NamedSharding(mesh, out_spec)
 
@@ -397,7 +397,7 @@ def build_pallas_psum_op(
         return y.squeeze(1) if squeeze_out else y
 
     _call._qualname = op_name  # type: ignore[attr-defined]
-    _REGISTERED_TORCH_OPS[cache_key] = _call
+    REGISTERED_OPS[cache_key] = _call
     return _call
 
 
@@ -411,9 +411,9 @@ def build_pallas_psum_scatter_rows_op(
     variant_tag: str = "opt2d_1",
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Build deterministic 1-shot Pallas ``psum_scatter_rows`` over ``'dp'``, ``'tp'``, or ``('dp', 'tp')``."""
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
-    axis_key = _normalize_axis_name(axis_name)
-    axes_t = _axis_tuple(axis_key)
+    dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
+    axis_key = normalize_axis_name(axis_name)
+    axes_t = axis_tuple(axis_key)
     if axes_t == (DP_AXIS_NAME,):
         scatter_factor = dp_size
     elif axes_t == (TP_AXIS_NAME,):
@@ -439,8 +439,8 @@ def build_pallas_psum_scatter_rows_op(
         variant_tag=variant_tag,
     )
     cache_key = ("rs_rows", op_name, dev_ids)
-    if cache_key in _REGISTERED_TORCH_OPS:
-        return _REGISTERED_TORCH_OPS[cache_key]
+    if cache_key in REGISTERED_OPS:
+        return REGISTERED_OPS[cache_key]
 
     def _rs_jax(x3d: jax.Array) -> jax.Array:
         def _local(part3d: jax.Array) -> jax.Array:
@@ -479,5 +479,5 @@ def build_pallas_psum_scatter_rows_op(
         return raw_op(x.unsqueeze(1)).squeeze(1)
 
     _call._qualname = op_name  # type: ignore[attr-defined]
-    _REGISTERED_TORCH_OPS[cache_key] = _call
+    REGISTERED_OPS[cache_key] = _call
     return _call

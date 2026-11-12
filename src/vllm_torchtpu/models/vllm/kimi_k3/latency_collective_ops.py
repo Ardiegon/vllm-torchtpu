@@ -21,7 +21,7 @@ Provides:
      ``12 -> 4`` on ``4``-MoE ``L5``).
   2. Warm-cache-safe custom-op variant tagging (`D87`) encoding all active
      `O2` environment toggles directly into `pallas::kimi_*` custom-op names.
-  3. Pre-built `@jax_op` bundle (`KimiO2Collectives`) with JAX-internal
+  3. Pre-built `@jax_op` bundle (`KimiDmaCollectives`) with JAX-internal
      ``T_padded <= max_dma_tokens`` width guards (`T_padded <= 64` 1-shot Pallas
      remote-DMA, `T_padded > 64` `jax.lax.*` ring fallback inside JAX — zero
      Python branching on symbolic `num_tokens`) across the non-overlapping
@@ -65,12 +65,12 @@ from vllm_torchtpu.kernels.kimi_k3.polish import normalize_compute_polish_mode
 from vllm_torchtpu.kernels.kimi_k3.spec_kda import normalize_spec_kda_mode
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
-    _mesh_shape_and_ids,
-    _sanitize_tag,
     build_pallas_all_gather_cols_op,
     build_pallas_all_gather_rows_op,
     build_pallas_psum_op,
     build_pallas_psum_scatter_rows_op,
+    mesh_shape_and_ids,
+    sanitize_tag,
 )
 
 logger = init_logger(__name__)
@@ -106,7 +106,7 @@ def normalize_latency_tp_psum_mode(raw: str | None) -> str:
     )
 
 
-def kimi_o2_variant_tag() -> str:
+def kimi_dma_variant_tag() -> str:
     """Return a cache-safe variant tag encoding all active O2/O4/O5 env flags (`D87`)."""
     tp_mode = normalize_latency_tp_psum_mode(envs.TPU_KIMI_OPT_LATENCY_TP_PSUM)
     raw_ef = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
@@ -125,7 +125,7 @@ def kimi_o2_variant_tag() -> str:
     if ef_mode == "off":
         tag = base
     else:
-        raw_ef_tok = _sanitize_tag(raw_ef)
+        raw_ef_tok = sanitize_tag(raw_ef)
         if raw_ef_tok == ef_mode:
             tag = f"{base}_ef_{ef_mode}"
         else:
@@ -137,7 +137,7 @@ def kimi_o2_variant_tag() -> str:
     return tag
 
 
-def _pack_dispatch_metadata(
+def pack_dispatch_metadata(
     topk_ids_i32: torch.Tensor,
     topk_weights_bf16: torch.Tensor,
 ) -> torch.Tensor:
@@ -167,7 +167,7 @@ def _pack_dispatch_metadata(
     return torch.cat((low_bf16, high_bf16, w_bf16), dim=-1)
 
 
-def _pack_dp_dispatch(
+def pack_dp_dispatch(
     latent_bf16: torch.Tensor,
     topk_ids_i32: torch.Tensor,
     topk_weights_bf16: torch.Tensor,
@@ -178,11 +178,11 @@ def _pack_dp_dispatch(
         if latent_bf16.dtype == torch.bfloat16
         else latent_bf16.to(torch.bfloat16)
     )
-    meta_bf16 = _pack_dispatch_metadata(topk_ids_i32, topk_weights_bf16)
+    meta_bf16 = pack_dispatch_metadata(topk_ids_i32, topk_weights_bf16)
     return torch.cat((x_bf16, meta_bf16), dim=-1)
 
 
-def _unpack_dp_dispatch(
+def unpack_dp_dispatch(
     packed_bf16: torch.Tensor,
     latent_dim: int,
     topk: int,
@@ -197,7 +197,7 @@ def _unpack_dp_dispatch(
 
 
 @dataclass(frozen=True)
-class KimiO2Collectives:
+class KimiDmaCollectives:
     """Pre-built Phase O2/O4 `@jax_op` callables attached at model load time."""
 
     variant_tag: str
@@ -228,12 +228,12 @@ class KimiO2Collectives:
         )
 
     def attach_to_moe(self, moe_module: Any) -> None:
-        moe_module._o2_tp_latent_ag_op = self.tp_latent_ag_op
-        moe_module._o2_dp_packed_ag_op = self.dp_packed_ag_op
-        moe_module._o2_dp_combine_rs_op = self.dp_combine_rs_op
-        moe_module._o2_tp_routed_psum_op = self.tp_routed_psum_op
-        moe_module._o2_tp_moe_exit_psum_op = self.tp_moe_exit_psum_op
-        can_attach_o4 = (
+        moe_module._dma_tp_latent_ag_op = self.tp_latent_ag_op
+        moe_module._dma_dp_packed_ag_op = self.dp_packed_ag_op
+        moe_module._dma_dp_combine_rs_op = self.dp_combine_rs_op
+        moe_module._dma_tp_routed_psum_op = self.tp_routed_psum_op
+        moe_module._dma_tp_moe_exit_psum_op = self.tp_moe_exit_psum_op
+        can_attach_ep_overlap = (
             self.exit_fold_mode != "off"
             and self.mesh is not None
             and getattr(moe_module, "w_routed_down_tp", None) is not None
@@ -241,7 +241,7 @@ class KimiO2Collectives:
             and getattr(moe_module, "packed_moe_out_weight", None) is not None
             and bool(getattr(moe_module, "use_ep", False))
         )
-        if can_attach_o4:
+        if can_attach_ep_overlap:
             tp_rank = (
                 int(torch.distributed.get_rank()) % self.tp_size
                 if torch.distributed.is_initialized()
@@ -261,16 +261,16 @@ class KimiO2Collectives:
                         dev = p.device
                         break
             moe_module.register_buffer(
-                "_o2_tp_rank_buf",
+                "_dma_tp_rank_buf",
                 torch.tensor([[tp_rank]], dtype=torch.int32, device=dev),
                 persistent=False,
             )
         else:
-            moe_module._o2_tp_rank_buf = None
+            moe_module._dma_tp_rank_buf = None
 
-        if can_attach_o4:
+        if can_attach_ep_overlap:
             assert self.mesh is not None
-            moe_module._o4_ep_overlap_op = build_kimi_moe_ep_overlap_op(
+            moe_module._ep_overlap_op = build_kimi_moe_ep_overlap_op(
                 self.mesh,
                 moe_module,
                 exit_fold_mode=self.exit_fold_mode,
@@ -278,7 +278,7 @@ class KimiO2Collectives:
                 variant_tag=self.variant_tag,
             )
         else:
-            moe_module._o4_ep_overlap_op = None
+            moe_module._ep_overlap_op = None
 
     def attach_to_attn(self, attn_module: Any) -> None:
         attn_module._tp_exit_psum_op = self.tp_attn_mlp_psum_op
@@ -295,14 +295,14 @@ class KimiO2Collectives:
             mlp_module._tp_exit_psum_op = self.tp_attn_mlp_psum_op
 
 
-def build_kimi_o2_collectives(
+def build_kimi_dma_collectives(
     mesh: Mesh,
     *,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-) -> KimiO2Collectives:
+) -> KimiDmaCollectives:
     """Pre-build active O2/O4 `@jax_op` callables outside `torch.compile`."""
-    dp_size, tp_size, _ = _mesh_shape_and_ids(mesh)
-    vtag = kimi_o2_variant_tag()
+    dp_size, tp_size, _ = mesh_shape_and_ids(mesh)
+    vtag = kimi_dma_variant_tag()
     use_lat = bool(envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES)
     tp_psum_mode = normalize_latency_tp_psum_mode(envs.TPU_KIMI_OPT_LATENCY_TP_PSUM)
     ef_mode = normalize_exit_fold_mode(envs.TPU_KIMI_OPT_EXIT_FOLD)
@@ -394,7 +394,7 @@ def build_kimi_o2_collectives(
                 variant_tag=vtag,
             )
 
-    bundle = KimiO2Collectives(
+    bundle = KimiDmaCollectives(
         variant_tag=vtag,
         dp_size=dp_size,
         tp_size=tp_size,

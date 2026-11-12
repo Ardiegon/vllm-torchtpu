@@ -51,9 +51,9 @@ from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 from .latency_collective_ops import (
-    _pack_dispatch_metadata,
-    _pack_dp_dispatch,
-    _unpack_dp_dispatch,
+    pack_dispatch_metadata,
+    pack_dp_dispatch,
+    unpack_dp_dispatch,
 )
 from .layers import KimiMLP, quantize_weight_w8a16, w8a16_matmul
 
@@ -384,7 +384,7 @@ class KimiMoE(nn.Module):
                 (down_group is not None and down_group.world_size == self.tp_size and down_cols == latent_local)
                 or (down_group is None and down_cols == latent_dim)
             )
-            use_o4_split = (
+            use_ep_overlap_split = (
                 is_exit_fold_active()
                 and self.use_ep
                 and get_pcp_world_size() == 1
@@ -392,7 +392,7 @@ class KimiMoE(nn.Module):
                 and hierarchical_split_or_none() is None
                 and can_split_down_tp
             )
-            if use_o4_split:
+            if use_ep_overlap_split:
                 w_down_tp = (
                     w_down.contiguous()
                     if down_cols == latent_local
@@ -439,7 +439,7 @@ class KimiMoE(nn.Module):
             getattr(self, "w_routed_down_tp", None) is not None
             and getattr(self, "w_shared_gu", None) is not None
             and getattr(self, "packed_moe_out_weight", None) is not None
-            and getattr(self, "_o4_ep_overlap_op", None) is not None
+            and getattr(self, "_ep_overlap_op", None) is not None
         ):
             output = self._forward_async_ep_unified(hidden_states)
             return output.view(num_tokens, hidden_size)
@@ -462,11 +462,11 @@ class KimiMoE(nn.Module):
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
             topk_ids, topk_weights, is_local_tensor=True
         )
-        packed_meta = _pack_dispatch_metadata(topk_ids, topk_weights)
+        packed_meta = pack_dispatch_metadata(topk_ids, topk_weights)
         assert self.w_routed_down_tp is not None
         assert self.packed_moe_out_weight is not None
         routed_down_local = hidden_states @ self.w_routed_down_tp
-        combined_in = self._o4_ep_overlap_op(  # type: ignore[misc]
+        combined_in = self._ep_overlap_op(  # type: ignore[misc]
             hidden_states,
             routed_down_local,
             packed_meta,
@@ -474,7 +474,7 @@ class KimiMoE(nn.Module):
         )
         out_partial = combined_in @ self.packed_moe_out_weight
         if self.tp_size > 1:
-            tp_moe_exit_psum_op = getattr(self, "_o2_tp_moe_exit_psum_op", None)
+            tp_moe_exit_psum_op = getattr(self, "_dma_tp_moe_exit_psum_op", None)
             if tp_moe_exit_psum_op is not None:
                 return tp_moe_exit_psum_op(out_partial)
             return tensor_model_parallel_all_reduce(out_partial)
@@ -502,11 +502,11 @@ class KimiMoE(nn.Module):
         routed = self.experts.routed_experts
         dp_size = routed.moe_config.dp_size if self.use_ep else 1
         pcp_size = get_pcp_world_size() if self.use_ep else 1
-        tp_latent_ag_op = getattr(self, "_o2_tp_latent_ag_op", None)
-        dp_packed_ag_op = getattr(self, "_o2_dp_packed_ag_op", None)
-        dp_combine_rs_op = getattr(self, "_o2_dp_combine_rs_op", None)
-        tp_routed_psum_op = getattr(self, "_o2_tp_routed_psum_op", None)
-        tp_moe_exit_psum_op = getattr(self, "_o2_tp_moe_exit_psum_op", None)
+        tp_latent_ag_op = getattr(self, "_dma_tp_latent_ag_op", None)
+        dp_packed_ag_op = getattr(self, "_dma_dp_packed_ag_op", None)
+        dp_combine_rs_op = getattr(self, "_dma_dp_combine_rs_op", None)
+        tp_routed_psum_op = getattr(self, "_dma_tp_routed_psum_op", None)
+        tp_moe_exit_psum_op = getattr(self, "_dma_tp_moe_exit_psum_op", None)
         use_packed_dp = bool(
             self.use_ep
             and dp_size > 1
@@ -533,13 +533,13 @@ class KimiMoE(nn.Module):
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights, is_local_tensor=True
             )
-            packed_payload = _pack_dp_dispatch(latent, topk_ids, topk_weights)
+            packed_payload = pack_dp_dispatch(latent, topk_ids, topk_weights)
             gathered_payload = (
                 dp_packed_ag_op(packed_payload)
                 if dp_packed_ag_op is not None
                 else get_dp_group().all_gather(packed_payload, dim=0)
             )
-            ag_latent, ag_ids, ag_weights = _unpack_dp_dispatch(
+            ag_latent, ag_ids, ag_weights = unpack_dp_dispatch(
                 gathered_payload, latent.shape[-1], topk_ids.shape[-1]
             )
             moe_out = routed.quant_method.apply_with_routing(

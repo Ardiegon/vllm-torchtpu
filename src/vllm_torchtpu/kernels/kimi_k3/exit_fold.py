@@ -68,7 +68,7 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     DEFAULT_VMEM_MAX_TOKENS,
     DP_AXIS_NAME,
     TP_AXIS_NAME,
-    _normalize_axis_name,
+    normalize_axis_name,
     barrier_and_allocate,
     call_kernel,
     kimi_guarded_all_gather_cols,
@@ -260,7 +260,7 @@ def async_ep_dispatch_start(
     collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
 ) -> tuple[AsyncDispatchState | jax.Array, jax.Array]:
     """Barrier-allocate buffers and launch non-blocking 1-shot remote-DMA gather."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
     if world_size == 1:
         return send_shard[None, :, :], jnp.zeros((1,), dtype=jnp.int32)
@@ -353,7 +353,7 @@ def async_ep_dispatch_wait(
     zero_extra_copy: bool = False,
 ) -> jax.Array:
     """Wait on in-flight async EP dispatch DMAs, drain sends (`0` leak), and unpack."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
     if world_size == 1:
         assert isinstance(state, jax.Array)
@@ -1523,9 +1523,9 @@ def build_kimi_moe_ep_overlap_op(
     """Build (or reuse cached) unified `kimi_moe_ep_overlap` `@jax_op` across layers."""
     # Imported here: kernels/ must not import models/ at module load (cycle).
     from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
-        _REGISTERED_TORCH_OPS,
-        _mesh_shape_and_ids,
-        _sanitize_tag,
+        REGISTERED_OPS,
+        mesh_shape_and_ids,
+        sanitize_tag,
         format_pallas_dma_op_name,
     )
 
@@ -1533,7 +1533,7 @@ def build_kimi_moe_ep_overlap_op(
     if norm_mode == "off":
         raise ValueError("build_kimi_moe_ep_overlap_op requires an active exit_fold_mode")
 
-    dp_size, tp_size, dev_ids = _mesh_shape_and_ids(mesh)
+    dp_size, tp_size, dev_ids = mesh_shape_and_ids(mesh)
     cfg = _extract_moe_overlap_config(moe_module)
     cfg_sig = (
         cfg["moe_act_str"],
@@ -1559,7 +1559,7 @@ def build_kimi_moe_ep_overlap_op(
         else ""
     )
     spec_tag = (
-        f"{norm_mode}{impl_tag}_k{cfg['topk']}_{_sanitize_tag(cfg['shared_act_kind'])}"
+        f"{norm_mode}{impl_tag}_k{cfg['topk']}_{sanitize_tag(cfg['shared_act_kind'])}"
         f"_q{int(cfg['has_scales'])}_n{int(cfg['use_norm'])}"
     )
     op_name = format_pallas_dma_op_name(
@@ -1577,8 +1577,8 @@ def build_kimi_moe_ep_overlap_op(
     )
     raw_key = ("moe_ep_overlap_raw", op_name, dev_ids, cfg_sig)
 
-    if raw_key in _REGISTERED_TORCH_OPS:
-        raw_op = _REGISTERED_TORCH_OPS[raw_key]
+    if raw_key in REGISTERED_OPS:
+        raw_op = REGISTERED_OPS[raw_key]
     else:
         from torch.tpu.pallas import jax_op
 
@@ -1616,7 +1616,7 @@ def build_kimi_moe_ep_overlap_op(
             return_annotation=torch.Tensor,
         )
         raw_op.register_fake(_fake_fn)
-        _REGISTERED_TORCH_OPS[raw_key] = raw_op  # type: ignore[assignment]
+        REGISTERED_OPS[raw_key] = raw_op  # type: ignore[assignment]
 
     has_scales = bool(cfg["has_scales"])
     has_bias = bool(cfg["has_bias"])
@@ -1657,7 +1657,7 @@ def build_kimi_moe_ep_overlap_op(
         if use_norm:
             call_args.append(layer_moe.routed_expert_norm.weight)
         call_args.append(routed._experts_start.reshape(1, 1))
-        call_args.append(layer_moe._o2_tp_rank_buf)
+        call_args.append(layer_moe._dma_tp_rank_buf)
         return raw_op(*call_args)
 
     _call._qualname = op_name  # type: ignore[attr-defined]
@@ -1781,13 +1781,13 @@ def inspect_kimi_moe_ep_overlap_hlo(
     from torch_tpu._internal.pallas import pallas as pallas_impl
 
     from vllm_torchtpu.models.vllm.kimi_k3.dma_collective_ops import (
-        _mesh_shape_and_ids,
+        mesh_shape_and_ids,
     )
 
     mode = normalize_exit_fold_mode(
         envs.TPU_KIMI_OPT_EXIT_FOLD if exit_fold_mode is None else exit_fold_mode
     )
-    dp_size, tp_size, _ = _mesh_shape_and_ids(mesh)
+    dp_size, tp_size, _ = mesh_shape_and_ids(mesh)
     cfg = _extract_moe_overlap_config(moe_module)
     jax_fn, in_specs, out_spec, _ = _make_moe_ep_overlap_jax_fn(
         mesh,
@@ -1824,7 +1824,7 @@ def inspect_kimi_moe_ep_overlap_hlo(
     if cfg["use_norm"]:
         sample_torch_args.append(moe_module.routed_expert_norm.weight)
     sample_torch_args.append(routed._experts_start.reshape(1, 1))
-    sample_torch_args.append(moe_module._o2_tp_rank_buf)
+    sample_torch_args.append(moe_module._dma_tp_rank_buf)
 
     jax_avals = pallas_impl.jax_placeholders(
         sample_torch_args, mesh=mesh, partition_specs=in_specs

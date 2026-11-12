@@ -62,7 +62,7 @@ TP_AXIS_NAME = "tp"
 # Unified Non-Overlapping Kimi K3 `collective_id` Barrier Registry (0..6)
 # =============================================================================
 COLLECTIVE_ID_MOE_TP_LATENT_AG = 0       # 'tp': KimiMoE routed_down_local [B_dp, 224->256]
-COLLECTIVE_ID_MOE_DP_DISPATCH_AG = 1     # 'dp' / ('dp','tp'): _pack_dp_dispatch [B_dp, 3632->3712]
+COLLECTIVE_ID_MOE_DP_DISPATCH_AG = 1     # 'dp' / ('dp','tp'): pack_dp_dispatch [B_dp, 3632->3712]
 COLLECTIVE_ID_MOE_DP_COMBINE_RS = 2      # 'dp': post-MoE combine psum_scatter_rows [B_glob, 3584]
 COLLECTIVE_ID_MOE_TP_ROUTED_PSUM = 3     # 'tp': KimiMoE routed_out psum [B_dp, 3584]
 COLLECTIVE_ID_ATTN_MLP_TP_EXIT_PSUM = 4  # 'tp': KDA/MLA o_proj + L0 KimiMLP.down_proj [B_dp, 7168]
@@ -76,7 +76,7 @@ DEFAULT_MAX_DMA_TOKENS = 64
 DEFAULT_VMEM_MAX_TOKENS = 8
 
 
-def _normalize_axis_name(axis_name: str | Sequence[str]) -> str | tuple[str, ...]:
+def normalize_axis_name(axis_name: str | Sequence[str]) -> str | tuple[str, ...]:
     """Return a hashable axis identifier suitable for ``lax`` and Pallas ``device_id``."""
     if isinstance(axis_name, str):
         return axis_name
@@ -86,7 +86,7 @@ def _normalize_axis_name(axis_name: str | Sequence[str]) -> str | tuple[str, ...
     return axes[0] if len(axes) == 1 else axes
 
 
-def _axis_tuple(axis_name: str | Sequence[str]) -> tuple[str, ...]:
+def axis_tuple(axis_name: str | Sequence[str]) -> tuple[str, ...]:
     return (axis_name,) if isinstance(axis_name, str) else tuple(axis_name)
 
 
@@ -258,7 +258,7 @@ def barrier_and_allocate(
     scheduling across consecutive collectives sharing ``collective_id``, while
     ``to_alloc``'s dataflow into ``run_dense_a2a`` prevents DCE.
     """
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     in_args: tuple[Any, ...] = ()
     in_specs: Any = ()
     if order_dep is not None:
@@ -375,7 +375,7 @@ def run_dense_a2a(
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
     """Complete the barrier, push ``N - 1`` remote DMAs + local VMEM copy, and wait."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
 
     def kernel(
@@ -748,7 +748,7 @@ def dense_all_to_all(
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
     """One-shot Pallas remote-DMA all-to-all over ``axis_name``."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     split_axis = split_axis if split_axis >= 0 else split_axis + len(x.shape)
     concat_axis = concat_axis if concat_axis >= 0 else concat_axis + len(x.shape)
 
@@ -898,7 +898,7 @@ def latency_all_gather_rows(
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
     """1-shot Pallas remote-DMA row all-gather: ``[rows, ...] -> [Ax * rows, ...]``."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     if axis_size == 1:
         return x
@@ -927,7 +927,7 @@ def latency_all_gather_cols(
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
     """1-shot Pallas remote-DMA trailing-dim gather: ``[rows, D] -> [rows, Ax * D]``."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     if axis_size == 1:
         return x
@@ -954,7 +954,7 @@ def latency_psum(
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
     """Deterministic 1-shot Pallas remote-DMA all-reduce over ``axis_name``."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     if axis_size == 1:
         return x
@@ -980,7 +980,7 @@ def latency_psum_scatter_rows(
     recv_memory_space: str = "hbm",
 ) -> jax.Array:
     """Deterministic 1-shot Pallas remote-DMA row reduce-scatter: ``[Ax*rows, ...] -> [rows, ...]``."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     if axis_size == 1:
         return x
@@ -1008,7 +1008,7 @@ def kimi_guarded_all_gather_rows(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
 ) -> jax.Array:
     """JAX-internal width-guarded row all-gather (1-shot Pallas for ``<= max_dma_tokens``)."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows = x.shape[0]
     if rows <= max_dma_tokens and rows * axis_size <= 1024:
@@ -1033,7 +1033,7 @@ def kimi_guarded_all_gather_cols(
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
 ) -> jax.Array:
     """JAX-internal width-guarded column all-gather (1-shot Pallas for ``<= max_dma_tokens``)."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows = x.shape[0]
     if rows <= max_dma_tokens and rows * axis_size <= 1024:
@@ -1059,7 +1059,7 @@ def kimi_guarded_psum(
     vmem_max_tokens: int = DEFAULT_VMEM_MAX_TOKENS,
 ) -> jax.Array:
     """JAX-internal width-guarded all-reduce (1-shot Pallas for ``<= max_dma_tokens``)."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows = x.shape[0]
     if rows <= max_dma_tokens and rows * axis_size <= 1024:
@@ -1091,7 +1091,7 @@ def kimi_guarded_psum_scatter_rows(
     vmem_max_tokens: int = DEFAULT_VMEM_MAX_TOKENS,
 ) -> jax.Array:
     """JAX-internal width-guarded row reduce-scatter (1-shot Pallas for ``<= max_dma_tokens``)."""
-    axis_key = _normalize_axis_name(axis_name)
+    axis_key = normalize_axis_name(axis_name)
     axis_size = jax.lax.axis_size(axis_key)
     rows_out = x.shape[0] // axis_size
     if rows_out <= max_dma_tokens and x.shape[0] <= 1024:

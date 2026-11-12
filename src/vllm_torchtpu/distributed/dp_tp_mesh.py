@@ -19,7 +19,7 @@ slices. Reshaping a hardware-sorted 1D mesh to ``(dp_size, tp_size)`` would
 scramble ``('dp', 'tp')`` coordinates relative to vLLM's ``dp_group`` and
 ``tp_group``.
 
-Instead, ``build_ep_2d_mesh`` constructs a PyTorch-rank-ordered 2D mesh via
+Instead, ``build_dp_tp_mesh`` constructs a PyTorch-rank-ordered 2D mesh via
 ``torch_tpu._internal.pallas.get_pallas_mesh(axis_names=('dp', 'tp'),
 mesh_shape=(dp_size, tp_size))`` (mirroring ``dcp.get_or_create_dcp_mesh``),
 asserts on every worker that ``dp_group.ranks == mesh_ranks[:, tp_rank]`` and
@@ -40,12 +40,12 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import DP_AXIS_NAME, TP_AXIS_NAME
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-KIMI_2D_MESH_AXES: tuple[str, str] = (DP_AXIS_NAME, TP_AXIS_NAME)
+DP_TP_MESH_AXES: tuple[str, str] = (DP_AXIS_NAME, TP_AXIS_NAME)
 
 _MESH_2D_CACHE: dict[tuple[int, int, tuple[int, ...]], Mesh] = {}
 
 
-def reset_ep_2d_mesh() -> None:
+def reset_dp_tp_mesh() -> None:
     """Clear cached 2D ``('dp', 'tp')`` meshes."""
     _MESH_2D_CACHE.clear()
 
@@ -84,7 +84,7 @@ def _resolve_vllm_dp_tp_groups() -> tuple[
     return len(dp_ranks), len(tp_ranks), dp_ranks, tp_ranks
 
 
-def validate_ep_2d_group_ranks(
+def validate_dp_tp_group_ranks(
     dp_size: int,
     tp_size: int,
     *,
@@ -156,7 +156,7 @@ def validate_ep_2d_group_ranks(
     return dp_rank, tp_rank
 
 
-def build_ep_2d_mesh(
+def build_dp_tp_mesh(
     dp_size: int | None = None,
     tp_size: int | None = None,
     *,
@@ -191,11 +191,11 @@ def build_ep_2d_mesh(
             if cached_dp == dp_size and cached_tp == tp_size:
                 return cached_mesh
         raise RuntimeError(
-            "build_ep_2d_mesh must be called before torch.compile tracing "
+            "build_dp_tp_mesh must be called before torch.compile tracing "
             f"(no cached mesh found for dp_size={dp_size}, tp_size={tp_size})."
         )
 
-    dp_rank, tp_rank = validate_ep_2d_group_ranks(
+    dp_rank, tp_rank = validate_dp_tp_group_ranks(
         dp_size,
         tp_size,
         dp_ranks=dp_ranks,
@@ -205,12 +205,12 @@ def build_ep_2d_mesh(
     from torch_tpu._internal.pallas.pallas import _get_pallas_mesh
 
     mesh = _get_pallas_mesh(
-        axis_names=KIMI_2D_MESH_AXES,
+        axis_names=DP_TP_MESH_AXES,
         mesh_shape=(dp_size, tp_size),
     )
-    if tuple(mesh.axis_names) != KIMI_2D_MESH_AXES:
+    if tuple(mesh.axis_names) != DP_TP_MESH_AXES:
         raise RuntimeError(
-            f"Unexpected mesh axis_names={mesh.axis_names}, expected {KIMI_2D_MESH_AXES}."
+            f"Unexpected mesh axis_names={mesh.axis_names}, expected {DP_TP_MESH_AXES}."
         )
     if tuple(mesh.devices.shape) != (dp_size, tp_size):
         raise RuntimeError(

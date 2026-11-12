@@ -451,27 +451,27 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 module.prepare_sp_mla_gate()
 
         from vllm_torchtpu.distributed.dp_tp_mesh import (
-            build_ep_2d_mesh,
+            build_dp_tp_mesh,
             kimi_use_2d_ep_mesh,
         )
 
         if kimi_use_2d_ep_mesh() and torch.distributed.is_initialized():
             from vllm_torchtpu.models.vllm.kimi_k3.latency_collective_ops import (
-                build_kimi_o2_collectives,
+                build_kimi_dma_collectives,
             )
 
-            mesh_2d = build_ep_2d_mesh()
-            o2_collectives = build_kimi_o2_collectives(mesh_2d)
-            if o2_collectives.has_any_op:
+            mesh_2d = build_dp_tp_mesh()
+            dma_collectives = build_kimi_dma_collectives(mesh_2d)
+            if dma_collectives.has_any_op:
                 for module in self.modules():
                     if isinstance(module, KimiMoE):
-                        o2_collectives.attach_to_moe(module)
+                        dma_collectives.attach_to_moe(module)
                     elif isinstance(
                         module, (MultiHeadLatentAttention, KimiDeltaAttention)
                     ):
-                        o2_collectives.attach_to_attn(module)
+                        dma_collectives.attach_to_attn(module)
                     elif isinstance(module, KimiMLP):
-                        o2_collectives.attach_to_mlp(module)
+                        dma_collectives.attach_to_mlp(module)
 
         if envs.TPU_KIMI_DENSE_W8A16_B11:
             from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (
