@@ -230,7 +230,7 @@ def test_no_forced_embedding_sharing():
 class _ToyLogitsProcessor:
     """Per-shard lm_head matmul, like LogitsProcessor with skip_gather=True."""
 
-    def _get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather=False):
+    def __call__(self, lm_head, hidden_states, embedding_bias=None, skip_gather=False):
         assert embedding_bias is None and skip_gather
         return hidden_states @ lm_head.weight.T
 
