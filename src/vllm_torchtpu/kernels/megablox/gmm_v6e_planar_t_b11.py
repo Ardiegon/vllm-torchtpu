@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,8 +33,8 @@ traffic about 4x (bf16 2 bytes/weight -> mxfp4 0.5 + 1/32).
 
 The tiling, group metadata and pipelining are megablox's
 (`jax.experimental.pallas.ops.tpu.megablox.gmm`, whose
-`make_group_metadata` is reproduced below because that directory has no
-BUILD file and so cannot be depended on from google3); only the rhs
+`make_group_metadata` is adapted below so this module depends only on
+public JAX APIs); only the rhs
 load stage differs. That kernel supports bf16/f32 operands ONLY, and gemax's
 subchannel-quantized gmm covers int8/int4/float8_e4m3fn/float8_e5m2
 with no e2m1 or e8m0 support, so neither takes MXFP4 as-is. MXFP4 also
@@ -167,11 +166,11 @@ what went stale here.
 import functools
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
-import numpy as np
 
 # e2m1 decode table, index = sign<<3 | exp<<1 | mantissa. Mirrors
 # `ffw._E2M1_LUT` and `checkpoint_converter._E2M1_LUT`.
@@ -1846,13 +1845,25 @@ _MOE_GMM_DEEP_MAX_ROWS = 2048
 _MOE_GMM_EP_SHARDS = 8
 
 
+def _as_rank3_scales(scale: jax.Array) -> jax.Array:
+    """Drops the singleton axis 2 of `[E, rows, 1, N]` scales (rank-3 as is)."""
+    return jnp.squeeze(scale, axis=2) if scale.ndim == 4 else scale
+
+
 def repack_w13_planar_t(
     w13_packed: jax.Array, w13_scale: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    """Repacks checkpoint `w13` (`[E, 2*N, K/2]` u8) and `w13_scale` (`[E, 2*N, K/32]` u8)
-    into a single zero-copy 3D/4D `planar_t` stack pair:
-      - `w13_pt`: `[E, K, N]` uint8 (equivalent to `[E, 2, K/2, N]` flattened on axes 1..2)
-      - `w13_sc`: `[E, 2*(K/32), 1, N]` uint8 (equivalent to `[E, 2, K/32, 1, N]`)
+    """Repacks a checkpoint gate+up MXFP4 stack into the planar_t layout.
+
+    Args:
+      w13_packed: `[E, 2*N, K/2]` uint8 MXFP4 nibble pairs, gate rows first.
+      w13_scale: `[E, 2*N, K/32]` uint8 e8m0 scales.
+
+    Returns:
+      `(w13_pt, w13_sc)`: `[E, K, N]` uint8 planar_t nibbles (gate and up
+      stacked on axis 1, i.e. `[E, 2, K/2, N]` flattened) and
+      `[E, 2*(K/32), 1, N]` uint8 transposed scales (`[E, 2, K/32, 1, N]`
+      flattened).
     """
     n = w13_packed.shape[1] // 2
     gate_pt = repack_planar_t_stack(w13_packed[:, :n, :])
@@ -1868,10 +1879,15 @@ def repack_w13_planar_t(
 def repack_w2_planar_t(
     w2_packed: jax.Array, w2_scale: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    """Repacks checkpoint `w2` (`[E, L, N/2]` u8) and `w2_scale` (`[E, L, N/32]` u8)
-    into `planar_t` layout:
-      - `w2_pt`: `[E, N/2, L]` uint8
-      - `w2_sc`: `[E, N/32, 1, L]` uint8
+    """Repacks a checkpoint down-projection MXFP4 stack into the planar_t layout.
+
+    Args:
+      w2_packed: `[E, L, N/2]` uint8 MXFP4 nibble pairs.
+      w2_scale: `[E, L, N/32]` uint8 e8m0 scales.
+
+    Returns:
+      `(w2_pt, w2_sc)`: `[E, N/2, L]` uint8 planar_t nibbles and
+      `[E, N/32, 1, L]` uint8 transposed scales.
     """
     w2_pt = repack_planar_t_stack(w2_packed)
     w2_sc = jnp.expand_dims(transpose_scales_planar_t(w2_scale), axis=2)
@@ -1879,7 +1895,19 @@ def repack_w2_planar_t(
 
 
 def parse_situ_activation(activation: str) -> tuple[float, float | None]:
-    """Parses vLLM activation string ('situ:4.0:25.0' or 'silu') into (beta, linear_beta)."""
+    """Parses the expert activation string into SiTU clamp parameters.
+
+    Args:
+      activation: `'situ:<beta>:<linear_beta>'` (`linear_beta` may be `none`) or
+        `'silu'`.
+
+    Returns:
+      `(beta, linear_beta)`; `'silu'` maps to `(0.0, None)`, which `_situ_f32`
+      evaluates as plain SiLU-and-multiply.
+
+    Raises:
+      NotImplementedError: for any other activation.
+    """
     if activation.startswith("situ:"):
         _, beta_str, lin_str = activation.split(":")
         beta = float(beta_str)
@@ -1904,8 +1932,26 @@ def _run_fused_gate_up_5d(
     group_metadata: GroupMetadata,
     deep_vmem_budget: int = V6E_DEEP_VMEM_BUDGET,
 ) -> jax.Array:
-    """Runs fused gate+up GMM directly on combined `w13_pt` `[E, K, N]` (`[E, 2, steps, chunk/2, N]`)
-    and `w13_sc_3d` `[E, 2*(K/32), N]` (`[E, 2, steps, chunk/32, N]`) with zero HBM copy.
+    """Fused gate+up grouped matmul with the SiTU epilogue.
+
+    Reads the combined planar_t stack in place: `w13_pt` `[E, K, N]` is viewed
+    as `[E, 2, steps, chunk/2, N]` and `w13_sc_3d` `[E, 2*(K/32), N]` as
+    `[E, 2, steps, chunk/32, N]` (index 0 gate, 1 up), so no HBM copy splits
+    the two halves.
+
+    Args:
+      lhs: `[M, K]` sorted routed activations.
+      w13_pt: `[E, K, N]` uint8 from `repack_w13_planar_t`.
+      w13_sc_3d: `[E, 2*(K/32), N]` uint8 scales.
+      situ_beta: SiTU gate clamp (`parse_situ_activation`).
+      situ_linear_beta: SiTU linear clamp, or None.
+      tiling: `(tm, k_chunk, tn)`.
+      dequant: one of `DEQUANT_MODES`.
+      group_metadata: `_make_group_metadata` result for `(M, tm, E)`.
+      deep_vmem_budget: VMEM bound for the deep kernel's column tile.
+
+    Returns:
+      `[M, N]` SiTU-gated activations in `lhs.dtype`.
     """
     m, k = lhs.shape
     num_groups, _, n = w13_pt.shape
@@ -2113,18 +2159,12 @@ def moe_gmm_v6e_planar_t_b11(
         else jnp.dtype(preferred_element_type)
     )
 
-    if w13_scale_pt.ndim == 4:
-        w13_sc_3d = jnp.squeeze(w13_scale_pt, axis=2)
-    else:
-        w13_sc_3d = w13_scale_pt
-    if w2_scale_pt.ndim == 4:
-        w2_sc_3d = jnp.squeeze(w2_scale_pt, axis=2)
-    else:
-        w2_sc_3d = w2_scale_pt
+    w13_sc_3d = _as_rank3_scales(w13_scale_pt)
+    w2_sc_3d = _as_rank3_scales(w2_scale_pt)
 
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
-    # Pad M to a multiple of 32 (or 128 for large prefill) so tm always divides m cleanly.
+    # Pad M to a multiple of 32 (or 128 for large prefill) so tm divides it.
     align_m = 32 if orig_m <= _MOE_GMM_DEEP_MAX_ROWS else 128
     padded_m = ((orig_m + align_m - 1) // align_m) * align_m
     if padded_m != orig_m:
@@ -2317,14 +2357,8 @@ def fused_decode_moe_v6e_planar_t_b11(
         else jnp.dtype(preferred_element_type)
     )
 
-    if w13_scale_pt.ndim == 4:
-        w13_sc_3d = jnp.squeeze(w13_scale_pt, axis=2)
-    else:
-        w13_sc_3d = w13_scale_pt
-    if w2_scale_pt.ndim == 4:
-        w2_sc_3d = jnp.squeeze(w2_scale_pt, axis=2)
-    else:
-        w2_sc_3d = w2_scale_pt
+    w13_sc_3d = _as_rank3_scales(w13_scale_pt)
+    w2_sc_3d = _as_rank3_scales(w2_scale_pt)
 
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
@@ -2557,7 +2591,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                         up_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
                     for cs in range(steps_13):
                         k_sl = pl.ds(cs * chunk, chunk)
-                        # Hoist b11 weight unpack outside token_trays loop (1 unpack/chunk):
+                        # One weight unpack per chunk, shared by all trays.
                         g_codes, g_wscale = fold_chunk(
                             w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
                         )
@@ -2608,7 +2642,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                         )
                     for cs in range(steps_2):
                         n_sl = pl.ds(cs * chunk, chunk)
-                        # Hoist w2 b11 weight unpack outside token_trays loop (1 unpack/chunk):
+                        # One weight unpack per chunk, shared by all trays.
                         codes2, wscale2 = fold_chunk(
                             w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
                         )
@@ -2632,13 +2666,17 @@ def fused_decode_moe_v6e_planar_t_b11(
                         w_g_tr = jnp.tile(w_expert_ref[g, r_sl, :], (1, tn2 // _LANES))
                         out_acc[r_sl, sl2] += down_bf16 * w_g_tr
             else:
+                # Narrow the Optional for the type checker; the non-tray
+                # prologue always loads it.
+                tile = lhs_tile
+                assert tile is not None
                 w_g = w_expert_ref[g]
                 for t in range(tiles_n13):
                     sl = pl.ds(t * tn13, tn13)
                     gate_acc[...] = jnp.zeros_like(gate_acc)
                     up_acc[...] = jnp.zeros_like(up_acc)
                     for cs in range(steps_13):
-                        lhs_chunk = lhs_tile[:, cs * chunk : (cs + 1) * chunk]
+                        lhs_chunk = tile[:, cs * chunk : (cs + 1) * chunk]
                         g_codes, g_wscale = fold_chunk(
                             w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
                         )

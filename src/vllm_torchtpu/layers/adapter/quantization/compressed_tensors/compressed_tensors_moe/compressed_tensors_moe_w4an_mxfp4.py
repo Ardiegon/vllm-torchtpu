@@ -33,7 +33,6 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
     requant_load_kmajor_fp4,
 )
-from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
@@ -43,6 +42,7 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     release_memory_to_os,
 )
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:

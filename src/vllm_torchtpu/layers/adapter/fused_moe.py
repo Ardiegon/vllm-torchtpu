@@ -22,11 +22,13 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    repack_w2_planar_t,
+    repack_w13_planar_t,
+)
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
-    repack_w2_planar_t,
-    repack_w13_planar_t,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
@@ -107,7 +109,7 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
 def load_w13_planar_t_mxfp4(
     w13_u8: torch.Tensor, s13_u8: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One-time load transform for TPU v6e MXFP4 -> b11 MoE w13 weights + E8M0 scales."""
+    """One-time load transform of MXFP4 w13 weights + E8M0 scales to planar_t."""
     global _load_w13_planar_t_op
     if _load_w13_planar_t_op is None:
         _load_w13_planar_t_op = pallas.jax_op(
@@ -119,7 +121,7 @@ def load_w13_planar_t_mxfp4(
 def load_w2_planar_t_mxfp4(
     w2_u8: torch.Tensor, s2_u8: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One-time load transform for TPU v6e MXFP4 -> b11 MoE w2 weights + E8M0 scales."""
+    """One-time load transform of MXFP4 w2 weights + E8M0 scales to planar_t."""
     global _load_w2_planar_t_op
     if _load_w2_planar_t_op is None:
         _load_w2_planar_t_op = pallas.jax_op(

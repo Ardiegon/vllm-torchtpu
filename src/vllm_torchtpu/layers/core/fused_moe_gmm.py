@@ -32,8 +32,6 @@ from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     can_use_fused_decode_moe_v6e_planar_t_b11,
     fused_decode_moe_v6e_planar_t_b11,
     moe_gmm_v6e_planar_t_b11,
-    repack_w2_planar_t,
-    repack_w13_planar_t,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
