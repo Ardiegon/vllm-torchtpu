@@ -158,16 +158,6 @@ class DFlashProposer:
 
     bucketed_drafts = True
 
-    # Debug self-check (DSpark `TPU_KIMI_DSPARK_DRAFT_CHECK=1`): the compiled
-    # draft program also returns reference draft tokens in place of the hidden
-    # states, compared on the host (forces a sync; tests only).
-    _draft_self_check = False
-
-    def _check_draft_tokens(
-        self, draft_tokens: torch.Tensor, reference: torch.Tensor, num_reqs: int
-    ) -> None:
-        raise NotImplementedError
-
     # Whether load_model overwrites the draft's embed_tokens/lm_head with the
     # target's unconditionally. DSpark sets this False to honor the draft's
     # has_own_embed_tokens / has_own_lm_head flags instead.
@@ -669,11 +659,9 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
             ):
-                draft_tokens_chunk, aux = self._dflash_forward_and_sample(
+                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size
                 )
-            if self._draft_self_check:
-                self._check_draft_tokens(draft_tokens_chunk, aux, chunk.num_reqs)
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
         for _ in range(extra_chunks):

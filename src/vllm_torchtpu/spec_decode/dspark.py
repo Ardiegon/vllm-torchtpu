@@ -33,8 +33,6 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
-import os
-
 import torch
 from vllm.config import VllmConfig
 
@@ -103,10 +101,6 @@ class DSparkProposer(DFlashProposer):
         # Phase O6b (`TPU_KIMI_OPT_SPEC_KDA="o6b"`): position-major draft
         # logits (see `_dflash_forward_and_sample`).
         self._position_major_logits = use_spec_o6b()
-        self._draft_self_check = self._position_major_logits and (
-            os.environ.get("TPU_KIMI_DSPARK_DRAFT_CHECK", "0") == "1"
-        )
-        self._draft_check_stats = [0, 0, 0]  # steps, rows, mismatched rows
         logger.info(
             "DSpark: sample_from_anchor=%s, K=%d, position_major_logits=%s.",
             self.sample_from_anchor,
@@ -185,28 +179,11 @@ class DSparkProposer(DFlashProposer):
         start = int(shard.org_vocab_start_index)
         end = int(shard.org_vocab_end_index)
         local = w2[start:end].contiguous().clone()
-        # Drop the replicated copy: only the shard is read from now on
-        # (kept for the debug self-check only).
-        self._markov_w2_full = w2 if self._draft_self_check else None
+        # Drop the replicated copy: only the shard is read from now on.
         head.markov_w2.weight = torch.nn.Parameter(local, requires_grad=False)
         self._markov_vocab_start = start
         self._markov_tp = tp
         return local
-
-    def _check_draft_tokens(
-        self, draft_tokens: torch.Tensor, reference: torch.Tensor, num_reqs: int
-    ) -> None:
-        a = draft_tokens[:num_reqs].cpu()
-        b = reference[:num_reqs].cpu()
-        st = self._draft_check_stats
-        st[0] += 1
-        st[1] += num_reqs
-        st[2] += int((a != b).any(dim=-1).sum())
-        if st[0] % 200 == 1 or st[2]:
-            logger.info(
-                "DSpark draft self-check: steps=%d rows=%d mismatched_rows=%d",
-                *st,
-            )
 
     def _vocab_parallel_argmax(
         self, local_scores: torch.Tensor, rows: int
@@ -293,25 +270,6 @@ class DSparkProposer(DFlashProposer):
                     draft_tokens.append(step)
                     prev = step
                 draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
-                if self._draft_self_check:
-                    # Reference: the pre-O6b path (request-major full-vocab
-                    # logits, replicated Markov head, plain argmax).
-                    ref_logits = self.draft_model.compute_draft_logits(valid_hidden)
-                    ref_logits = ref_logits.view(
-                        padded_num_reqs, block_size, ref_logits.shape[-1]
-                    )
-                    full_w2 = self._markov_w2_full
-                    ref_prev = ids_3d[:, 0]
-                    ref_tokens = []
-                    for i in range(sample_start, block_size):
-                        ref_bias = torch.nn.functional.linear(
-                            self.draft_model.markov_embed(ref_prev), full_w2
-                        )
-                        ref_step = (ref_logits[:, i] + ref_bias).argmax(dim=-1)
-                        ref_tokens.append(ref_step)
-                        ref_prev = ref_step
-                    ref_chunk = torch.stack(ref_tokens, dim=1)
-                    return draft_tokens_chunk[:padded_num_reqs], ref_chunk
                 return draft_tokens_chunk[:padded_num_reqs], hidden
             logits_pm = self.draft_model.compute_draft_logits(flat_pm)
             logits_pm = logits_pm.view(block_size, reqs_tile, logits_pm.shape[-1])
