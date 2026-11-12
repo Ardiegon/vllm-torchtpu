@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
@@ -28,6 +29,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -35,10 +37,26 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dp_tp_mesh import (
+    build_dp_tp_mesh,
+    require_dp_tp_mesh_order,
+)
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    FUSED_DECODE_MOE_MAX_TOKENS,
+    FUSED_VERIFY_MOE_MAX_TOKENS,
+)
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
-from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
+from vllm_torchtpu.layers.adapter.custom_ops.kimi_moe_ep_overlap_op import (
+    MoeOverlapConfig,
+    SharedExpertActivation,
+    build_kimi_moe_ep_overlap_op,
+)
+from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+    IntraChipColumnParallelLinear,
+    make_latent_projection,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -47,35 +65,62 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
 )
-from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
-    quantize_weight_w8a16,
-    w8a16_matmul,
-)
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
-from .latency_collective_ops import (
-    pack_dispatch_metadata,
-    pack_dp_dispatch,
-    unpack_dp_dispatch,
-)
-from .layers import KimiMLP
-from .opt_flags import is_exit_fold_active
+from .layers import KimiMLP, SituAndMul
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
         VllmCompressedTensorsW4ANMxfp4MoEMethod,
     )
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 logger = init_logger(__name__)
 
-# A collective attached after weight loading: tensor in, tensor out.
-CollectiveOp = Callable[[torch.Tensor], torch.Tensor]
 
-# The packed entry projection pads the routed-down columns to a full MXU
-# lane tile so the shared and routed column blocks start tile-aligned.
-_MXU_LANES = 128
+def pack_dispatch_metadata(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> torch.Tensor:
+    """Pack `topk_ids[B, K]` and `topk_weights[B, K]` into `[B, 3K]` bf16.
+
+    The ids travel as two byte-valued bf16 lanes each (low byte, high byte of
+    the int16 id, covering -1 and every expert id) rather than as raw int32
+    bits viewed as bf16: TPU float ops flush bf16 subnormals to zero, which
+    would turn the bit patterns of ids 1..127 into 0, and canonicalize the
+    NaN pattern of -1. Byte values 0..255 are exact, normal bf16 numbers.
+    """
+    ids = topk_ids.to(torch.int32)
+    low = (ids & 0xFF).to(torch.bfloat16)
+    high = ((ids >> 8) & 0xFF).to(torch.bfloat16)
+    return torch.cat((low, high, topk_weights.to(torch.bfloat16)), dim=-1)
+
+
+def pack_dp_dispatch(
+    latent: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> torch.Tensor:
+    """Pack `(latent[B, D], topk_ids[B, K], topk_weights[B, K])` as `[B, D + 3K]`.
+
+    One bf16 payload, so the EP dispatch needs one DP all-gather instead of
+    three.
+    """
+    meta = pack_dispatch_metadata(topk_ids, topk_weights)
+    return torch.cat((latent.to(torch.bfloat16), meta), dim=-1)
+
+
+def unpack_dp_dispatch(
+    packed: torch.Tensor, latent_dim: int, topk: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack `[B, D + 3K]` bf16 into `(latent, topk_ids int32, topk_weights)`."""
+    latent = packed[:, :latent_dim]
+    low = packed[:, latent_dim : latent_dim + topk].to(torch.int32)
+    high = packed[:, latent_dim + topk : latent_dim + 2 * topk].to(torch.int32)
+    # Sign-extend the int16 id.
+    topk_ids = (((high << 8) | low) << 16) >> 16
+    topk_weights = packed[:, latent_dim + 2 * topk : latent_dim + 3 * topk]
+    return latent, topk_ids, topk_weights
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -118,6 +163,13 @@ class KimiMoE(nn.Module):
             vllm_config is not None
             and vllm_config.parallel_config.enable_expert_parallel
         )
+        # Largest batch the fused small-batch routed-expert kernel serves:
+        # speculative decoding verifies `1 + K` tokens per request.
+        self._fused_decode_max_tokens = (
+            FUSED_VERIFY_MOE_MAX_TOKENS
+            if vllm_config is not None and vllm_config.speculative_config is not None
+            else FUSED_DECODE_MOE_MAX_TOKENS
+        )
         routed_expert_hidden_size = config.routed_expert_hidden_size
         expert_hidden_size = (
             routed_expert_hidden_size
@@ -142,8 +194,9 @@ class KimiMoE(nn.Module):
         )
 
         # Replicated by default; sharded across a chip's cores under
-        # TPU_LATENT_PROJ_INTRA_CHIP_TP. These two are the model's largest
-        # unquantized weights and are read in full by every rank each step.
+        # TPU_LATENT_PROJ_INTRA_CHIP_TP, or across TP on chips with one core.
+        # These two are the model's largest unquantized weights and are read
+        # in full by every rank each step.
         self.routed_expert_down_proj = (
             make_latent_projection(
                 hidden_size,
@@ -182,27 +235,25 @@ class KimiMoE(nn.Module):
         self.prefill_group = None
         self.shared_group = None
         self.register_buffer("packed_moe_in_weight", None, persistent=False)
-        self.register_buffer("packed_moe_in_scale", None, persistent=False)
         self.register_buffer("packed_moe_out_weight", None, persistent=False)
-        self.register_buffer("packed_moe_out_scale", None, persistent=False)
         self.register_buffer("w_routed_down_tp", None, persistent=False)
         self.register_buffer("w_shared_gu", None, persistent=False)
-        self.register_buffer("_dma_tp_rank_buf", None, persistent=False)
+        self.register_buffer("_tp_rank", None, persistent=False)
         # Column layout of the packed projections (set by prepare_moe_projections).
         self._moe_in_shared_cols = 0
         self._moe_in_down_cols = 0
         self._moe_in_down_pad_cols = 0
         self._moe_out_latent_start = 0
         self._moe_out_latent_end = 0
-        # One-shot DMA collectives and the fused EP-overlap op, attached by
-        # KimiDmaCollectives.attach_to_moe after weight loading. None selects
-        # the XLA collective (or, for the overlap op, the packed path).
-        self._dma_tp_latent_ag_op: CollectiveOp | None = None
-        self._dma_dp_packed_ag_op: CollectiveOp | None = None
-        self._dma_dp_combine_rs_op: CollectiveOp | None = None
-        self._dma_tp_routed_psum_op: CollectiveOp | None = None
-        self._dma_tp_moe_exit_psum_op: CollectiveOp | None = None
+        # The fused EP-overlap layer exit, built by
+        # process_weights_after_loading when it applies; None selects the
+        # packed path.
         self._ep_overlap_op: Callable[..., torch.Tensor] | None = None
+        self._has_ep_overlap_layout = self._resolve_ep_overlap_layout()
+        if self._has_ep_overlap_layout:
+            # Before any expert layer builds its EP mesh: the overlap op's
+            # (dp, tp) mesh shares the compiled module with the EP kernels.
+            require_dp_tp_mesh_order()
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
@@ -320,18 +371,58 @@ class KimiMoE(nn.Module):
             bias_param.copy_(bias)
             weight_param.copy_(weight)
 
+    def _resolve_ep_overlap_layout(self) -> bool:
+        """Whether the parallel layout fits the fused EP-overlap layer exit.
+
+        It needs flat expert parallelism over a (dp, tp) grid of ranks and the
+        latent projections sharded over the whole TP group, so each rank
+        holds its `latent_dim / tp` columns of the routed latent.
+        """
+        down_proj = self.routed_expert_down_proj
+        up_proj = self.routed_expert_up_proj
+        return (
+            self.use_ep
+            and self.tp_size > 1
+            and isinstance(down_proj, IntraChipColumnParallelLinear)
+            and isinstance(up_proj, IntraChipColumnParallelLinear)
+            and down_proj.tp_size == self.tp_size
+            and up_proj.tp_size == self.tp_size
+            and get_dp_group().world_size > 1
+            and get_pcp_world_size() == 1
+            and hierarchical_split_or_none() is None
+        )
+
+    def _routed_experts_are_planar_t(self) -> bool:
+        """Whether the routed experts hold planar_t MXFP4 weights.
+
+        The EP-overlap exit runs them through the planar_t kernels; the MXFP4
+        loader picks that layout (uint8 weights) only where they apply.
+        """
+        routed = cast("TpuRoutedExperts", self.experts.routed_experts)
+        return (
+            routed.w13_weight.dtype == torch.uint8
+            and routed.w2_weight.dtype == torch.uint8
+        )
+
+    def process_weights_after_loading(self) -> None:
+        """Pack the projections and build the EP-overlap op where it applies."""
+        self.initialize_dummy_router()
+        self.prepare_moe_projections()
+        if self.w_routed_down_tp is not None:
+            self._build_ep_overlap_op()
+
     def prepare_moe_projections(self) -> None:
         """Pack MoE entry (shared gate_up + routed down + router gate) and exit
         (shared down + row-sharded routed up) weights on TPU when eligible.
 
         Fuses 3 entry matmuls into 1, 2 exit matmuls into 1, and eliminates
         `routed_expert_up_proj`'s `[T, hidden_size]` all-gather by folding its
-        row-parallel partial sum into the single exit `all_reduce`.
+        row-parallel partial sum into the single exit `all_reduce`. For the
+        EP-overlap exit the entry weights stay separate (`w_shared_gu`,
+        `w_routed_down_tp`): the op runs the shared gate/up matmul itself.
         """
         self.packed_moe_in_weight = None
-        self.packed_moe_in_scale = None
         self.packed_moe_out_weight = None
-        self.packed_moe_out_scale = None
         self.w_routed_down_tp = None
         self.w_shared_gu = None
         if (
@@ -366,6 +457,7 @@ class KimiMoE(nn.Module):
                 return w
             return w.t().contiguous()
 
+        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
         with torch.no_grad():
             w_shared_gu = _as_kn(shared_gu)
             w_down = _as_kn(down_proj)
@@ -379,7 +471,11 @@ class KimiMoE(nn.Module):
                     f"shared down {tuple(w_shared_down.shape)}"
                 )
                 return
-            up_group = getattr(up_proj, "_chip_group", None)
+            up_group = (
+                up_proj._chip_group
+                if isinstance(up_proj, IntraChipColumnParallelLinear)
+                else None
+            )
             tp_rank = get_tensor_model_parallel_rank()
             latent_dim = w_up.shape[0]
             if self.tp_size > 1 and latent_dim % self.tp_size != 0:
@@ -412,11 +508,13 @@ class KimiMoE(nn.Module):
 
             shared_gu_cols = w_shared_gu.shape[1]
             down_cols = w_down.shape[1]
-            down_pad_cols = (down_cols + _MXU_LANES - 1) // _MXU_LANES * _MXU_LANES
-            if shared_gu_cols % _MXU_LANES != 0:
+            # Pad the routed-down columns to a full lane tile so the shared
+            # and routed column blocks start tile-aligned.
+            down_pad_cols = (down_cols + num_lanes - 1) // num_lanes * num_lanes
+            if shared_gu_cols % num_lanes != 0:
                 self._log_unpacked(
                     f"shared gate_up width {shared_gu_cols} is not a multiple of "
-                    f"{_MXU_LANES}"
+                    f"{num_lanes}"
                 )
                 return
 
@@ -430,33 +528,14 @@ class KimiMoE(nn.Module):
             empty_dtype = w_shared_gu.dtype
             empty_device = w_shared_gu.device
 
-            down_group = getattr(down_proj, "_chip_group", None)
-            can_split_down_tp = (
-                down_group is not None
-                and down_group.world_size == self.tp_size
+            if (
+                self._has_ep_overlap_layout
                 and down_cols == latent_local
-            ) or (down_group is None and down_cols == latent_dim)
-            use_ep_overlap_split = (
-                is_exit_fold_active()
-                and self.use_ep
-                and get_pcp_world_size() == 1
-                and not envs.TPU_KIMI_DENSE_W8A16_B11
-                and hierarchical_split_or_none() is None
-                and can_split_down_tp
-            )
-            if use_ep_overlap_split:
-                w_down_tp = (
-                    w_down.contiguous()
-                    if down_cols == latent_local
-                    else w_down[
-                        :, rank * latent_local : (rank + 1) * latent_local
-                    ].contiguous()
-                )
-                self._moe_in_down_cols = latent_local
-                self.w_routed_down_tp = fresh_buffer(w_down_tp)
+                and self._routed_experts_are_planar_t()
+            ):
+                self.w_routed_down_tp = fresh_buffer(w_down.contiguous())
                 self.w_shared_gu = fresh_buffer(w_shared_gu.contiguous())
                 self.packed_moe_out_weight = fresh_buffer(packed_out)
-                del w_down_tp, packed_out, w_up_row, full_w_up
             else:
                 packed_in = torch.cat(
                     (
@@ -466,21 +545,62 @@ class KimiMoE(nn.Module):
                     ),
                     dim=-1,
                 )
-                if envs.TPU_KIMI_DENSE_W8A16_B11:
-                    in_q, in_s = quantize_weight_w8a16(packed_in)
-                    out_q, out_s = quantize_weight_w8a16(packed_out)
-                    self.packed_moe_in_weight = in_q
-                    self.packed_moe_in_scale = in_s
-                    self.packed_moe_out_weight = out_q
-                    self.packed_moe_out_scale = out_s
-                else:
-                    self.packed_moe_in_weight = fresh_buffer(packed_in)
-                    self.packed_moe_out_weight = fresh_buffer(packed_out)
-                del packed_in, packed_out, w_up_row, full_w_up
+                self.packed_moe_in_weight = fresh_buffer(packed_in)
+                self.packed_moe_out_weight = fresh_buffer(packed_out)
+                del packed_in
+            del packed_out, w_up_row, full_w_up
             for layer in layers:
                 layer.weight.data = torch.empty(
                     0, dtype=empty_dtype, device=empty_device
                 )
+
+    def _build_ep_overlap_op(self) -> None:
+        """Build the fused EP-overlap op for the split entry weights."""
+        assert self.shared_experts is not None and self.w_shared_gu is not None
+        routed = cast("TpuRoutedExperts", self.experts.routed_experts)
+        act_fn = self.shared_experts.act_fn
+        if isinstance(act_fn, SituAndMul):
+            shared_activation = SharedExpertActivation.SITU
+            situ_beta = float(act_fn.beta)
+            situ_linear_beta = (
+                None if act_fn.linear_beta is None else float(act_fn.linear_beta)
+            )
+        elif isinstance(act_fn, SiluAndMul):
+            shared_activation = SharedExpertActivation.SILU
+            situ_beta = 1.0
+            situ_linear_beta = None
+        else:
+            raise NotImplementedError(
+                f"shared_experts activation {type(act_fn).__name__} is not supported "
+                "by the EP-overlap op"
+            )
+        routed_activation = cast(
+            "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
+        )._tpu_activation_str
+        assert routed_activation is not None, (
+            "[kimi_moe] the routed experts must finish weight loading before "
+            "the EP-overlap op is built"
+        )
+        norm = self.routed_expert_norm
+        cfg = MoeOverlapConfig(
+            routed_activation=routed_activation,
+            topk=int(routed.moe_config.experts_per_token),
+            use_norm=norm is not None,
+            # Unused without the norm.
+            rms_eps=float(norm.variance_epsilon) if norm is not None else 0.0,
+            shared_activation=shared_activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            fused_decode_max_tokens=self._fused_decode_max_tokens,
+        )
+        # The op reads this rank's TP index from a runtime buffer so every
+        # rank traces the same program.
+        self._tp_rank = torch.tensor(
+            [[get_tensor_model_parallel_rank()]],
+            dtype=torch.int32,
+            device=self.w_shared_gu.device,
+        )
+        self._ep_overlap_op = build_kimi_moe_ep_overlap_op(build_dp_tp_mesh(), cfg)
 
     def _log_unpacked(self, reason: str) -> None:
         logger.warning_once(
@@ -494,13 +614,8 @@ class KimiMoE(nn.Module):
             return self._forward_expert_parallel(hidden_states, sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if (
-            self.w_routed_down_tp is not None
-            and self.w_shared_gu is not None
-            and self.packed_moe_out_weight is not None
-            and self._ep_overlap_op is not None
-        ):
-            output = self._forward_async_ep_unified(hidden_states)
+        if self._ep_overlap_op is not None:
+            output = self._forward_ep_overlap(hidden_states)
             return output.view(num_tokens, hidden_size)
         if (
             self.packed_moe_in_weight is not None
@@ -512,48 +627,54 @@ class KimiMoE(nn.Module):
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
 
-    def _tp_all_reduce(
-        self, x: torch.Tensor, dma_op: CollectiveOp | None
-    ) -> torch.Tensor:
-        """TP psum through the attached one-shot DMA op, else the XLA all-reduce."""
-        if dma_op is not None:
-            return dma_op(x)
-        return tensor_model_parallel_all_reduce(x)
-
     def _exit_all_reduce(self, out_partial: torch.Tensor) -> torch.Tensor:
         """Sum the row-parallel exit projection's partial outputs over TP."""
         if self.tp_size > 1:
-            return self._tp_all_reduce(out_partial, self._dma_tp_moe_exit_psum_op)
+            return tensor_model_parallel_all_reduce(out_partial)
         return out_partial
 
-    def _forward_async_ep_unified(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_ep_overlap(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Route, run the fused EP-overlap op, then the packed exit matmul."""
         ep_overlap_op = self._ep_overlap_op
         assert ep_overlap_op is not None
         assert self.w_routed_down_tp is not None
         assert self.packed_moe_out_weight is not None
         router_logits, _ = self.gate(hidden_states)
-        routed = self.experts.routed_experts
+        routed = cast("TpuRoutedExperts", self.experts.routed_experts)
         topk_weights, topk_ids = moe_routing.route(routed, hidden_states, router_logits)
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
             topk_ids, topk_weights, is_local_tensor=True
         )
         packed_meta = pack_dispatch_metadata(topk_ids, topk_weights)
+        # The op takes the metadata padded to a multiple of the TP size.
+        pad_cols = -packed_meta.shape[1] % self.tp_size
+        if pad_cols:
+            packed_meta = torch.nn.functional.pad(packed_meta, (0, pad_cols))
         routed_down_local = hidden_states @ self.w_routed_down_tp
-        combined_in = ep_overlap_op(
+        operands = [
             hidden_states,
             routed_down_local,
             packed_meta,
-            self,
-        )
+            self.w_shared_gu,
+            routed.w13_weight[None, None],
+            routed.w2_weight[None, None],
+            routed.w13_weight_scale[None, None],
+            routed.w2_weight_scale[None, None],
+        ]
+        if self.routed_expert_norm is not None:
+            operands.append(self.routed_expert_norm.weight)
+        assert routed._experts_start is not None
+        operands += [routed._experts_start.reshape(1, 1), self._tp_rank]
+        combined_in = ep_overlap_op(*operands)
         out_partial = combined_in @ self.packed_moe_out_weight
         return self._exit_all_reduce(out_partial)
 
     def _forward_packed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Packed entry matmul, latent MoE dispatch, packed exit matmul."""
+        assert self.packed_moe_in_weight is not None
+        assert self.packed_moe_out_weight is not None
         router_logits, _ = self.gate(hidden_states)
-        packed_in = self._packed_matmul(
-            hidden_states, self.packed_moe_in_weight, self.packed_moe_in_scale
-        )
+        packed_in = hidden_states @ self.packed_moe_in_weight
         shared_gate_up, routed_down_pad = packed_in.split(
             [
                 self._moe_in_shared_cols,
@@ -573,20 +694,8 @@ class KimiMoE(nn.Module):
         assert self.shared_experts is not None
         shared_act = self.shared_experts.act_fn(shared_gate_up)
         combined_in = torch.cat((shared_act, routed_local), dim=-1)
-        out_partial = self._packed_matmul(
-            combined_in, self.packed_moe_out_weight, self.packed_moe_out_scale
-        )
+        out_partial = combined_in @ self.packed_moe_out_weight
         return self._exit_all_reduce(out_partial)
-
-    @staticmethod
-    def _packed_matmul(
-        x: torch.Tensor, weight: torch.Tensor | None, scale: torch.Tensor | None
-    ) -> torch.Tensor:
-        """``x @ weight``, or the W8A16 matmul when the weight has a scale."""
-        assert weight is not None
-        if scale is not None:
-            return w8a16_matmul(x, weight, scale)
-        return x @ weight
 
     def _dispatch_latent_moe(
         self,
@@ -597,18 +706,15 @@ class KimiMoE(nn.Module):
         """Gather the latent across TP, run the routed experts, reduce over TP.
 
         Returns the full routed-expert latent output on every TP rank. With
-        EP across DP ranks the tokens are routed here and dispatched either as
-        one packed DP all-gather (`TPU_KIMI_OPT_PACKED_DP_AG`) or by the
-        pipelined EP experts; otherwise the experts route monolithically.
+        EP across DP ranks the tokens are routed here and dispatched as one
+        packed DP all-gather (by the pipelined EP experts under PCP);
+        otherwise the experts route monolithically.
         """
-        down_group = getattr(self.routed_expert_down_proj, "_chip_group", None)
+        down_proj = self.routed_expert_down_proj
         routed = self.experts.routed_experts
         dp_size = routed.moe_config.dp_size if self.use_ep else 1
-        pcp_size = get_pcp_world_size() if self.use_ep else 1
         use_ep_dispatch = self.use_ep and dp_size > 1
-        use_packed_dp = bool(
-            use_ep_dispatch and pcp_size == 1 and envs.TPU_KIMI_OPT_PACKED_DP_AG
-        )
+        use_packed_dp = use_ep_dispatch and get_pcp_world_size() == 1
 
         # Route before the latent all-gather: route() reads only the dtype of
         # its second tensor argument, so the gather does not have to finish.
@@ -617,33 +723,36 @@ class KimiMoE(nn.Module):
             if use_ep_dispatch
             else None
         )
-        if down_group is not None:
-            tp_latent_ag_op = self._dma_tp_latent_ag_op
-            latent = (
-                tp_latent_ag_op(routed_down_local)
-                if tp_latent_ag_op is not None
-                else down_group.all_gather(routed_down_local, dim=-1)
-            )
-        else:
-            latent = routed_down_local
+        latent = (
+            down_proj._chip_group.all_gather(routed_down_local, dim=-1)
+            if isinstance(down_proj, IntraChipColumnParallelLinear)
+            else routed_down_local
+        )
 
+        if routing is None:
+            routed_out = routed.quant_method.apply_monolithic(
+                routed, latent, router_logits
+            )
+            # Under EP with one TP rank the experts' partial sums still need
+            # the all-reduce over the EP ranks.
+            if self.tp_size > 1 or self.use_ep:
+                routed_out = tensor_model_parallel_all_reduce(routed_out)
+            return routed_out
+
+        topk_weights, topk_ids = routing
+        quant_method = cast(
+            "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
+        )
         if use_packed_dp:
-            assert routing is not None
-            topk_weights, topk_ids = routing
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights, is_local_tensor=True
             )
             packed_payload = pack_dp_dispatch(latent, topk_ids, topk_weights)
-            dp_packed_ag_op = self._dma_dp_packed_ag_op
-            gathered_payload = (
-                dp_packed_ag_op(packed_payload)
-                if dp_packed_ag_op is not None
-                else get_dp_group().all_gather(packed_payload, dim=0)
-            )
+            gathered_payload = get_dp_group().all_gather(packed_payload, dim=0)
             ag_latent, ag_ids, ag_weights = unpack_dp_dispatch(
                 gathered_payload, latent.shape[-1], topk_ids.shape[-1]
             )
-            moe_out = routed.quant_method.apply_with_routing(
+            moe_out = quant_method.apply_with_routing(
                 routed,
                 ag_latent,
                 ag_weights,
@@ -651,41 +760,13 @@ class KimiMoE(nn.Module):
                 pipelined=False,
                 mask_padding=False,
             )
-            dp_combine_rs_op = self._dma_dp_combine_rs_op
-            routed_out = (
-                dp_combine_rs_op(moe_out)
-                if dp_combine_rs_op is not None
-                else get_dp_group().reduce_scatter(moe_out, dim=0)
-            )
-            if self.tp_size > 1:
-                routed_out = self._tp_all_reduce(
-                    routed_out, self._dma_tp_routed_psum_op
-                )
-        elif use_ep_dispatch:
-            assert routing is not None
-            topk_weights, topk_ids = routing
-            routed_out = routed.quant_method.apply_with_routing(
-                routed,
-                latent,
-                topk_weights,
-                topk_ids,
-                pipelined=True,
-            )
-            if self.tp_size > 1:
-                routed_out = self._tp_all_reduce(
-                    routed_out, self._dma_tp_routed_psum_op
-                )
+            routed_out = get_dp_group().reduce_scatter(moe_out, dim=0)
         else:
-            routed_out = routed.quant_method.apply_monolithic(
-                routed, latent, router_logits
+            routed_out = quant_method.apply_with_routing(
+                routed, latent, topk_weights, topk_ids, pipelined=True
             )
-            # Under EP with one TP rank the experts' partial sums still need
-            # the (XLA) all-reduce over the EP ranks.
-            if self.tp_size > 1 or self.use_ep:
-                routed_out = self._tp_all_reduce(
-                    routed_out,
-                    self._dma_tp_routed_psum_op if self.tp_size > 1 else None,
-                )
+        if self.tp_size > 1:
+            routed_out = tensor_model_parallel_all_reduce(routed_out)
         return routed_out
 
     def _forward_expert_parallel(

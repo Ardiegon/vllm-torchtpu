@@ -14,7 +14,7 @@
 
 import pytest
 
-from vllm_torchtpu.distributed import dp_tp_mesh
+from vllm_torchtpu.distributed import dp_tp_mesh, ep_mesh
 
 
 def _groups(rank, dp, tp):
@@ -75,3 +75,42 @@ def test_validate_needs_torch_distributed_without_explicit_rank(monkeypatch):
     monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: False)
     with pytest.raises(RuntimeError):
         dp_tp_mesh.validate_dp_tp_group_ranks(2, 4, global_rank=1)
+
+
+@pytest.fixture
+def ep_state(monkeypatch):
+    """A fresh EP mesh state whose devices sort differently from the ranks."""
+    monkeypatch.setattr(ep_mesh, "_rank_order_required", False)
+    monkeypatch.setattr(ep_mesh, "_MESH_CACHE", {})
+    monkeypatch.setattr(ep_mesh, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(ep_mesh, "get_dcp_world_size", lambda: 1)
+    monkeypatch.setattr(ep_mesh.envs, "MOE_FUSED_EP_SORTED_GATHER", False)
+    monkeypatch.setattr(ep_mesh, "ep_device_ids", lambda: (40, 20, 10, 30))
+
+
+def test_ep_mesh_stays_device_id_ordered_until_required(ep_state):
+    assert not dp_tp_mesh.dp_tp_mesh_order_required()
+    assert ep_mesh.ep_rank_order() == (2, 1, 3, 0)
+
+    dp_tp_mesh.require_dp_tp_mesh_order()
+
+    assert dp_tp_mesh.dp_tp_mesh_order_required()
+    assert ep_mesh.ep_rank_order() == (0, 1, 2, 3)
+
+
+def test_require_rejects_a_cached_device_id_ordered_ep_mesh(ep_state):
+    ep_mesh._MESH_CACHE[(ep_mesh.EP_AXIS_NAME, (10, 20, 30, 40))] = object()
+
+    with pytest.raises(RuntimeError, match="device-id order"):
+        dp_tp_mesh.require_dp_tp_mesh_order()
+
+    assert not dp_tp_mesh.dp_tp_mesh_order_required()
+
+
+def test_require_accepts_a_cached_rank_ordered_ep_mesh(ep_state):
+    ep_mesh._MESH_CACHE[(ep_mesh.EP_AXIS_NAME, (40, 20, 10, 30))] = object()
+
+    dp_tp_mesh.require_dp_tp_mesh_order()
+    dp_tp_mesh.require_dp_tp_mesh_order()
+
+    assert dp_tp_mesh.dp_tp_mesh_order_required()

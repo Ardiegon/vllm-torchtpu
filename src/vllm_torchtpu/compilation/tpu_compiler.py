@@ -273,10 +273,6 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
-    "vllm_torchtpu/env_override.py",
-    # Kimi K3 mode parsers and switches: they pick kernel variants and the
-    # static arguments baked into the custom ops.
-    "vllm_torchtpu/kimi_k3_opt_modes.py",
     "vllm_torchtpu/kernels",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
@@ -310,15 +306,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # the wrapper mesh or with none, like `build_ep_mesh` above.
     "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
     # K3 custom-op registration, sharding, and Attention Residual bridges.
-    "vllm_torchtpu/models/vllm/kimi_k3/attention.py",
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
-    "vllm_torchtpu/models/vllm/kimi_k3/dma_collective_ops.py",
-    "vllm_torchtpu/models/vllm/kimi_k3/latency_collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-    "vllm_torchtpu/models/vllm/kimi_k3/model.py",
-    "vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-    "vllm_torchtpu/models/vllm/kimi_k3/moe_ep_overlap_op.py",
-    "vllm_torchtpu/models/vllm/kimi_k3/opt_flags.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import ExitStack
 from functools import cache
 from typing import cast
@@ -94,8 +93,6 @@ class SituAndMul(nn.Module):
 class KimiMLP(nn.Module):
     """The standard vLLM merged-projection gated MLP."""
 
-    _tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
-
     def __init__(
         self,
         hidden_size: int,
@@ -111,7 +108,6 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_group = tp_group
-        self._tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.sp_group = (
             TokenShardCollectives(tp_group or get_tp_group())
             if envs.TPU_K3_SP_PREFILL
@@ -178,13 +174,6 @@ class KimiMLP(nn.Module):
                 return group.reduce_scatter(hidden_states, dim=0)
             assert self.tp_group is not None
             return self.tp_group.all_reduce(hidden_states)
-        tp_exit_psum_op = self._tp_exit_psum_op
-        if tp_exit_psum_op is not None:
-            assert self.down_proj.quant_method is not None
-            hidden_states = self.down_proj.quant_method.apply(
-                self.down_proj, hidden_states, None
-            )
-            return tp_exit_psum_op(hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 

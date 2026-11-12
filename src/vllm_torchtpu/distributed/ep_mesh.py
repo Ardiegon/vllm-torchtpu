@@ -56,8 +56,38 @@ logger = init_logger(__name__)
 EP_AXIS_NAME = "d"
 
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+_rank_order_required = False
 _TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
 _SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
+
+
+def require_rank_order() -> None:
+    """Keep the EP mesh in rank order from now on (see `_ep_mesh_order`).
+
+    Call it before the first EP mesh is built, at model construction.
+
+    Raises:
+      RuntimeError: an EP mesh was already built in device-id order; kernels
+        traced with it would conflict with a rank-ordered mesh.
+    """
+    global _rank_order_required
+    if _rank_order_required:
+        return
+    if _MESH_CACHE:
+        rank_ordered = ep_device_ids()
+        stale = [ids for _, ids in _MESH_CACHE if ids != rank_ordered]
+        if stale:
+            raise RuntimeError(
+                "An EP mesh was already built in device-id order "
+                f"{stale[0]} (rank order is {rank_ordered}); request the "
+                "rank order before any layer builds its EP mesh."
+            )
+    _rank_order_required = True
+
+
+def rank_order_required() -> bool:
+    """Whether `require_rank_order` was called."""
+    return _rank_order_required
 
 
 def ep_token_replica_groups(
@@ -181,22 +211,20 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     activation all-gather gets the device-id order on its own instead; see
     `ep_sorted_gather_group`.
 
-    The mesh also stays in rank order when the Kimi K3 options that build the
-    rank-ordered ('dp', 'tp') mesh are on (`dp_tp_mesh.kimi_use_2d_ep_mesh`):
-    its Pallas DMA kernels share the compiled module with the EP kernels.
+    The mesh also stays in rank order once a model has asked for it
+    (`require_rank_order`), e.g. because its kernels on the rank-ordered
+    (dp, tp) mesh share the compiled module with the EP kernels.
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
-    from vllm_torchtpu.distributed.dp_tp_mesh import kimi_use_2d_ep_mesh
-
     ep_ranks = range(len(device_ids))
     if (
         get_pcp_world_size() > 1
         or get_dcp_world_size() > 1
         or envs.MOE_FUSED_EP_SORTED_GATHER
-        or kimi_use_2d_ep_mesh()
+        or _rank_order_required
     ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
@@ -273,8 +301,8 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     """A one-axis JAX mesh over the EP group, or None when EP is off.
 
     The devices are Torchtpu's ``get_pallas_mesh`` ones, put in the order
-    `_ep_mesh_order` picks: rank order when PCP, DCP, the sorted gather or a
-    rank-ordered (dp, tp) mesh needs it, otherwise ascending device id.
+    `_ep_mesh_order` picks: ascending device id, or rank order when another
+    rank-ordered mesh shares the compiled module.
     `ep_rank_order` has the permutation this introduces and the consequence
     for the caller.
 

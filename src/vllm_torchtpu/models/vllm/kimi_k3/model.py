@@ -75,22 +75,12 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dp_tp_mesh import (
-    build_dp_tp_mesh,
-    kimi_use_2d_ep_mesh,
-)
-from vllm_torchtpu.kimi_k3_opt_modes import DSparkTapMode
-from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
-    quantize_linear_layer_w8a16,
-    synchronize_quantized_weights,
-)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
-from .latency_collective_ops import build_kimi_dma_collectives
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
 
@@ -263,8 +253,6 @@ class KimiModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        # Validated by envs.TPU_KIMI_DSPARK_TAP into a DSparkTapMode value.
-        self.aux_tap_mode = DSparkTapMode(envs.TPU_KIMI_DSPARK_TAP)
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,
@@ -274,30 +262,6 @@ class KimiModel(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
-
-    def _aux_tap(
-        self,
-        layer_idx: int,
-        hidden_states: torch.Tensor,
-        block_residuals: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Drafter tap after ``layer_idx`` (``TPU_KIMI_DSPARK_TAP``).
-
-        ``DSparkTapMode.PREFIX`` returns the AttnRes partial block sum
-        (``prefix_sum + mlp_out``), matching upstream vLLM's default capture.
-        ``DSparkTapMode.ATTN_RES`` returns the pre-norm AttnRes mixture the
-        next consumer computes from it (next layer's ``self_attention_res``, or
-        ``output_attn_res`` after the last layer), matching upstream
-        ``VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1``.
-        """
-        if block_residuals is None or self.aux_tap_mode != DSparkTapMode.ATTN_RES:
-            return hidden_states
-        if layer_idx + 1 < len(self.layers):
-            consumer = cast(KimiDecoderLayer, self.layers[layer_idx + 1])
-            return consumer.self_attention_res(
-                hidden_states, block_residuals, blocks_first=True
-            )
-        return self.output_attn_res(hidden_states, block_residuals, blocks_first=True)
 
     def forward(
         self,
@@ -341,9 +305,7 @@ class KimiModel(nn.Module):
                 sequence_parallel=sequence_parallel,
             )
             if layer_idx + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    self._aux_tap(layer_idx, hidden_states, block_residuals)
-                )
+                aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
             hidden_states = self.output_attn_res(
@@ -439,93 +401,18 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def _prepare_module_weights(self) -> None:
+    def process_weights_after_loading(self) -> None:
+        """Finalize the loaded weights of the modules the loader does not visit.
+
+        The generic loader hook fires per module only for attention layers,
+        so the residuals, the MoE blocks and the MLA gate are handled from
+        here instead.
+        """
         for module in self.modules():
-            if isinstance(module, AttentionResidual):
+            if isinstance(module, (AttentionResidual, KimiMoE)):
                 module.process_weights_after_loading()
-            elif isinstance(module, KimiMoE):
-                module.initialize_dummy_router()
-                module.prepare_moe_projections()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
-
-    def _attach_dma_collectives(self) -> None:
-        if not (kimi_use_2d_ep_mesh() and torch.distributed.is_initialized()):
-            return
-        mesh_2d = build_dp_tp_mesh()
-        dma_collectives = build_kimi_dma_collectives(mesh_2d)
-        if not dma_collectives.has_any_op:
-            return
-        for module in self.modules():
-            if isinstance(module, KimiMoE):
-                dma_collectives.attach_to_moe(module)
-            elif isinstance(module, (MultiHeadLatentAttention, KimiDeltaAttention)):
-                dma_collectives.attach_to_attn(module)
-            elif isinstance(module, KimiMLP):
-                dma_collectives.attach_to_mlp(module)
-
-    def _quantize_dense_weights_w8a16(self) -> None:
-        to_sync: list[torch.Tensor] = []
-        for module in self.modules():
-            if isinstance(module, KimiDecoderLayer):
-                if not module.is_moe:
-                    to_sync.extend(quantize_linear_layer_w8a16(module.mlp.gate_up_proj))
-                    to_sync.extend(quantize_linear_layer_w8a16(module.mlp.down_proj))
-                if isinstance(module.self_attn, KimiDeltaAttention):
-                    to_sync.extend(quantize_linear_layer_w8a16(module.self_attn.o_proj))
-                    if module.self_attn.packed_prefill_weight is not None:
-                        to_sync.append(module.self_attn.packed_prefill_weight)
-                    if module.self_attn.packed_prefill_scale is not None:
-                        to_sync.append(module.self_attn.packed_prefill_scale)
-                elif isinstance(module.self_attn, MultiHeadLatentAttention):
-                    to_sync.extend(quantize_linear_layer_w8a16(module.self_attn.o_proj))
-                    if module.self_attn.mla_attn.kimi_preprocess is None:
-                        to_sync.extend(
-                            quantize_linear_layer_w8a16(
-                                module.self_attn.fused_qkv_a_proj
-                            )
-                        )
-                        to_sync.extend(
-                            quantize_linear_layer_w8a16(module.self_attn.q_b_proj)
-                        )
-            elif isinstance(module, KimiMoE):
-                if module.packed_moe_in_weight is not None:
-                    to_sync.append(module.packed_moe_in_weight)
-                if module.packed_moe_in_scale is not None:
-                    to_sync.append(module.packed_moe_in_scale)
-                if module.packed_moe_out_weight is not None:
-                    to_sync.append(module.packed_moe_out_weight)
-                if module.packed_moe_out_scale is not None:
-                    to_sync.append(module.packed_moe_out_scale)
-                if (
-                    module.packed_moe_in_weight is None
-                    or module.packed_moe_out_weight is None
-                ):
-                    if module.shared_experts is not None:
-                        to_sync.extend(
-                            quantize_linear_layer_w8a16(
-                                module.shared_experts.gate_up_proj
-                            )
-                        )
-                        to_sync.extend(
-                            quantize_linear_layer_w8a16(module.shared_experts.down_proj)
-                        )
-                    to_sync.extend(
-                        quantize_linear_layer_w8a16(module.routed_expert_down_proj)
-                    )
-                    to_sync.extend(
-                        quantize_linear_layer_w8a16(module.routed_expert_up_proj)
-                    )
-        if not self.config.tie_word_embeddings:
-            to_sync.extend(quantize_linear_layer_w8a16(self.lm_head))
-        synchronize_quantized_weights(to_sync)
-
-    def process_weights_after_loading(self) -> None:
-        """Finalize loaded module weights, attach DMA collectives, and apply W8A16."""
-        self._prepare_module_weights()
-        self._attach_dma_collectives()
-        if envs.TPU_KIMI_DENSE_W8A16_B11:
-            self._quantize_dense_weights_w8a16()
 
     @classmethod
     def get_mamba_state_dtype_from_config(

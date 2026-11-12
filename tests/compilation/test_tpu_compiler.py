@@ -182,29 +182,6 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
 
-    def test_runtime_hash_covers_kimi_k3_custom_op_sources(self):
-        # Dropping one of these would let a warm compile cache serve programs
-        # built from stale op registration, sharding or mesh source.
-        from vllm_torchtpu.compilation import tpu_compiler
-
-        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
-        hashed = {
-            path.relative_to(source_root).as_posix()
-            for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
-        }
-        assert {
-            "vllm_torchtpu/env_override.py",
-            "vllm_torchtpu/kimi_k3_opt_modes.py",
-            "vllm_torchtpu/distributed/dp_tp_mesh.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/dma_collective_ops.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/latency_collective_ops.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/model.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/moe_ep_overlap_op.py",
-            "vllm_torchtpu/models/vllm/kimi_k3/opt_flags.py",
-        } <= hashed
-
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):
         """Excluded diffusion kernels must have no caller in hashed code.
 

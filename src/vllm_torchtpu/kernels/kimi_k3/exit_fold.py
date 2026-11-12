@@ -13,7 +13,8 @@
 # limitations under the License.
 """Pallas and JAX pieces of the Kimi K3 EP-overlap MoE layer exit.
 
-`models/vllm/kimi_k3/moe_ep_overlap_op.py` composes these into one `jax_op`
+`layers/adapter/custom_ops/kimi_moe_ep_overlap_op.py` composes these into one
+`jax_op`
 (a `jax.shard_map` over the `('dp', 'tp')` mesh) that runs a whole Kimi K3
 MoE block for expert parallelism with its Pallas DMA semaphores held
 internally:
@@ -45,13 +46,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
-    COLLECTIVE_ID_MOE_DP_COMBINE_RS,
-    COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-    COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
     DEFAULT_MAX_DMA_TOKENS,
-    DEFAULT_VMEM_MAX_TOKENS,
-    DP_AXIS_NAME,
-    TP_AXIS_NAME,
     barrier_and_allocate,
     call_kernel,
     kimi_guarded_psum,
@@ -62,6 +57,23 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
 )
 
 Ref = Any
+
+# Barrier `collective_id` of each DMA collective of the layer exit.
+# Collectives that can be in flight at the same time use different ids:
+#   0 TP gather of the routed latent columns
+#   1 DP dispatch gather of the latent and the routing metadata
+#   2 DP reduce-scatter of the routed expert outputs
+#   3 TP psum of the routed expert outputs
+COLLECTIVE_ID_MOE_TP_LATENT_AG = 0
+COLLECTIVE_ID_MOE_DP_DISPATCH_AG = 1
+COLLECTIVE_ID_MOE_DP_COMBINE_RS = 2
+COLLECTIVE_ID_MOE_TP_ROUTED_PSUM = 3
+
+# The one-shot TP psum serves at most this many rows summed over the TP axis,
+# and never fewer than `_TP_PSUM_MIN_ROWS` per rank; wider buckets take
+# `lax.psum`.
+_TP_PSUM_MAX_TOTAL_ROWS = 128
+_TP_PSUM_MIN_ROWS = 8
 
 
 # =============================================================================
@@ -248,13 +260,11 @@ def async_ep_dispatch_wait(
     rows: int,
     orig_lanes: int,
     collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-    zero_extra_copy: bool = False,
 ) -> jax.Array:
     """Wait for an in-flight EP dispatch, drain its sends, and unpack the rows.
 
-    Returns `[world, rows, orig_lanes]`. With `zero_extra_copy` the rows are
-    unpacked straight from the receive buffer instead of being copied to a
-    fresh output buffer first.
+    Returns `[world, rows, orig_lanes]`, unpacked straight from the receive
+    buffer.
     """
     axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
@@ -280,65 +290,26 @@ def async_ep_dispatch_wait(
                     sem=state_ref.data_send_sem,
                 ).wait()
 
-    if zero_extra_copy:
-
-        def _wait_kernel_inplace(
-            wait_tok_ref: Any,
-            state_ref: AsyncDispatchState,
-        ) -> None:
-            _ = wait_tok_ref[0]
-            _wait_and_drain(state_ref)
-
-        with xla_metadata.set_xla_metadata(
-            async_type="collective-done",
-            latency_metadata="300000",
-        ):
-            (state_done,) = call_kernel(
-                _wait_kernel_inplace,
-                args=(wait_tok,),
-                inout=(state,),
-                compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-                allow_pin=True,
-                name="kimi_ep_dispatch_wait_inplace",
-            )
-        return seam_pieces_unpack(state_done.x_recv, rows, orig_lanes)
-
-    recv_shape = state.x_recv.shape
-    recv_dtype = state.x_recv.dtype
-
-    def _wait_kernel(
+    def _wait_kernel_inplace(
         wait_tok_ref: Any,
         state_ref: AsyncDispatchState,
-        out_ref: Any,
-        *,
-        out_sem: Any,
     ) -> None:
         _ = wait_tok_ref[0]
         _wait_and_drain(state_ref)
-        with jax.named_scope("emit_dispatch_rows"):
-            emit = pltpu.make_async_copy(
-                src_ref=state_ref.x_recv,
-                dst_ref=out_ref,
-                sem=out_sem,
-            )
-            emit.start()
-            emit.wait()
 
     with xla_metadata.set_xla_metadata(
         async_type="collective-done",
         latency_metadata="300000",
     ):
-        _, out_raw = call_kernel(
-            _wait_kernel,
+        (state_done,) = call_kernel(
+            _wait_kernel_inplace,
             args=(wait_tok,),
             inout=(state,),
-            output=(pltpu.HBM(shape=recv_shape, dtype=recv_dtype),),
-            scoped={"out_sem": pltpu.SemaphoreType.DMA},
             compiler_params=pltpu.CompilerParams(collective_id=collective_id),
             allow_pin=True,
-            name="kimi_ep_dispatch_wait",
+            name="kimi_ep_dispatch_wait_inplace",
         )
-    return seam_pieces_unpack(out_raw, rows, orig_lanes)
+    return seam_pieces_unpack(state_done.x_recv, rows, orig_lanes)
 
 
 def unpack_meta_columns(
@@ -382,31 +353,32 @@ def hierarchical_combine_rms_slice(
     local_norm_w: jax.Array,
     local_tp_rank: jax.Array,
     *,
+    dp_axis_name: str,
+    tp_axis_name: str,
     dp_size: int,
     tp_size: int,
     latent_dim: int,
     use_norm: bool,
     rms_eps: float,
     max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-    vmem_chain: bool = False,
 ) -> jax.Array:
     """Combine the routed expert partial sums of every rank.
 
-    One-shot `'dp'` reduce-scatter of the rows, `'tp'` psum, exact
-    `RMSNorm(latent_dim)` (when `use_norm`), then this rank's
-    `latent_dim / tp_size` columns. Batches above `max_dma_tokens` (and a
-    single-rank mesh) use XLA collectives. With `vmem_chain` the DMA
-    collectives receive into VMEM up to `max_dma_tokens` rows.
+    One-shot reduce-scatter of the rows over `dp_axis_name`, psum over
+    `tp_axis_name`, exact `RMSNorm(latent_dim)` (when `use_norm`), then this
+    rank's `latent_dim / tp_size` columns. Batches above `max_dma_tokens`
+    (and a single-rank mesh) use XLA collectives; the DMA collectives receive
+    into VMEM.
     """
     latent_local = latent_dim // tp_size
     world_size = dp_size * tp_size
     if moe_out.shape[0] > max_dma_tokens or world_size == 1:
         routed_dp = (
-            lax.psum_scatter(moe_out, DP_AXIS_NAME, scatter_dimension=0, tiled=True)
+            lax.psum_scatter(moe_out, dp_axis_name, scatter_dimension=0, tiled=True)
             if dp_size > 1
             else moe_out
         )
-        routed_full = lax.psum(routed_dp, TP_AXIS_NAME) if tp_size > 1 else routed_dp
+        routed_full = lax.psum(routed_dp, tp_axis_name) if tp_size > 1 else routed_dp
         if use_norm:
             routed_full = _jax_rms_norm(routed_full, local_norm_w, rms_eps)
         if tp_size > 1:
@@ -418,31 +390,29 @@ def hierarchical_combine_rms_slice(
             )
         return routed_full
 
-    vmax = max_dma_tokens if vmem_chain else DEFAULT_VMEM_MAX_TOKENS
     if dp_size > 1:
         routed_dp = kimi_guarded_psum_scatter_rows(
             moe_out,
-            DP_AXIS_NAME,
+            dp_axis_name,
             collective_id=COLLECTIVE_ID_MOE_DP_COMBINE_RS,
             recv_memory_space="auto",
             max_dma_tokens=max_dma_tokens,
-            vmem_max_tokens=vmax,
+            vmem_max_tokens=max_dma_tokens,
         )
     else:
         routed_dp = moe_out
 
     if tp_size > 1:
-        # The one-shot TP psum handles at most `b_dp * tp_size <= 128` rows
-        # (b_dp <= 32 at TP=4, 16 at TP=8, 8 at TP=16); wider buckets fall back
-        # to `lax.psum` inside the guarded collective.
-        tp_psum_cap = min(max_dma_tokens, max(8, 128 // tp_size))
+        tp_psum_cap = min(
+            max_dma_tokens, max(_TP_PSUM_MIN_ROWS, _TP_PSUM_MAX_TOTAL_ROWS // tp_size)
+        )
         routed_full = kimi_guarded_psum(
             routed_dp,
-            TP_AXIS_NAME,
+            tp_axis_name,
             collective_id=COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
             recv_memory_space="auto",
             max_dma_tokens=tp_psum_cap,
-            vmem_max_tokens=vmax,
+            vmem_max_tokens=max_dma_tokens,
         )
     else:
         routed_full = routed_dp
@@ -473,7 +443,6 @@ def dispatch_overlapping_shared_experts(
     *,
     rows: int,
     orig_lanes: int,
-    zero_extra_copy: bool,
     act_kind: str,
     situ_beta: float,
     situ_linear_beta: float | None,
@@ -507,6 +476,5 @@ def dispatch_overlapping_shared_experts(
         rows=rows,
         orig_lanes=orig_lanes,
         collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-        zero_extra_copy=zero_extra_copy,
     )
     return gathered, shared_act

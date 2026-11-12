@@ -15,10 +15,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import cast
 
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -60,26 +60,20 @@ from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     supports_deferred_spec_commit,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
-    quantize_weight_w8a16,
-    w8a16_matmul,
-)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
-from .opt_flags import use_spec_kda_verify
 
 logger = init_logger(__name__)
 
 # Extra SparseCore-aligned row tile retained above max_model_len for draft blocks.
 _ROPE_DRAFT_ROW_MARGIN = 128
-# MXU lane alignment for KDA prefill beta-column padding.
-_KDA_BETA_PAD_LANES = 128
 
 
 def kda_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
@@ -212,8 +206,6 @@ class MixedParallelMergedLinear(MergedColumnParallelLinear):
 class MultiHeadLatentAttention(nn.Module):
     """NoPE MLA dispatched through the TPU Pallas MLA custom op."""
 
-    _tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
-
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -246,14 +238,12 @@ class MultiHeadLatentAttention(nn.Module):
         quant_config = vllm_config.quant_config
         super().__init__()
 
-        self.hidden_size = config.hidden_size
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = int(config.kv_lora_rank)
         self.qk_nope_head_dim = int(config.qk_nope_head_dim)
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
         self.v_head_dim = int(config.v_head_dim)
         self.qk_head_dim = qk_head_dim
-        self._tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
 
         self.mla_gate_is_fused = False
         if self.q_lora_rank is None:
@@ -464,12 +454,11 @@ class MultiHeadLatentAttention(nn.Module):
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return self.mla_attn(positions, hidden_states, prefill_group=group)
         output = self.mla_attn(positions, hidden_states)
-        if sequence_parallel:
-            return group.reduce_scatter(output, dim=0)
-        tp_exit_psum_op = self._tp_exit_psum_op
-        if tp_exit_psum_op is not None:
-            return tp_exit_psum_op(output)
-        return group.all_reduce(output)
+        return (
+            group.reduce_scatter(output, dim=0)
+            if sequence_parallel
+            else group.all_reduce(output)
+        )
 
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -503,9 +492,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     """KDA registered with vLLM and executed by TPU Pallas custom ops."""
 
     supports_dcp = False
-    use_full_rank_gate: bool = False
-    _tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
-    defers_spec_state_commit: bool = False
 
     def __init__(
         self,
@@ -522,7 +508,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.vllm_config = vllm_config
         self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
-        self._tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.head_dim = int(kda_config["head_dim"])
         self.total_heads = int(kda_config["num_heads"])
         if self.total_heads % self.tp_size:
@@ -625,7 +610,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
         )
         self.register_buffer("packed_prefill_weight", None, persistent=False)
-        self.register_buffer("packed_prefill_scale", None, persistent=False)
         self.kv_cache = None
         # The dispatched op owns the short convolution as well: the fused
         # kernel does the convolution itself, so it cannot be fed by a separate
@@ -652,15 +636,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
         )
-        # With speculative KDA verify/commit enabled (K > 0), the unified-pool
-        # KDA runs a side-effect-free W = 1 + K verify that caches its kernel
-        # inputs, and the runner commits each request's accepted prefix after
-        # rejection sampling (`commit_spec`). The caches hold the leading
-        # `max_num_seqs * W` token rows, which cover every windowed row
-        # ([decode][verify][prefill] batch order).
-        self.defers_spec_state_commit = use_spec_kda_verify(
-            self.num_spec_tokens
-        ) and supports_deferred_spec_commit(vllm_config)
+        # Under speculative decoding the unified-pool KDA runs a
+        # side-effect-free W = 1 + K verify that caches its kernel inputs, and
+        # the runner commits each request's accepted prefix after rejection
+        # sampling (`commit_spec`): one state write per request instead of
+        # W. The caches hold the leading `max_num_seqs * W` token rows, which
+        # cover every windowed row ([decode][verify][prefill] batch order).
+        self.defers_spec_state_commit = (
+            self.num_spec_tokens > 0 and supports_deferred_spec_commit(vllm_config)
+        )
         self.pooled_kda_verify_op = None
         self.pooled_kda_commit_op = None
         if self.defers_spec_state_commit:
@@ -747,15 +731,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
-    def _beta_pad_cols(self) -> int:
-        return (
-            (self.num_heads + _KDA_BETA_PAD_LANES - 1) // _KDA_BETA_PAD_LANES
-        ) * _KDA_BETA_PAD_LANES
-
     def _pack_prefill_projection(self) -> None:
-        """Cache BF16 or W8A16 KDA input weights after the normal checkpoint loaders."""
+        """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
-        self.packed_prefill_scale = None
         if not (
             self.use_full_rank_gate and self.num_heads > 0 and self.head_dim == 128
         ):
@@ -764,7 +742,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             return
         local_proj = self.local_projection_size
         qkv_cols = 3 * local_proj
-        beta_pad_cols = self._beta_pad_cols()
+        # The beta columns are padded up to a lane tile boundary.
+        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
+        beta_pad_cols = (self.num_heads + num_lanes - 1) // num_lanes * num_lanes
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
         expected = (
             (self.hidden_size, qkv_cols + self.num_heads),
@@ -797,7 +777,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 )
                 return
             weights.append(weight)
-        # Pad the beta columns up to an MXU 128-lane tile boundary.
         qkvb, gate, fa = weights
         pad_cols = beta_pad_cols - self.num_heads
         empty_dtype = qkvb.dtype
@@ -806,13 +785,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             packed = torch.cat(
                 (qkvb, qkvb.new_zeros((self.hidden_size, pad_cols)), gate, fa), dim=-1
             )
-            if envs.TPU_KIMI_DENSE_W8A16_B11 and packed.device.type == "tpu":
-                w_q, w_s = quantize_weight_w8a16(packed)
-                self.packed_prefill_weight = w_q
-                self.packed_prefill_scale = w_s
-            else:
-                # Materialize the layout once, avoiding a lazy cat at every call.
-                self.packed_prefill_weight = fresh_buffer(packed)
+            # Materialize the layout once, avoiding a lazy cat at every call.
+            self.packed_prefill_weight = fresh_buffer(packed)
             del packed
             for weight in weights:
                 weight.data = torch.empty(0, dtype=empty_dtype, device=empty_device)
@@ -833,25 +807,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
-            if (
-                sequence_parallel
-                and isinstance(group, FusedPrefillCollectives)
-                and self.packed_prefill_scale is None
-            ):
+            if sequence_parallel and isinstance(group, FusedPrefillCollectives):
                 packed = group.gather_project(hidden_states, self.packed_prefill_weight)
             else:
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)
-                if self.packed_prefill_scale is not None:
-                    packed = w8a16_matmul(
-                        hidden_states,
-                        self.packed_prefill_weight,
-                        self.packed_prefill_scale,
-                    )
-                else:
-                    packed = hidden_states @ self.packed_prefill_weight
+                packed = hidden_states @ self.packed_prefill_weight
             qkv_cols = 3 * local_proj
-            beta_pad_cols = self._beta_pad_cols()
+            beta_pad_cols = packed.shape[-1] - qkv_cols - local_proj - self.head_dim
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
                 [qkv_cols, beta_pad_cols, local_proj, self.head_dim], dim=-1
             )
@@ -931,12 +894,11 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return group.project_reduce_scatter(output, self.o_proj)
         output, _ = self.o_proj(output)
-        if sequence_parallel:
-            return group.reduce_scatter(output, dim=0)
-        tp_exit_psum_op = self._tp_exit_psum_op
-        if tp_exit_psum_op is not None:
-            return tp_exit_psum_op(output)
-        return group.all_reduce(output)
+        return (
+            group.reduce_scatter(output, dim=0)
+            if sequence_parallel
+            else group.all_reduce(output)
+        )
 
     def _core_attention_pooled(
         self,

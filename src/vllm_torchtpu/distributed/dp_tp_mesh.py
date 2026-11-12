@@ -25,7 +25,9 @@ mesh_shape=(dp_size, tp_size))`` (as ``dcp.get_or_create_dcp_mesh`` does),
 checks on every worker that ``dp_group.ranks == mesh_ranks[:, tp_rank]`` and
 ``tp_group.ranks == mesh_ranks[dp_rank, :]``, and checks that its flattened
 ``DeviceAssignment`` matches the rank-ordered EP mesh, so every multi-device
-``@jax_op`` in a compiled module shares one device order.
+``@jax_op`` in a compiled module shares one device order. A model that will
+build this mesh calls ``require_dp_tp_mesh_order`` at construction, before any
+layer builds the EP mesh.
 """
 
 from __future__ import annotations
@@ -37,37 +39,33 @@ import torch.distributed as dist
 from jax.sharding import Mesh
 from vllm.distributed import parallel_state as ps
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed import ep_mesh
-from vllm_torchtpu.kernels.kimi_k3.pallas_dma import DP_AXIS_NAME, TP_AXIS_NAME
-from vllm_torchtpu.kimi_k3_opt_modes import OFF_TOKENS
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+DP_AXIS_NAME = "dp"
+TP_AXIS_NAME = "tp"
 DP_TP_MESH_AXES: tuple[str, str] = (DP_AXIS_NAME, TP_AXIS_NAME)
 
 _MESH_2D_CACHE: dict[tuple[int, int, tuple[int, ...]], Mesh] = {}
 
 
-def reset_dp_tp_mesh() -> None:
-    """Clear cached 2D ``('dp', 'tp')`` meshes."""
-    _MESH_2D_CACHE.clear()
+def require_dp_tp_mesh_order() -> None:
+    """Keep the EP mesh in the rank order of the ``('dp', 'tp')`` mesh.
+
+    A model that will call ``build_dp_tp_mesh`` calls this when it is
+    constructed. Models that never do keep the device-id ordered EP mesh.
+
+    Raises:
+      RuntimeError: an EP mesh was already built in device-id order.
+    """
+    ep_mesh.require_rank_order()
 
 
-def kimi_use_2d_ep_mesh() -> bool:
-    """True when any Kimi K3 option that needs the ``('dp', 'tp')`` mesh is on."""
-    # Only "is it off?" matters here, so unvalidated values count as on; the
-    # full parsers reject them when the ops are built.
-    tp_psum_raw = (envs.TPU_KIMI_OPT_LATENCY_TP_PSUM or "off").strip().lower()
-    tp_psum_active = tp_psum_raw not in OFF_TOKENS
-    exit_fold_raw = (envs.TPU_KIMI_OPT_EXIT_FOLD or "off").strip().lower()
-    exit_fold_active = exit_fold_raw not in OFF_TOKENS
-    return bool(
-        envs.TPU_KIMI_OPT_2D_EP_MESH
-        or envs.TPU_KIMI_OPT_LATENCY_COLLECTIVES
-        or tp_psum_active
-        or exit_fold_active
-    )
+def dp_tp_mesh_order_required() -> bool:
+    """Whether the EP mesh is kept in the ``('dp', 'tp')`` mesh's rank order."""
+    return ep_mesh.rank_order_required()
 
 
 def _resolve_vllm_dp_tp_groups() -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
@@ -189,9 +187,10 @@ def _check_matches_ep_mesh(flat_device_ids: tuple[int, ...]) -> None:
     if flat_device_ids != ep_1d_ids:
         raise RuntimeError(
             "Conflicting DeviceAssignment between 2D ('dp', 'tp') mesh "
-            f"{flat_device_ids} and 1D EP mesh {ep_1d_ids}. "
-            "Enable TPU_KIMI_OPT_2D_EP_MESH=1 so all multi-device "
-            "@jax_op kernels share one rank-ordered DeviceAssignment."
+            f"{flat_device_ids} and 1D EP mesh {ep_1d_ids}. Call "
+            "require_dp_tp_mesh_order() at model construction so all "
+            "multi-device @jax_op kernels share one rank-ordered "
+            "DeviceAssignment."
         )
 
 
@@ -209,6 +208,7 @@ def build_dp_tp_mesh(
     initialization) so ``jax.sharding.Mesh`` construction never enters a
     Dynamo-traced frame.
     """
+    require_dp_tp_mesh_order()
     dp_size, tp_size, dp_ranks, tp_ranks = _resolve_sizes_and_ranks(
         dp_size, tp_size, dp_ranks, tp_ranks
     )

@@ -12,23 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import os
-import re
-from typing import NamedTuple
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
 from vllm_torchtpu import envs
-from vllm_torchtpu.kimi_k3_opt_modes import (
-    normalize_compute_polish_mode,
-    normalize_exit_fold_mode,
-)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-_existing_tier2_cache = os.environ.get("TORCH_TPU_TIER2_COMPILATION_CACHE")
 
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
@@ -210,144 +201,6 @@ def set_libtpu_flag_default(flag_name: str, value: str) -> None:
     logger.info("Appended default flag to LIBTPU_INIT_ARGS: %s", new_args)
 
 
-# Default XLA overlap preset ("1"/"auto"/"c1"): overlapping async copies with
-# collectives cuts the exposed DMA wait of v6e decode at no HBM cost.
-# SparseCore collective offload stays off by default: its staging buffers cost
-# HBM and add TensorCore DMA wait on v6e decode.
-_DEFAULT_XLA_OVERLAP_TOKENS = ("msa_r12", "async_coll")
-
-# Off spellings of TPU_KIMI_OPT_XLA_OVERLAP / TPU_KIMI_OPT_SC_OFFLOAD.
-_LIBTPU_KNOB_OFF = ("", "0", "off", "false", "none")
-
-_MSA_RATIO_RE = re.compile(r"^msa_r(\d+)$")
-_SC_FULL_RE = re.compile(r"^(?:full_|min_)?(\d+)$")
-_SC_AR_ONLY_RE = re.compile(r"^ar_(\d+)$")
-_SC_THRESH_ONLY_RE = re.compile(r"^thresh_(\d+)$")
-
-_SC_AR_OFFLOAD_FLAG = "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"
-_SC_AG_OFFLOAD_FLAG = "--xla_tpu_enable_sparse_core_collective_offload_all_gather"
-_SC_CONCURRENT_FLAG = "--xla_tpu_enable_concurrent_sparse_core_offloading"
-_SC_AR_MIN_BYTES_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
-_SC_AG_MIN_BYTES_FLAG = "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
-
-
-class LibtpuFlagOverrides(NamedTuple):
-    """LIBTPU_INIT_ARGS additions requested by the Kimi K3 libtpu knobs."""
-
-    # Ordered (flag, value) pairs without duplicate flag names.
-    flags: list[tuple[str, str]]
-    # SparseCore `*_min_size_in_bytes` thresholds that replace the default
-    # per-tensor-core VMEM cap.
-    sc_thresholds: dict[str, int]
-    # Whether any flag or threshold is requested.
-    active: bool
-
-
-def _parse_xla_overlap(raw: str) -> dict[str, str]:
-    """Map `TPU_KIMI_OPT_XLA_OVERLAP` to XLA flags, in token order."""
-    flags: dict[str, str] = {}
-    norm = raw.strip().lower()
-    if norm in _LIBTPU_KNOB_OFF:
-        return flags
-    tokens: list[str] = []
-    for tok in norm.split("+"):
-        tok = tok.strip()
-        if tok in _LIBTPU_KNOB_OFF:
-            continue
-        if tok in ("1", "true", "auto", "c1"):
-            tokens.extend(_DEFAULT_XLA_OVERLAP_TOKENS)
-        else:
-            tokens.append(tok)
-
-    for tok in tokens:
-        m_msa = _MSA_RATIO_RE.match(tok)
-        if m_msa:
-            ratio = int(m_msa.group(1))
-            if not (1 <= ratio <= 31):
-                raise ValueError(
-                    f"TPU_KIMI_OPT_XLA_OVERLAP={raw!r}: MSA "
-                    f"overlap ratio {ratio} must be in 1..31 (32 hits the "
-                    "v6e VMEM prefetch capacity cliff)."
-                )
-            flags["--xla_msa_preferred_overlap_to_async_copy_ratio"] = str(ratio)
-        elif tok == "async_coll":
-            flags["--xla_tpu_enable_async_collective_fusion"] = "true"
-            flags["--xla_tpu_enable_async_collective_fusion_fuse_all_gather"] = "true"
-        elif tok == "cpp_256":
-            flags["--xla_msa_max_cross_program_prefetches"] = "256"
-        else:
-            raise ValueError(
-                f"Unsupported TPU_KIMI_OPT_XLA_OVERLAP token {tok!r} in "
-                f"{raw!r}; expected 'off', 'auto'/'c1'/'1', "
-                "'msa_r<1..31>', 'async_coll', 'cpp_256', or '+'-joined "
-                "combinations."
-            )
-    return flags
-
-
-def _parse_sc_offload(raw: str) -> tuple[dict[str, str], dict[str, int]]:
-    """Map `TPU_KIMI_OPT_SC_OFFLOAD` to (offload flags, threshold overrides)."""
-    norm = raw.strip().lower()
-    if norm in ("1", "true"):
-        norm = "8192"
-    elif norm in ("auto", "c1"):
-        # The default setting keeps the offload off.
-        norm = "off"
-    if norm in _LIBTPU_KNOB_OFF:
-        return {}, {}
-
-    m_full = _SC_FULL_RE.match(norm)
-    m_ar = _SC_AR_ONLY_RE.match(norm)
-    m_th = _SC_THRESH_ONLY_RE.match(norm)
-    if m_full:
-        min_bytes = int(m_full.group(1))
-        flags = {
-            _SC_AR_OFFLOAD_FLAG: "true",
-            _SC_AG_OFFLOAD_FLAG: "true",
-            _SC_CONCURRENT_FLAG: "true",
-        }
-        return flags, {
-            _SC_AR_MIN_BYTES_FLAG: min_bytes,
-            _SC_AG_MIN_BYTES_FLAG: min_bytes,
-        }
-    if m_ar:
-        min_bytes = int(m_ar.group(1))
-        flags = {_SC_AR_OFFLOAD_FLAG: "true", _SC_CONCURRENT_FLAG: "true"}
-        return flags, {_SC_AR_MIN_BYTES_FLAG: min_bytes}
-    if m_th:
-        min_bytes = int(m_th.group(1))
-        return {}, {_SC_AR_MIN_BYTES_FLAG: min_bytes, _SC_AG_MIN_BYTES_FLAG: min_bytes}
-    raise ValueError(
-        f"Unsupported TPU_KIMI_OPT_SC_OFFLOAD={raw!r}; "
-        "expected 'off'/'0', '1'/'auto'/'c1', '<bytes>'/'min_<bytes>', "
-        "'ar_<bytes>', or 'thresh_<bytes>'."
-    )
-
-
-def _resolve_kimi_libtpu_flags(
-    xla_overlap_raw: str | None = None,
-    sc_offload_raw: str | None = None,
-) -> LibtpuFlagOverrides:
-    """Resolve the Kimi K3 libtpu knobs into LIBTPU_INIT_ARGS additions.
-
-    Args:
-      xla_overlap_raw: `TPU_KIMI_OPT_XLA_OVERLAP` value; None reads the env.
-      sc_offload_raw: `TPU_KIMI_OPT_SC_OFFLOAD` value; None reads the env.
-    """
-    if xla_overlap_raw is None:
-        xla_overlap_raw = envs.TPU_KIMI_OPT_XLA_OVERLAP
-    if sc_offload_raw is None:
-        sc_offload_raw = envs.TPU_KIMI_OPT_SC_OFFLOAD
-    flags = _parse_xla_overlap(xla_overlap_raw)
-    sc_flags, sc_thresholds = _parse_sc_offload(sc_offload_raw)
-    flags.update(sc_flags)
-    return LibtpuFlagOverrides(
-        flags=list(flags.items()),
-        sc_thresholds=sc_thresholds,
-        active=bool(flags or sc_thresholds),
-    )
-
-
 _libtpu_extra_args: list[str] = []
 
 # --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
@@ -356,83 +209,26 @@ _libtpu_extra_args: list[str] = []
 if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
 
-_kimi_libtpu = _resolve_kimi_libtpu_flags()
-for _flag_name, _flag_value in _kimi_libtpu.flags:
-    if not _user_has_flag(_flag_name):
-        _libtpu_extra_args.append(f"{_flag_name}={_flag_value}")
-
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
-# offloaded to SparseCore, unless TPU_KIMI_OPT_SC_OFFLOAD overrides a threshold.
-# The chip family is detected from TPU_ACCELERATOR_TYPE / GCE metadata and
-# mapped to a VMEM constant above; each flag is added only if the user hasn't
-# supplied it explicitly.
+# offloaded to SparseCore. The chip family is detected from
+# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
+# each flag is added only if the user hasn't supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
-for _flag_name in (_SC_AR_MIN_BYTES_FLAG, _SC_AG_MIN_BYTES_FLAG):
-    _target_bytes = _kimi_libtpu.sc_thresholds.get(_flag_name, _sc_offload_bytes)
-    if _target_bytes is not None and not _user_has_flag(_flag_name):
-        _libtpu_extra_args.append(f"{_flag_name}={_target_bytes}")
+if _sc_offload_bytes is not None:
+    for _flag_name in (
+        "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+    ):
+        if not _user_has_flag(_flag_name):
+            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:
         _assembled = _assembled + " " + _existing_libtpu_args
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
-
-
-def _kimi_tier2_cache_name(
-    libtpu_args: str, exit_fold: str, polish_tag: str, spec_kda: str
-) -> str | None:
-    """Tier-2 cache directory name for the active Kimi K3 knobs, or None.
-
-    The most specific active knob names the directory: speculative KDA, then
-    compute polish, then exit fold, then the libtpu flags. The digest folds in
-    LIBTPU_INIT_ARGS and every active mode, so processes with different
-    settings never share a directory.
-    """
-
-    def digest(key: str) -> str:
-        return hashlib.sha256(key.encode()).hexdigest()[:8]
-
-    # Bumped whenever the exit-fold implementation changes the compiled program.
-    impl_salt = "|impl=o4d_axial_v1" if exit_fold in ("c2", "o4d") else ""
-    exit_fold_key = libtpu_args + "|exit_fold=" + exit_fold + impl_salt
-    polish_key = exit_fold_key + "|polish=" + polish_tag
-    if spec_kda != "off":
-        spec_key = polish_key + "|spec_kda=" + spec_kda
-        return f"tpu_tier2_o6_{spec_kda}_{digest(spec_key)}"
-    if polish_tag != "off":
-        return f"tpu_tier2_o5_{polish_tag[:24]}_{digest(polish_key)}"
-    if exit_fold != "off":
-        return f"tpu_tier2_o4_{exit_fold}_{digest(exit_fold_key)}"
-    if _kimi_libtpu.active:
-        return f"tpu_tier2_o3_{digest(libtpu_args)}"
-    return None
-
-
-# Parsed unconditionally so an invalid value fails at import (fail closed).
-_kimi_exit_fold_mode = normalize_exit_fold_mode(envs.TPU_KIMI_OPT_EXIT_FOLD)
-_kimi_polish_tag, _ = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
-_kimi_spec_kda_mode = envs.TPU_KIMI_OPT_SPEC_KDA
-
-# Tier-2 cache isolation: torch_tpu's /dev/shm/torch_tpu_cache/<name> keys
-# compiled executables by HLO + PjRt version, without LIBTPU_INIT_ARGS. When a
-# Kimi K3 knob changes LIBTPU_INIT_ARGS or the traced program, rename an
-# enabled Tier-2 cache (the Tier-3 root above enables it) so processes on the
-# same host with different settings cannot reuse a stale executable. A
-# caller-pinned TORCH_TPU_TIER2_COMPILATION_CACHE is never renamed, and the
-# Tier-2 cache is never turned on here.
-if os.environ.get("TORCH_TPU_TIER2_COMPILATION_CACHE") and not _existing_tier2_cache:
-    _tier2_name = _kimi_tier2_cache_name(
-        os.environ.get("LIBTPU_INIT_ARGS", ""),
-        _kimi_exit_fold_mode,
-        _kimi_polish_tag,
-        _kimi_spec_kda_mode,
-    )
-    if _tier2_name is not None:
-        os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = _tier2_name
-        os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _tier2_name
 
 
 def _patch_jax_pallas_fori_lowering() -> None:

@@ -89,7 +89,16 @@ def test_hierarchical_combine_single_rank_is_rms_norm():
 
     def local(m, nw, r):
         return exit_fold.hierarchical_combine_rms_slice(
-            m, nw, r, dp_size=1, tp_size=1, latent_dim=32, use_norm=True, rms_eps=1e-6
+            m,
+            nw,
+            r,
+            dp_axis_name="dp",
+            tp_axis_name="tp",
+            dp_size=1,
+            tp_size=1,
+            latent_dim=32,
+            use_norm=True,
+            rms_eps=1e-6,
         )
 
     out = jax.shard_map(
