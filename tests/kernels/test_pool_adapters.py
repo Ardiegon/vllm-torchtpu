@@ -616,21 +616,34 @@ class TestKimiLinearMlaPoolGeometry:
         assert (conv.kb0, conv.row0) == (0, 103)
         assert conv.row0 + conv.nrows <= self.BS
 
-    def test_kda_conv_dim_rejected_by_gdn_view(self):
-        # Phase 1.2 boundary: the MLA pool's 640 lanes do not divide KDA's
-        # per-tap conv dim (3 * 4 * 128 = 1536), so the GDN conv view cannot
-        # express the KDA conv region; KDA needs its own pool view.
+    def _conv_plan(self, conv_dim):
         layout = self._layout()
+        return pool_adapters.v3_state_source(
+            self._pool(),
+            split=1,
+            ssm_ntok=layout.ssm_tokens,
+            conv_tok0=layout.ssm_tokens,
+            conv_ntok=layout.conv_tokens,
+            conv_dim=conv_dim,
+            n_v=self.N_V,
+            d_k=self.D_K,
+            d_v=self.D_V,
+            kernel_size=self.KERNEL_SIZE,
+        ).conv
+
+    def test_kda_conv_dim_uses_a_lane_split_u32_view(self):
+        # The MLA pool's 640 lanes do not divide KDA's per-tap conv dim
+        # (3 * 4 * 128 = 1536), so the conv region is viewed as uint32 rows
+        # (two bf16 per lane) split into d_v-lane rows.
+        conv = self._conv_plan(self.CONV_DIM)
+
+        assert conv.view_dtype == jnp.dtype(jnp.uint32)
+        assert conv.lane_split == self.LANES // self.D_V
+        bf16_rows = (self.KERNEL_SIZE - 1) * self.CONV_DIM // self.D_V
+        assert conv.rows_used == bf16_rows // 2
+
+    def test_conv_dim_not_dividing_value_lanes_rejected(self):
+        # Neither the pool lanes nor d_v divide this conv dim, so no view of
+        # the pool rows can express the conv region.
         with pytest.raises(AssertionError):
-            pool_adapters.v3_state_source(
-                self._pool(),
-                split=1,
-                ssm_ntok=layout.ssm_tokens,
-                conv_tok0=layout.ssm_tokens,
-                conv_ntok=layout.conv_tokens,
-                conv_dim=self.CONV_DIM,
-                n_v=self.N_V,
-                d_k=self.D_K,
-                d_v=self.D_V,
-                kernel_size=self.KERNEL_SIZE,
-            )
+            self._conv_plan(self.CONV_DIM + self.D_V // 2)

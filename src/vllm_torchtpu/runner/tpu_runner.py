@@ -458,33 +458,7 @@ def _spec_warmup_all_token_ids(
     }
 
 
-def _spec_warmup_num_output_tokens(
-    runner: Any, req_ids: list[str], fallback_counts: list[int]
-) -> list[int]:
-    """Match vLLM V1 Scheduler's CachedRequestData.num_output_tokens contract.
-
-    Under async scheduling, the scheduler sends
-    ``req.num_output_tokens + req.num_output_placeholders``
-    (``len(self.requests[rid].output_token_ids)``). Passing ``[t + 1]`` without
-    the in-flight ``1 + K`` placeholders causes ``GPUModelRunner._update_states``
-    to truncate ``output_token_ids`` and reset ``num_tokens_no_spec`` before
-    ``sample_tokens()._modify_prev_results()`` subtracts ``1 + K``, underflowing
-    ``start_idx`` on short prompts (e.g. ``P = 4, K = 7``).
-    """
-    if not getattr(runner, "use_async_scheduling", False):
-        return list(fallback_counts)
-    requests = getattr(runner, "requests", None) or {}
-    counts: list[int] = []
-    for req_id, fallback in zip(req_ids, fallback_counts):
-        req_state = requests.get(req_id)
-        num_outputs = len(req_state.output_token_ids) if req_state is not None else 0
-        counts.append(max(fallback, num_outputs))
-    return counts
-
-
-def _spec_warmup_max_reqs(
-    max_num_reqs: int, scheduler_config: SchedulerConfig | None
-) -> int:
+def _spec_warmup_max_reqs(max_num_reqs: int, scheduler_config: SchedulerConfig) -> int:
     """Largest request count a synthetic spec-decode warmup batch may use.
 
     The scheduler never sends more than `max_num_seqs` requests, which can be
@@ -492,8 +466,6 @@ def _spec_warmup_max_reqs(
     per-request buffers by `max_num_seqs`, so warming more requests than that
     would index past them.
     """
-    if scheduler_config is None:
-        return int(max_num_reqs)
     return min(int(max_num_reqs), int(scheduler_config.max_num_seqs))
 
 
@@ -7185,6 +7157,30 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
+    def _spec_warmup_num_output_tokens(
+        self, req_ids: list[str], fallback_counts: list[int]
+    ) -> list[int]:
+        """Match vLLM V1 Scheduler's CachedRequestData.num_output_tokens contract.
+
+        Under async scheduling, the scheduler sends
+        ``req.num_output_tokens + req.num_output_placeholders``
+        (``len(self.requests[rid].output_token_ids)``). Passing ``[t + 1]`` without
+        the in-flight ``1 + K`` placeholders causes ``GPUModelRunner._update_states``
+        to truncate ``output_token_ids`` and reset ``num_tokens_no_spec`` before
+        ``sample_tokens()._modify_prev_results()`` subtracts ``1 + K``, underflowing
+        ``start_idx`` on short prompts (e.g. ``P = 4, K = 7``).
+        """
+        if not self.use_async_scheduling:
+            return list(fallback_counts)
+        counts: list[int] = []
+        for req_id, fallback in zip(req_ids, fallback_counts):
+            req_state = self.requests.get(req_id)
+            num_outputs = (
+                len(req_state.output_token_ids) if req_state is not None else 0
+            )
+            counts.append(max(fallback, num_outputs))
+        return counts
+
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
         """Request counts to warm: the first count at which any program bucket
         of a verify step changes (request pad, token bucket, logits-row bucket,
@@ -7229,8 +7225,6 @@ class TPUModelRunner(GPUModelRunner):
             if new:
                 seen.update(new)
                 grid.append(R)
-        if max_reqs >= 1 and max_reqs not in grid and budget >= max_reqs * (1 + K):
-            grid.append(max_reqs)
         return grid
 
     def _warmup_spec_batch(
@@ -7328,8 +7322,8 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=_spec_warmup_num_output_tokens(
-                        self, rids, [t + 1] * R
+                    num_output_tokens=self._spec_warmup_num_output_tokens(
+                        rids, [t + 1] * R
                     ),
                 )
                 so = SchedulerOutput.make_empty()
@@ -7395,8 +7389,8 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=_spec_warmup_num_output_tokens(
-                            self, rids, [n_decode + 1 + vi] * R
+                        num_output_tokens=self._spec_warmup_num_output_tokens(
+                            rids, [n_decode + 1 + vi] * R
                         ),
                     )
                     so = SchedulerOutput.make_empty()
@@ -7502,8 +7496,8 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=_spec_warmup_num_output_tokens(
-                        self, [rid], [t + 1]
+                    num_output_tokens=self._spec_warmup_num_output_tokens(
+                        [rid], [t + 1]
                     ),
                 )
                 so = SchedulerOutput.make_empty()

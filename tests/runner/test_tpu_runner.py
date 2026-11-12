@@ -114,6 +114,11 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        use_async_scheduling=False,
+        requests={},
+    )
+    runner._spec_warmup_num_output_tokens = (
+        TPUModelRunner._spec_warmup_num_output_tokens.__get__(runner)
     )
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
@@ -3149,6 +3154,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 num_reqs_list=[2],
                 spec_decode_metadata_list=[None],
                 mamba_state_indices_list=None,
+                spec_commit_metadata_list=None,
                 pooler_output_list=[],
                 top_tokens=False,
             ),
@@ -3189,6 +3195,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
+            _commit_spec_state_and_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,
             _stage_timing=MagicMock(),
         )

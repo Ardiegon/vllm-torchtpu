@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import dataclasses
 import functools
 import math
 from collections.abc import Callable
@@ -763,11 +762,18 @@ def mla_attention(
             else "bfloat16"
         )
 
+        decode_key = TuningKey(
+            case="batched_decode",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=num_attention_heads,
+            actual_lkv_dim=qk_nope_head_dim,
+            actual_r_dim=actual_r_dim,
+            kv_dtype=kv_dtype_str,
+        )
+        decode_tuned = get_tuned_params(decode_key)
+
         _, page_size_per_kv_packing, kv_packing, _ = cache.shape
         max_num_seqs = seq_lens.shape[0]
-        # Both keys describe the kernel's actual inputs: the local (per-shard)
-        # heads, the absorbed latent dim of q (kv_lora_rank, not
-        # qk_nope_head_dim), the q dtype and the paged-cache geometry.
         mixed_key = TuningKey(
             case="mixed",
             max_num_tokens=max_num_tokens,
@@ -782,9 +788,6 @@ def mla_attention(
             pages_per_seq=block_tables.shape[0] // max_num_seqs,
         )
         mixed_tuned = get_tuned_params(mixed_key)
-        decode_tuned = get_tuned_params(
-            dataclasses.replace(mixed_key, case="batched_decode")
-        )
 
         # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
         num_kv_pages_per_blocks = (

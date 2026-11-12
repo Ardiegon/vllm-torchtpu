@@ -1342,208 +1342,29 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         decode_batch_size=1,
         q_split=2,
     ),
-    # 12 and 6 local heads on TPU v6e, BF16 KV pool with 648-token pages.
-    TuningKey(
-        case="mixed",
-        max_num_tokens=1024,
-        actual_num_q_heads=12,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=324,
-        kv_packing=2,
-        max_num_seqs=64,
-        pages_per_seq=13,
-    ): TunableParams(
-        num_kv_pages_per_block=1,
-        num_queries_per_block=256,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    ),
-    TuningKey(
-        case="mixed",
-        max_num_tokens=4096,
-        actual_num_q_heads=12,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=324,
-        kv_packing=2,
-        max_num_seqs=64,
-        pages_per_seq=13,
-    ): TunableParams(
-        num_kv_pages_per_block=1,
-        num_queries_per_block=256,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    ),
-    TuningKey(
-        case="mixed",
-        max_num_tokens=8192,
-        actual_num_q_heads=12,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=324,
-        kv_packing=2,
-        max_num_seqs=64,
-        pages_per_seq=13,
-    ): TunableParams(
-        num_kv_pages_per_block=1,
-        num_queries_per_block=256,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    ),
-    TuningKey(
-        case="mixed",
-        max_num_tokens=1024,
-        actual_num_q_heads=6,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=324,
-        kv_packing=2,
-        max_num_seqs=64,
-        pages_per_seq=13,
-    ): TunableParams(
-        num_kv_pages_per_block=1,
-        num_queries_per_block=512,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    ),
-    TuningKey(
-        case="mixed",
-        max_num_tokens=4096,
-        actual_num_q_heads=6,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=324,
-        kv_packing=2,
-        max_num_seqs=64,
-        pages_per_seq=13,
-    ): TunableParams(
-        num_kv_pages_per_block=1,
-        num_queries_per_block=512,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    ),
-    TuningKey(
-        case="mixed",
-        max_num_tokens=8192,
-        actual_num_q_heads=6,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=324,
-        kv_packing=2,
-        max_num_seqs=64,
-        pages_per_seq=13,
-    ): TunableParams(
-        num_kv_pages_per_block=1,
-        num_queries_per_block=512,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    ),
 }
-
-
-# Element budgets of the tiles the large-page "mixed" model sizes: the bf16
-# query tile [bq * heads, lkv_dim] (4 MiB) and the f32 score tile
-# [bq * heads, bkvp * page_size] (16 MiB). Larger tiles fail to compile with a
-# scoped VMEM OOM under the 60 MiB kernel limit.
-_MIXED_QUERY_TILE_ELEMENTS = 1 << 21
-_MIXED_SCORE_TILE_ELEMENTS = 1 << 22
-_MIXED_MAX_QUERIES_PER_BLOCK = 512
-_MIXED_MIN_QUERIES_PER_BLOCK = 16
-# Smallest batch the model covers; smaller ones keep the default tile.
-_MIXED_MIN_TOKENS = 64
-# Pages up to this many tokens are the geometries the tuned table and its
-# default cover.
-_MIXED_TABLE_PAGE_MAX_TOKENS = 128
-# A page of at least this many tokens fills a KV block on its own.
-_MIXED_SINGLE_PAGE_BLOCK_TOKENS = 512
-
-
-def _floor_power_of_two(value: int) -> int:
-    return 1 << (value.bit_length() - 1)
-
-
-def _large_page_mixed_params(tuning_key: TuningKey) -> TunableParams | None:
-    """Cost-model "mixed" block sizes for large KV pages.
-
-    Covers pools whose pages hold more tokens than the tuned table's (pages
-    that also carry per-sequence state), for any table shape. Returns None
-    outside that envelope.
-    """
-    page_size = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
-    if (
-        tuning_key.case != "mixed"
-        or page_size <= _MIXED_TABLE_PAGE_MAX_TOKENS
-        or tuning_key.max_num_tokens < _MIXED_MIN_TOKENS
-    ):
-        return None
-    heads = tuning_key.actual_num_q_heads
-    query_rows = _MIXED_QUERY_TILE_ELEMENTS // (heads * tuning_key.actual_lkv_dim)
-    if query_rows < _MIXED_MIN_QUERIES_PER_BLOCK:
-        return None
-    bq = min(
-        _MIXED_MAX_QUERIES_PER_BLOCK,
-        _floor_power_of_two(query_rows),
-        1 << (tuning_key.max_num_tokens - 1).bit_length(),
-    )
-    if page_size >= _MIXED_SINGLE_PAGE_BLOCK_TOKENS:
-        bkvp = 1
-    else:
-        bkvp = 4 if tuning_key.max_num_tokens <= 1024 else 8
-    while (
-        bq > _MIXED_MIN_QUERIES_PER_BLOCK
-        and bq * heads * bkvp * page_size > _MIXED_SCORE_TILE_ELEMENTS
-    ):
-        bq //= 2
-    return TunableParams(
-        num_kv_pages_per_block=bkvp,
-        num_queries_per_block=bq,
-        vmem_limit_bytes=62914560,
-        decode_batch_size=1,
-        q_split=2,
-    )
 
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
+    else:
+        logger.warning(
+            "No tuned parameters found for the given tuning key: %s, "
+            "using default parameters",
+            tuning_key,
+        )
+        if tuning_key.case == "mixed":
+            return TunableParams(
+                num_kv_pages_per_block=1,
+                num_queries_per_block=16,
+                vmem_limit_bytes=62914560,
+            )
 
-    large_page_params = _large_page_mixed_params(tuning_key)
-    if large_page_params is not None:
-        return large_page_params
-
-    logger.warning_once(
-        "MLA v2: no tuned parameters for %s; using defaults", tuning_key
-    )
-    if tuning_key.case == "mixed":
+        # decode, batched_decode
         return TunableParams(
-            num_kv_pages_per_block=1,
-            num_queries_per_block=16,
+            decode_batch_size=4,
+            num_kv_pages_per_block=3,
+            num_queries_per_block=1,
             vmem_limit_bytes=62914560,
         )
-
-    # decode, batched_decode
-    return TunableParams(
-        decode_batch_size=4,
-        num_kv_pages_per_block=3,
-        num_queries_per_block=1,
-        vmem_limit_bytes=62914560,
-    )

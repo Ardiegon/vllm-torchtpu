@@ -80,6 +80,7 @@ def _make_runner(
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
+        data_parallel_size=1,
     )
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config,
@@ -128,6 +129,9 @@ def _make_runner(
         TPUModelRunner._upload_unless_unchanged, runner
     )
     runner._dp_target_bucket = None
+    runner._dp_zero_tokens_across_dp = types.MethodType(
+        TPUModelRunner._dp_zero_tokens_across_dp, runner
+    )
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True

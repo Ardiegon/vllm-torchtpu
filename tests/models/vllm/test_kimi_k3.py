@@ -2131,35 +2131,40 @@ def test_attention_project_rs_preserves_linear_layout(flipped):
 
 def test_kda_prefill_packing_preserves_projection_and_reload():
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import FusedPrefillCollectives
 
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.prefill_group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
+    layer.prefix = "layers.0.self_attn"
     layer.use_full_rank_gate = True
-    layer.num_heads, layer.head_dim = 3, 128
+    layer.hidden_size = 7168
+    layer.num_heads, layer.head_dim, layer.local_projection_size = 3, 128, 384
     generator = torch.Generator().manual_seed(19)
-    for name, width in [("fused_qkvb_proj", 1155), ("g_proj", 384), ("f_a_proj", 128)]:
+    widths = {"fused_qkvb_proj": 1155, "g_proj": 384, "f_a_proj": 128}
+    for name in widths:
         projection = nn.Module()
-        projection.weight = nn.Parameter(
-            torch.randn((7168, width), generator=generator, dtype=torch.bfloat16) * 0.01
-        )
         setattr(projection, WEIGHT_FLIPPED_ATTR, True)
         setattr(layer, name, projection)
     x = torch.randn((2, 7168), generator=generator)
-    for reload in (False, True):
-        if reload:
-            with torch.no_grad():
-                layer.fused_qkvb_proj.weight.add_(0.02)
+    # Packing releases the per-projection weights, so a reload is the loader
+    # filling them again before the next packing.
+    for _reload in (False, True):
+        loaded = {}
+        for name, width in widths.items():
+            weight = (
+                torch.randn((7168, width), generator=generator, dtype=torch.bfloat16)
+                * 0.01
+            )
+            loaded[name] = weight.clone()
+            getattr(layer, name).weight = nn.Parameter(weight)
         layer._pack_prefill_projection()
         output = x @ layer.packed_prefill_weight.float()
-        qkvb = x @ layer.fused_qkvb_proj.weight.float()
-        torch.testing.assert_close(output[:, :1155], qkvb)
-        assert torch.count_nonzero(output[:, 1155:1280]) == 0
         torch.testing.assert_close(
-            output[:, 1280:1664], x @ layer.g_proj.weight.float()
+            output[:, :1155], x @ loaded["fused_qkvb_proj"].float()
         )
-        torch.testing.assert_close(output[:, 1664:], x @ layer.f_a_proj.weight.float())
+        assert torch.count_nonzero(output[:, 1155:1280]) == 0
+        torch.testing.assert_close(output[:, 1280:1664], x @ loaded["g_proj"].float())
+        torch.testing.assert_close(output[:, 1664:], x @ loaded["f_a_proj"].float())
+        assert all(getattr(layer, name).weight.numel() == 0 for name in widths)
     layer.use_full_rank_gate = False
     layer._pack_prefill_projection()
     assert layer.packed_prefill_weight is None
