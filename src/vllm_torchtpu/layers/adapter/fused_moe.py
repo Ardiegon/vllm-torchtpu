@@ -22,13 +22,15 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.kimi_k3.polish import active_trays_mode, use_copy_opt
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     FUSED_DECODE_MOE_MAX_TOKENS,
     FUSED_VERIFY_MOE_MAX_TOKENS,
     repack_w2_planar_t,
     repack_w13_planar_t,
+)
+from vllm_torchtpu.kimi_k3_opt_modes import (
+    normalize_compute_polish_mode,
+    normalize_spec_kda_mode,
 )
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -242,14 +244,22 @@ def _resolve_fused_decode_options() -> _FusedDecodeOptions:
 
     Returns `(token_trays_mode, rank3_scales, fused_decode_max_tokens)` for
     `fused_moe_func`, read from the Kimi K3 `TPU_KIMI_OPT_COMPUTE_POLISH`
-    and `TPU_KIMI_OPT_SPEC_KDA` (`"o6b"` lets the kernel serve speculative
-    verify batches of up to FUSED_VERIFY_MOE_MAX_TOKENS tokens). Resolved
-    when the op is built, outside the trace, and part of the op cache key.
+    (`trays`, `copy_opt` tokens) and `TPU_KIMI_OPT_SPEC_KDA` (`"o6b"` lets
+    the kernel serve speculative verify batches of up to
+    FUSED_VERIFY_MOE_MAX_TOKENS tokens). Resolved when the op is built,
+    outside the trace, and part of the op cache key.
     """
+    _, polish_tokens = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
+    spec_kda_mode = normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA)
     return (
-        active_trays_mode(),
-        use_copy_opt(),
-        FUSED_VERIFY_MOE_MAX_TOKENS if use_spec_o6b() else FUSED_DECODE_MOE_MAX_TOKENS,
+        next(
+            (m for m in ("trays", "trays2", "trays32") if m in polish_tokens),
+            "off",
+        ),
+        "copy_opt" in polish_tokens,
+        FUSED_VERIFY_MOE_MAX_TOKENS
+        if spec_kda_mode == "o6b"
+        else FUSED_DECODE_MOE_MAX_TOKENS,
     )
 
 

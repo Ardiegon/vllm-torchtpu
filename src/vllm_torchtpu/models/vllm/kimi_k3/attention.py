@@ -52,12 +52,6 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.kimi_k3.polish import (
-    use_kda_cond,
-    use_kda_cw_f32,
-    use_kda_glue,
-)
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_kda_o6a
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
@@ -73,6 +67,12 @@ from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 from .layers import quantize_weight_w8a16, w8a16_matmul
+from .opt_flags import (
+    use_kda_cond,
+    use_kda_cw_f32,
+    use_kda_glue,
+    use_spec_kda_verify,
+)
 
 logger = init_logger(__name__)
 
@@ -657,7 +657,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # accepted prefix after rejection sampling (`commit_spec`). The
         # caches hold the leading `max_num_seqs * W` token rows, which cover
         # every windowed row ([decode][verify][prefill] batch order).
-        self.defers_spec_state_commit = use_spec_kda_o6a(self.num_spec_tokens)
+        self.defers_spec_state_commit = use_spec_kda_verify(self.num_spec_tokens)
         self.pooled_kda_verify_op = None
         self.pooled_kda_commit_op = None
         if self.defers_spec_state_commit:

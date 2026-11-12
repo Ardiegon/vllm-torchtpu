@@ -194,12 +194,14 @@ class TestTpuCompilerCache:
         }
         assert {
             "vllm_torchtpu/env_override.py",
+            "vllm_torchtpu/kimi_k3_opt_modes.py",
             "vllm_torchtpu/distributed/dp_tp_mesh.py",
             "vllm_torchtpu/models/vllm/kimi_k3/dma_collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/latency_collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/attention.py",
             "vllm_torchtpu/models/vllm/kimi_k3/model.py",
             "vllm_torchtpu/models/vllm/kimi_k3/moe.py",
+            "vllm_torchtpu/models/vllm/kimi_k3/opt_flags.py",
         } <= hashed
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):

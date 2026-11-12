@@ -274,6 +274,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/env_override.py",
+    # Kimi K3 mode parsers and switches: they pick kernel variants and the
+    # static arguments baked into the custom ops.
+    "vllm_torchtpu/kimi_k3_opt_modes.py",
     "vllm_torchtpu/kernels",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
@@ -314,6 +317,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     "vllm_torchtpu/models/vllm/kimi_k3/model.py",
     "vllm_torchtpu/models/vllm/kimi_k3/moe.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/opt_flags.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

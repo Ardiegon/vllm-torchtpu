@@ -19,6 +19,11 @@ import re
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
 from vllm_torchtpu import envs
+from vllm_torchtpu.kimi_k3_opt_modes import (
+    normalize_compute_polish_mode,
+    normalize_exit_fold_mode,
+    normalize_spec_kda_mode,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -387,139 +392,14 @@ if _libtpu_extra_args:
         _assembled = _assembled + " " + _existing_libtpu_args
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
-# D87 Tier-2 cache isolation: torch_tpu's /dev/shm/torch_tpu_cache/<name> keys
-# compiled executables by HLO + PjRt version without LIBTPU_INIT_ARGS. When O3
-# LIBTPU_INIT_ARGS overrides or O4 TPU_KIMI_OPT_EXIT_FOLD modes are active and
-# the caller has not explicitly pinned TORCH_TPU_TIER2_COMPILATION_CACHE,
-# namespace the Tier-2 directory so distinct O3/O4 sweeps cannot reuse a stale
-# executable across processes on the same host.
-def _normalize_kimi_o4_exit_fold_env(raw: str | None) -> str:
-    val = (raw or "off").strip().lower()
-    if val in ("", "0", "false", "no", "off", "none"):
-        return "off"
-    if val == "c2b":
-        return "o4d"
-    if val in ("o4a", "o4b", "o4d", "o4a_sync", "o4b_sync", "o4d_sync"):
-        return val
-    if val in ("1", "true", "yes", "auto", "c2"):
-        return "c2"
-    raise ValueError(
-        f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4a', 'o4b', "
-        "'o4d'/'c2b', 'o4a_sync', 'o4b_sync', 'o4d_sync', or 'c2'/'auto'/'1'."
-    )
-
-
-_DEFAULT_KIMI_COMPUTE_POLISH_C2_TOKENS: tuple[str, ...] = (
-    "vmem_chain",
-)
-_ALL_KIMI_COMPUTE_POLISH_TOKENS: tuple[str, ...] = (
-    "trays",
-    "vmem_chain",
-    "kda_glue",
-    "copy_opt",
-)
-_KIMI_O5_TRAY_TOKENS: frozenset[str] = frozenset({"trays", "trays2", "trays32"})
-_KIMI_O5_VMEM_TOKENS: frozenset[str] = frozenset({"vmem_chain", "vmem_src"})
-_KIMI_O5_OFF_TOKENS: frozenset[str] = frozenset(
-    {"", "0", "false", "no", "off", "none"}
-)
-
-
-def _normalize_kimi_o5_compute_polish_env(
-    raw: str | None = None,
-) -> tuple[str, frozenset[str]]:
-    if raw is None:
-        raw = os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH", "off")
-    val = (raw or "off").strip().lower()
-    if val in _KIMI_O5_OFF_TOKENS:
-        return "off", frozenset()
-
-    tokens: set[str] = set()
-    for part in val.split("+"):
-        tok = part.strip()
-        if tok in _KIMI_O5_OFF_TOKENS:
-            continue
-        if tok in ("trays", "trays4"):
-            tokens.add("trays")
-        elif tok in (
-            "trays2",
-            "trays32",
-            "vmem_chain",
-            "vmem_src",
-            "kda_glue",
-            "kda_cond",
-            "kda_cw_f32",
-            "copy_opt",
-        ):
-            tokens.add(tok)
-        elif tok == "all":
-            tokens.update(_ALL_KIMI_COMPUTE_POLISH_TOKENS)
-        elif tok in ("c2", "auto", "1", "true", "yes"):
-            tokens.update(_DEFAULT_KIMI_COMPUTE_POLISH_C2_TOKENS)
-        else:
-            raise ValueError(
-                f"Invalid TPU_KIMI_OPT_COMPUTE_POLISH token {tok!r} in {raw!r}; "
-                "expected 'off', 'trays'/'trays4', 'trays2', 'trays32', "
-                "'vmem_chain', 'vmem_src', 'kda_glue', 'kda_cond', 'kda_cw_f32', "
-                "'copy_opt', 'all', 'c2'/'auto'/'1', or '+'-joined combinations."
-            )
-
-    active_trays = tokens & _KIMI_O5_TRAY_TOKENS
-    if len(active_trays) > 1:
-        raise ValueError(
-            f"Conflicting tray modes {sorted(active_trays)} in "
-            f"TPU_KIMI_OPT_COMPUTE_POLISH={raw!r}; choose at most one of "
-            "'trays'/'trays4', 'trays2', or 'trays32'."
-        )
-
-    active_vmem = tokens & _KIMI_O5_VMEM_TOKENS
-    if len(active_vmem) > 1:
-        raise ValueError(
-            f"Conflicting VMEM chaining modes {sorted(active_vmem)} in "
-            f"TPU_KIMI_OPT_COMPUTE_POLISH={raw!r}; choose at most one of "
-            "'vmem_chain' or 'vmem_src'."
-        )
-
-    if not tokens:
-        return "off", frozenset()
-
-    frozen = frozenset(tokens)
-    return "_".join(sorted(frozen)), frozen
-
-
-_KIMI_O6_SPEC_KDA_OFF_TOKENS: frozenset[str] = frozenset(
-    {"", "0", "false", "no", "off", "none"}
-)
-
-
-def _normalize_kimi_o6_spec_kda_env(raw: str | None = None) -> str:
-    """Normalize ``TPU_KIMI_OPT_SPEC_KDA`` (Kimi K3 Cycle 3 Phases O6a/O6b).
-
-    ``"off"`` (default) keeps the pre-O6a KDA ops byte-identical; ``"o6a"``
-    (aliases ``"c3"``/``"auto"``/``"1"``/``"true"``/``"yes"``) selects the
-    side-effect-free multi-token KDA verify + masked commit when speculative
-    decoding is configured. ``"o6b"`` is a superset of ``"o6a"`` that also
-    enables the multi-tray fused verify MoE (up to 256 tokens) and the
-    TP-sharded DSpark context projections. Anything else fails closed.
-    """
-    if raw is None:
-        raw = os.environ.get("TPU_KIMI_OPT_SPEC_KDA", "off")
-    val = (raw or "off").strip().lower()
-    if val in _KIMI_O6_SPEC_KDA_OFF_TOKENS:
-        return "off"
-    if val in ("o6a", "c3", "auto", "1", "true", "yes"):
-        return "o6a"
-    if val == "o6b":
-        # Phase O6b: O6a KDA verify/commit + multi-tray fused verify MoE
-        # (<= 256 tokens) + TP-sharded DSpark context projections.
-        return "o6b"
-    raise ValueError(
-        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off', "
-        "'o6a' (aliases 'c3'/'auto'/'1') or 'o6b'."
-    )
-
-
-_kimi_o4_exit_fold_mode = _normalize_kimi_o4_exit_fold_env(
+# Tier-2 cache isolation: torch_tpu's /dev/shm/torch_tpu_cache/<name> keys
+# compiled executables by HLO + PjRt version without LIBTPU_INIT_ARGS. When the
+# Kimi XLA overlap flags in LIBTPU_INIT_ARGS or the Kimi exit-fold, compute
+# polish or speculative KDA modes are active and the caller has not pinned
+# TORCH_TPU_TIER2_COMPILATION_CACHE, namespace the Tier-2 directory so
+# processes on the same host with different settings cannot reuse a stale
+# executable.
+_kimi_o4_exit_fold_mode = normalize_exit_fold_mode(
     os.environ.get("TPU_KIMI_OPT_EXIT_FOLD")
 )
 _kimi_o4_t2_impl_salt = (
@@ -527,10 +407,10 @@ _kimi_o4_t2_impl_salt = (
     if _kimi_o4_exit_fold_mode in ("c2", "o4d", "o4d_sync")
     else ""
 )
-_kimi_o5_polish_tag, _ = _normalize_kimi_o5_compute_polish_env(
+_kimi_o5_polish_tag, _ = normalize_compute_polish_mode(
     os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH")
 )
-_kimi_o6_spec_kda_mode = _normalize_kimi_o6_spec_kda_env(
+_kimi_o6_spec_kda_mode = normalize_spec_kda_mode(
     os.environ.get("TPU_KIMI_OPT_SPEC_KDA")
 )
 

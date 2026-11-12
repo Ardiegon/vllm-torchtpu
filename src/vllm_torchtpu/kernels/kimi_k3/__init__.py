@@ -15,7 +15,6 @@
 from vllm_torchtpu.kernels.kimi_k3 import (
     exit_fold,
     pallas_dma,
-    polish,
 )
 from vllm_torchtpu.kernels.kimi_k3.kda import kda_step, ragged_kda
 
@@ -23,6 +22,5 @@ __all__ = [
     "exit_fold",
     "kda_step",
     "pallas_dma",
-    "polish",
     "ragged_kda",
 ]

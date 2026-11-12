@@ -79,55 +79,20 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     seam_pieces_tile,
     seam_pieces_unpack,
 )
-from vllm_torchtpu.kernels.kimi_k3.polish import (
-    active_trays_mode,
-    use_copy_opt,
-    vmem_chain_mode,
-)
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     FUSED_DECODE_MOE_MAX_TOKENS,
     FUSED_VERIFY_MOE_MAX_TOKENS,
+)
+from vllm_torchtpu.kimi_k3_opt_modes import (
+    normalize_compute_polish_mode,
+    normalize_exit_fold_mode,
+    normalize_spec_kda_mode,
 )
 
 Ref = Any
 
 DEFAULT_C2_COMBINE_KIND = "o4b"
 DEFAULT_C2_DISPATCH_KIND = "axial"
-
-
-def normalize_exit_fold_mode(raw: str | None) -> str:
-    """Normalize ``TPU_KIMI_OPT_EXIT_FOLD`` to a canonical mode token.
-
-    Supported modes:
-      - ``"off"`` (aliases: ``""``, ``"0"``, ``"false"``, ``"no"``, ``"none"``)
-      - ``"o4a"``: flat world async EP overlap + world owner combine + local RMSNorm + TP ``seam_exit_split`` (`cid=6`)
-      - ``"o4b"``: flat world async EP overlap + DP ``psum_scatter`` (`cid=2`) + TP ``latency_psum`` (`cid=3`) + fused RMSNorm + slice
-      - ``"o4d"`` (alias: ``"c2b"``): 2-stage axial ``TP -> DP`` async EP overlap (`cid=0` + `cid=1`) + ``O4-B`` combine (`cid=2` + `cid=3`) + 1D axial prefill fallback
-      - ``"o4a_sync"``: synchronous world EP dispatch + ``O4-A`` exit-fold (ablation)
-      - ``"o4b_sync"``: synchronous world EP dispatch + ``O4-B`` exit-fold (ablation)
-      - ``"o4d_sync"``: synchronous 2-stage axial ``TP -> DP`` dispatch + ``O4-B`` exit-fold (ablation)
-      - ``"c2"`` (aliases: ``"auto"``, ``"1"``, ``"true"``, ``"yes"``): Cycle-2b verified axial preset (``"o4d"``)
-    """
-    val = (raw or "off").strip().lower()
-    if val in ("", "0", "false", "no", "off", "none"):
-        return "off"
-    if val == "c2b":
-        return "o4d"
-    if val in ("o4a", "o4b", "o4d", "o4a_sync", "o4b_sync", "o4d_sync"):
-        return val
-    if val in ("1", "true", "yes", "auto", "c2"):
-        return "c2"
-    raise ValueError(
-        f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4a', 'o4b', "
-        "'o4d'/'c2b', 'o4a_sync', 'o4b_sync', 'o4d_sync', or 'c2'/'auto'/'1'."
-    )
-
-
-def is_exit_fold_active(raw: str | None = None) -> bool:
-    """Return True when ``TPU_KIMI_OPT_EXIT_FOLD`` enables the O4 split-weight path."""
-    src = envs.TPU_KIMI_OPT_EXIT_FOLD if raw is None else raw
-    return normalize_exit_fold_mode(src) != "off"
 
 
 def resolve_effective_exit_fold_plan(
@@ -1073,12 +1038,17 @@ def _make_moe_ep_overlap_jax_fn(
     use_sparse_core = bool(cfg["use_sparse_core"])
     onehot_thresh = int(cfg["onehot_thresh"])
     skip_padded = bool(cfg["skip_padded"])
-    polish_trays = active_trays_mode()
-    polish_vmem = vmem_chain_mode()
-    polish_copy = use_copy_opt()
+    _, polish_tokens = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
+    polish_trays = next(
+        (m for m in ("trays", "trays2", "trays32") if m in polish_tokens), "off"
+    )
+    polish_vmem = next(
+        (m for m in ("vmem_chain", "vmem_src") if m in polish_tokens), "off"
+    )
+    polish_copy = "copy_opt" in polish_tokens
     fused_decode_max_tokens = (
         FUSED_VERIFY_MOE_MAX_TOKENS
-        if use_spec_o6b()
+        if normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA) == "o6b"
         else FUSED_DECODE_MOE_MAX_TOKENS
     )
 

@@ -40,7 +40,7 @@ from vllm_torchtpu.models.vllm.kimi_k3.dspark import (
     ],
 )
 def test_context_tp_shards(monkeypatch, enabled, tp, hidden, kv_width, expected):
-    monkeypatch.setattr(k3_dspark, "use_spec_o6b", lambda: enabled)
+    monkeypatch.setattr(k3_dspark, "use_spec_verify_extensions", lambda: enabled)
     assert _context_tp_shards(tp, hidden, kv_width) == expected
 
 
@@ -64,7 +64,7 @@ def test_layer_major_context_kv_matches_replicated_layout(shards):
 
 @pytest.mark.parametrize("enabled", [True, False])
 def test_position_major_draft_logits_hook(monkeypatch, enabled):
-    monkeypatch.setattr(k3_dspark, "use_spec_o6b", lambda: enabled)
+    monkeypatch.setattr(k3_dspark, "use_spec_verify_extensions", lambda: enabled)
     model = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
     assert model.position_major_draft_logits() is enabled
 

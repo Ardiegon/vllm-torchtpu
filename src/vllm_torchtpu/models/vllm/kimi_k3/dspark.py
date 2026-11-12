@@ -37,11 +37,11 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
-from vllm_torchtpu.kernels.kimi_k3.spec_kda import use_spec_o6b
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 
 from .attention import MultiHeadLatentAttention
 from .layers import KimiMLP
+from .opt_flags import use_spec_verify_extensions
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
@@ -82,7 +82,7 @@ def _context_tp_shards(tp_size: int, hidden_size: int, kv_width: int) -> int:
     replicated layers. Both output widths must divide by ``tp_size``.
     """
     if (
-        use_spec_o6b()
+        use_spec_verify_extensions()
         and tp_size > 1
         and hidden_size % tp_size == 0
         and kv_width % tp_size == 0
@@ -387,7 +387,7 @@ class K3DSparkForCausalLM(nn.Module):
         Read by ``DSparkProposer.load_model``. Enabled together with the
         TP-sharded context projections by ``TPU_KIMI_OPT_SPEC_KDA``.
         """
-        return use_spec_o6b()
+        return use_spec_verify_extensions()
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lm_head is not None

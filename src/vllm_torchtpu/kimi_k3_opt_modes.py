@@ -1,0 +1,167 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Parsers for the Kimi K3 optimization mode env values.
+
+Standard library only: `env_override` imports this module at process start,
+before jax or libtpu are loaded, to namespace the compile caches on the
+canonical modes, and the model-side accessors in
+`models/vllm/kimi_k3/opt_flags.py` use the same parsers at build time, so
+both agree on what every spelling means. Every parser fails closed: an
+unknown value raises `ValueError`.
+"""
+
+from __future__ import annotations
+
+# Spellings that mean "disabled" for every Kimi mode env.
+OFF_TOKENS: frozenset[str] = frozenset({"", "0", "false", "no", "off", "none"})
+
+# `TPU_KIMI_OPT_EXIT_FOLD` spellings of the verified preset. Both the preset
+# ("c2") and its explicit name ("o4d", alias "c2b") run the axial
+# TP -> DP async EP dispatch with the hierarchical DP reduce-scatter +
+# TP psum combine.
+_EXIT_FOLD_ABLATION_MODES: frozenset[str] = frozenset(
+    {"o4a", "o4b", "o4a_sync", "o4b_sync", "o4d_sync"}
+)
+_EXIT_FOLD_PRESET_ALIASES: frozenset[str] = frozenset(
+    {"1", "true", "yes", "auto", "c2"}
+)
+
+# `TPU_KIMI_OPT_COMPUTE_POLISH` token sets: the preset ("c2" and aliases)
+# and "all".
+DEFAULT_COMPUTE_POLISH_TOKENS: tuple[str, ...] = ("vmem_chain",)
+ALL_COMPUTE_POLISH_TOKENS: tuple[str, ...] = (
+    "trays",
+    "vmem_chain",
+    "kda_glue",
+    "copy_opt",
+)
+_COMPUTE_POLISH_PRESET_ALIASES: frozenset[str] = frozenset(
+    {"c2", "auto", "1", "true", "yes"}
+)
+# At most one of each group may be active.
+_COMPUTE_POLISH_TRAY_TOKENS: frozenset[str] = frozenset({"trays", "trays2", "trays32"})
+_COMPUTE_POLISH_VMEM_TOKENS: frozenset[str] = frozenset({"vmem_chain", "vmem_src"})
+
+_SPEC_KDA_VERIFY_ALIASES: frozenset[str] = frozenset(
+    {"o6a", "c3", "auto", "1", "true", "yes"}
+)
+
+
+def normalize_exit_fold_mode(raw: str | None) -> str:
+    """Canonicalize `TPU_KIMI_OPT_EXIT_FOLD`.
+
+    Returns `"off"` (default and the `OFF_TOKENS` spellings), `"c2"` (the
+    verified preset; aliases `"auto"`, `"1"`, `"true"`, `"yes"`), `"o4d"`
+    (alias `"c2b"`), which selects the same plan as `"c2"` under its own
+    name, or one of the ablation modes `"o4a"`, `"o4b"`, `"o4a_sync"`,
+    `"o4b_sync"`, `"o4d_sync"`.
+    """
+    val = (raw or "off").strip().lower()
+    if val in OFF_TOKENS:
+        return "off"
+    if val == "c2b":
+        return "o4d"
+    if val == "o4d" or val in _EXIT_FOLD_ABLATION_MODES:
+        return val
+    if val in _EXIT_FOLD_PRESET_ALIASES:
+        return "c2"
+    raise ValueError(
+        f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4a', 'o4b', "
+        "'o4d'/'c2b', 'o4a_sync', 'o4b_sync', 'o4d_sync', or 'c2'/'auto'/'1'."
+    )
+
+
+def normalize_compute_polish_mode(raw: str | None) -> tuple[str, frozenset[str]]:
+    """Canonicalize `TPU_KIMI_OPT_COMPUTE_POLISH`.
+
+    The value is a `+`-joined list of tokens: `"trays"` (alias `"trays4"`),
+    `"trays2"`, `"trays32"`, `"vmem_chain"`, `"vmem_src"`, `"kda_glue"`,
+    `"kda_cond"`, `"kda_cw_f32"`, `"copy_opt"`, `"all"` (`trays`,
+    `vmem_chain`, `kda_glue`, `copy_opt`) and the
+    preset `"c2"` (aliases `"auto"`, `"1"`, `"true"`, `"yes"`), which expands
+    to `DEFAULT_COMPUTE_POLISH_TOKENS`. `OFF_TOKENS` spellings are ignored.
+
+    Returns:
+      `(tag, tokens)`: the active token set and its canonical tag (the
+      sorted tokens joined by `_`, or `"off"` when the set is empty).
+    """
+    val = (raw or "off").strip().lower()
+    if val in OFF_TOKENS:
+        return "off", frozenset()
+
+    tokens: set[str] = set()
+    for part in val.split("+"):
+        tok = part.strip()
+        if tok in OFF_TOKENS:
+            continue
+        if tok in ("trays", "trays4"):
+            tokens.add("trays")
+        elif tok in (
+            "trays2",
+            "trays32",
+            "vmem_chain",
+            "vmem_src",
+            "kda_glue",
+            "kda_cond",
+            "kda_cw_f32",
+            "copy_opt",
+        ):
+            tokens.add(tok)
+        elif tok == "all":
+            tokens.update(ALL_COMPUTE_POLISH_TOKENS)
+        elif tok in _COMPUTE_POLISH_PRESET_ALIASES:
+            tokens.update(DEFAULT_COMPUTE_POLISH_TOKENS)
+        else:
+            raise ValueError(
+                f"Invalid TPU_KIMI_OPT_COMPUTE_POLISH token {tok!r} in {raw!r}; "
+                "expected 'off', 'trays'/'trays4', 'trays2', 'trays32', "
+                "'vmem_chain', 'vmem_src', 'kda_glue', 'kda_cond', 'kda_cw_f32', "
+                "'copy_opt', 'all', 'c2'/'auto'/'1', or '+'-joined combinations."
+            )
+
+    for group in (_COMPUTE_POLISH_TRAY_TOKENS, _COMPUTE_POLISH_VMEM_TOKENS):
+        active = tokens & group
+        if len(active) > 1:
+            raise ValueError(
+                f"Conflicting tokens {sorted(active)} in "
+                f"TPU_KIMI_OPT_COMPUTE_POLISH={raw!r}; choose at most one of "
+                f"{sorted(group)}."
+            )
+
+    if not tokens:
+        return "off", frozenset()
+    frozen = frozenset(tokens)
+    return "_".join(sorted(frozen)), frozen
+
+
+def normalize_spec_kda_mode(raw: str | None) -> str:
+    """Canonicalize `TPU_KIMI_OPT_SPEC_KDA`.
+
+    Returns `"off"` (default), `"o6a"` (aliases `"c3"`, `"auto"`, `"1"`,
+    `"true"`, `"yes"`): the multi-token KDA verify plus masked commit of the
+    accepted prefix when speculative decoding is configured, or `"o6b"`:
+    `"o6a"` plus the multi-tray fused verify MoE (up to 256 tokens) and the
+    TP-sharded DSpark context projections.
+    """
+    val = (raw or "off").strip().lower()
+    if val in OFF_TOKENS:
+        return "off"
+    if val in _SPEC_KDA_VERIFY_ALIASES:
+        return "o6a"
+    if val == "o6b":
+        return "o6b"
+    raise ValueError(
+        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off', "
+        "'o6a' (aliases 'c3'/'auto'/'1') or 'o6b'."
+    )

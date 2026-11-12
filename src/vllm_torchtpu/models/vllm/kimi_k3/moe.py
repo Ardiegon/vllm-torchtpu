@@ -36,7 +36,6 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
-from vllm_torchtpu.kernels.kimi_k3.exit_fold import is_exit_fold_active
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -56,6 +55,7 @@ from .latency_collective_ops import (
     unpack_dp_dispatch,
 )
 from .layers import KimiMLP, quantize_weight_w8a16, w8a16_matmul
+from .opt_flags import is_exit_fold_active
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
