@@ -18,8 +18,6 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from vllm_torchtpu.kimi_k3_opt_modes import normalize_spec_kda_mode
-
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -375,6 +373,36 @@ def env_canonical(
         return canonicalize(os.getenv(env_name))
 
     return _get_canonical_env
+
+
+# Spellings that mean "disabled" for Kimi K3 mode env knobs.
+OFF_TOKENS: frozenset[str] = frozenset({"", "0", "false", "no", "off", "none"})
+
+_SPEC_KDA_VERIFY_ALIASES: frozenset[str] = frozenset(
+    {"o6a", "c3", "auto", "1", "true", "yes"}
+)
+
+
+def normalize_spec_kda_mode(raw: str | None) -> str:
+    """Canonicalize `TPU_KIMI_OPT_SPEC_KDA`.
+
+    Returns `"off"` (default), `"o6a"` (aliases `"c3"`, `"auto"`, `"1"`,
+    `"true"`, `"yes"`): the multi-token KDA verify plus masked commit of the
+    accepted prefix when speculative decoding is configured, or `"o6b"`:
+    `"o6a"` plus the multi-tray fused verify MoE (up to 256 tokens) and the
+    TP-sharded DSpark context projections.
+    """
+    val = (raw or "off").strip().lower()
+    if val in OFF_TOKENS:
+        return "off"
+    if val in _SPEC_KDA_VERIFY_ALIASES:
+        return "o6a"
+    if val == "o6b":
+        return "o6b"
+    raise ValueError(
+        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off', "
+        "'o6a' (aliases 'c3'/'auto'/'1') or 'o6b'."
+    )
 
 
 # `TPU_KIMI_DSPARK_TAP` spellings -> canonical tap mode.

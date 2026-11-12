@@ -25,6 +25,19 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from vllm_torchtpu.envs import OFF_TOKENS, normalize_spec_kda_mode
+
+__all__ = [
+    "ALL_COMPUTE_POLISH_TOKENS",
+    "DEFAULT_COMPUTE_POLISH_TOKENS",
+    "DSparkTapMode",
+    "OFF_TOKENS",
+    "normalize_compute_polish_mode",
+    "normalize_exit_fold_mode",
+    "normalize_latency_tp_psum_mode",
+    "normalize_spec_kda_mode",
+]
+
 
 class DSparkTapMode(StrEnum):
     """Target auxiliary hidden-state tap mode for the Kimi K3 DSpark drafter."""
@@ -32,9 +45,6 @@ class DSparkTapMode(StrEnum):
     PREFIX = "prefix"
     ATTN_RES = "attn_res"
 
-
-# Spellings that mean "disabled" for every Kimi mode env.
-OFF_TOKENS: frozenset[str] = frozenset({"", "0", "false", "no", "off", "none"})
 
 # `TPU_KIMI_OPT_EXIT_FOLD` spellings of the verified preset. Both the preset
 # ("c2") and its explicit name ("o4d", alias "c2b") run the axial
@@ -55,10 +65,6 @@ ALL_COMPUTE_POLISH_TOKENS: tuple[str, ...] = (
 )
 _COMPUTE_POLISH_PRESET_ALIASES: frozenset[str] = frozenset(
     {"c2", "auto", "1", "true", "yes"}
-)
-
-_SPEC_KDA_VERIFY_ALIASES: frozenset[str] = frozenset(
-    {"o6a", "c3", "auto", "1", "true", "yes"}
 )
 
 
@@ -123,28 +129,6 @@ def normalize_compute_polish_mode(raw: str | None) -> tuple[str, frozenset[str]]
         return "off", frozenset()
     frozen = frozenset(tokens)
     return "_".join(sorted(frozen)), frozen
-
-
-def normalize_spec_kda_mode(raw: str | None) -> str:
-    """Canonicalize `TPU_KIMI_OPT_SPEC_KDA`.
-
-    Returns `"off"` (default), `"o6a"` (aliases `"c3"`, `"auto"`, `"1"`,
-    `"true"`, `"yes"`): the multi-token KDA verify plus masked commit of the
-    accepted prefix when speculative decoding is configured, or `"o6b"`:
-    `"o6a"` plus the multi-tray fused verify MoE (up to 256 tokens) and the
-    TP-sharded DSpark context projections.
-    """
-    val = (raw or "off").strip().lower()
-    if val in OFF_TOKENS:
-        return "off"
-    if val in _SPEC_KDA_VERIFY_ALIASES:
-        return "o6a"
-    if val == "o6b":
-        return "o6b"
-    raise ValueError(
-        f"Invalid TPU_KIMI_OPT_SPEC_KDA={raw!r}; expected 'off', "
-        "'o6a' (aliases 'c3'/'auto'/'1') or 'o6b'."
-    )
 
 
 def normalize_latency_tp_psum_mode(raw: str | None) -> str:
