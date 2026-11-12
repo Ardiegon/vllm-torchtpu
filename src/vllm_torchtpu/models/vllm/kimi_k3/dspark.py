@@ -41,7 +41,6 @@ from vllm_torchtpu.layers.core.quantization import quantize_kv
 
 from .attention import MultiHeadLatentAttention
 from .layers import KimiMLP
-from .opt_flags import use_spec_verify_extensions
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
@@ -75,18 +74,13 @@ def _duplicate_context_kv_weights(
 def _context_tp_shards(tp_size: int, hidden_size: int, kv_width: int) -> int:
     """TP shard count of the context projections (1 means replicated).
 
-    With ``TPU_KIMI_OPT_SPEC_KDA`` selecting it, the two context projections
-    are sharded over TP by output rows and their (small) outputs
-    all-gathered instead of replicating the weights. Every output element is
-    still one full-K dot product on one chip, so the values match the
-    replicated layers. Both output widths must divide by ``tp_size``.
+    Under TP the two context projections are sharded by output rows and their
+    (small) outputs all-gathered instead of replicating the weights. Every
+    output element is still one full-K dot product on one chip, so the values
+    match the replicated layers. Both output widths must divide by
+    ``tp_size``.
     """
-    if (
-        use_spec_verify_extensions()
-        and tp_size > 1
-        and hidden_size % tp_size == 0
-        and kv_width % tp_size == 0
-    ):
+    if tp_size > 1 and hidden_size % tp_size == 0 and kv_width % tp_size == 0:
         return tp_size
     return 1
 
@@ -380,14 +374,6 @@ class K3DSparkForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
-
-    def position_major_draft_logits(self) -> bool:
-        """Whether the DSpark proposer computes draft logits position-major.
-
-        Read by ``DSparkProposer.load_model``. Enabled together with the
-        TP-sharded context projections by ``TPU_KIMI_OPT_SPEC_KDA``.
-        """
-        return use_spec_verify_extensions()
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.lm_head is not None

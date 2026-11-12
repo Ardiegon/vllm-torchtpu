@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_info import get_num_cores_per_chip
 
 logger = init_logger(__name__)
 
@@ -143,23 +144,23 @@ def shard_group_or_none(output_size: int) -> GroupCoordinator | None:
 
 
 def tp_shard_group_or_none(output_size: int) -> GroupCoordinator | None:
-    """The TP group to shard ``output_size`` across on single-core-per-chip TPUs.
+    """The TP group to shard ``output_size`` across on one-core chips, or ``None``.
 
-    On TPU v6e (1 core/chip), ``get_intra_chip_group()`` returns ``None``,
-    leaving ``routed_expert_down_proj`` and ``routed_expert_up_proj`` replicated
-    across all TP ranks. Sharding both column-parallel across ``get_tp_group()``
-    with an ``all_gather(dim=-1)`` cuts per-rank weight HBM and HBM read bytes by
-    ``tp_size`` while keeping the contraction arithmetic bit-identical to
-    ``ReplicatedLinear``.
+    A chip with one core has no intra-chip group, which would leave the
+    projections replicated on every TP rank. Sharding them column-parallel
+    across the TP group with an ``all_gather(dim=-1)`` divides the per-rank
+    weight bytes by the TP size and keeps the contraction arithmetic
+    bit-identical to ``ReplicatedLinear``. Chips with several cores never take
+    this path: their cross-chip gather would cost more than the bytes saved.
     """
-    if not envs.TPU_LATENT_PROJ_TP:
-        return None
-
     if not parallel_state.model_parallel_is_initialized():
         return None
 
     group = parallel_state.get_tp_group()
     if group is None or group.world_size < 2:
+        return None
+
+    if get_num_cores_per_chip() != 1:
         return None
 
     if output_size % group.world_size != 0:

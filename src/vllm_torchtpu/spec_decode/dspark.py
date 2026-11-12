@@ -37,16 +37,16 @@ from collections.abc import Callable
 
 import torch
 import vllm.distributed
+from jax.experimental.pallas import tpu as pltpu
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import round_up
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.tpu_info import get_chip_version
 
 logger = init_logger(__name__)
 
-# Rows per aligned TPU tile (the vreg sublane count).
-_SUBLANE_ROWS = 8
 # Largest integer up to which every integer is exact in float32.
 _MAX_EXACT_FLOAT32_INT = 2**24
 
@@ -106,8 +106,8 @@ class DSparkProposer(DFlashProposer):
                 self.block_size,
                 trained_block,
             )
-        # Position-major draft logits (see `_dflash_forward_and_sample`) are
-        # opt-in per draft model; `load_model` reads the draft's choice.
+        # Position-major draft logits (see `_dflash_forward_and_sample`);
+        # `load_model` derives it from the draft's lm_head layout.
         self._position_major_logits = False
         # Vocab-parallel Markov head state, set by `_shard_markov_head`.
         self._markov_w2_local: torch.Tensor | None = None
@@ -147,15 +147,16 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
-        # Optional draft-model hook: a draft model opts in to position-major
-        # draft logits by defining `position_major_draft_logits()`. Draft
-        # models without it keep the request-major path.
-        if hasattr(self.draft_model, "position_major_draft_logits"):
-            self._position_major_logits = bool(
-                self.draft_model.position_major_draft_logits()
-            )
-        if self._position_major_logits:
-            self._markov_w2_local = self._shard_markov_head()
+        # A vocab-parallel lm_head makes the draft logits position-major (see
+        # `_position_major_hidden`), with the Markov head sharded over the
+        # same vocab rows where the layout allows it.
+        draft = self.draft_model
+        assert draft is not None
+        lm_head = draft.lm_head
+        self._markov_w2_local = self._shard_markov_head()
+        self._position_major_logits = self._markov_w2_local is not None or (
+            lm_head is not None and lm_head.tp_size > 1
+        )
         logger.info(
             "DSpark: position_major_logits=%s, vocab-parallel Markov sampling=%s.",
             self._position_major_logits,
@@ -319,7 +320,7 @@ class DSparkProposer(DFlashProposer):
         Viewing the ``[rows, vocab]`` logits as ``[reqs, block, vocab]``
         relayouts the whole full-vocab tensor (a ~1.3 ms
         while/dynamic-update-slice loop per draft on v6e when ``reqs`` is
-        not a multiple of the 8-row tile). Reordering the small hidden rows
+        not a multiple of the sublane tile). Reordering the small hidden rows
         instead, with requests padded to the tile, makes each position's
         logits one aligned ``[reqs_tile, vocab]`` slab. Returns the flat
         ``[block * reqs_tile, H]`` hidden rows, the anchor ids padded to
@@ -327,7 +328,8 @@ class DSparkProposer(DFlashProposer):
         """
         padded_num_reqs = valid_hidden.shape[0] // block_size
         hidden_size = valid_hidden.shape[-1]
-        reqs_tile = round_up(padded_num_reqs, _SUBLANE_ROWS)
+        sublane_rows = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_sublanes
+        reqs_tile = round_up(padded_num_reqs, sublane_rows)
         hidden_pm = valid_hidden.view(
             padded_num_reqs, block_size, hidden_size
         ).transpose(0, 1)

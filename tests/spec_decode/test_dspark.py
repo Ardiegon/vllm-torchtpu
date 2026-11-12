@@ -440,24 +440,44 @@ def test_shard_markov_head_falls_back_to_replicated(overrides):
     assert draft.model.markov_head.markov_w2.weight is full
 
 
-def _loadable_draft(**hooks):
-    draft = _ToyDraft()
+def _loadable_draft(**layout):
+    """A `_sharding_draft` with the hooks `load_model` checks for."""
+    draft = _sharding_draft(**layout)
+    for name in ("compute_draft_logits", "markov_embed", "markov_bias"):
+        setattr(draft, name, mock.MagicMock())
+    draft.map_draft_to_target = mock.MagicMock()
     draft.has_own_lm_head = False
     draft.has_own_embed_tokens = False
-    # tp_size 1: _shard_markov_head keeps the replicated head.
-    draft.lm_head.tp_size = 1
-    for name, value in hooks.items():
-        setattr(draft, name, value)
     return draft
 
 
-@pytest.mark.parametrize("hook,expected", [(None, False), (False, False), (True, True)])
-def test_position_major_logits_follow_draft_model_hook(hook, expected):
+@pytest.mark.parametrize(
+    "layout,position_major,sharded",
+    [
+        (dict(tp=1, rank=0), False, False),
+        # Vocab-parallel lm_head whose Markov head must stay replicated.
+        (dict(padding=4), True, False),
+        (dict(), True, True),
+    ],
+    ids=["replicated_lm_head", "vocab_parallel_padded", "vocab_parallel"],
+)
+def test_position_major_logits_follow_the_lm_head_layout(
+    layout, position_major, sharded
+):
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._position_major_logits is False
-    hooks = {} if hook is None else {"position_major_draft_logits": lambda: hook}
-    p.draft_model = _loadable_draft(**hooks)
+    p.draft_model = _loadable_draft(**layout)
     with mock.patch.object(DFlashProposer, "load_model"):
         p.load_model(target_model=None)
-    assert p._position_major_logits is expected
+    assert p._position_major_logits is position_major
+    assert (p._markov_w2_local is not None) is sharded
+
+
+def test_draft_without_lm_head_keeps_request_major_logits():
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    p.draft_model = _loadable_draft()
+    p.draft_model.lm_head = None
+    with mock.patch.object(DFlashProposer, "load_model"):
+        p.load_model(target_model=None)
+    assert p._position_major_logits is False
     assert p._markov_w2_local is None

@@ -291,8 +291,10 @@ def test_shards_when_everything_lines_up(monkeypatch):
     assert mod.shard_group_or_none(7168) is group
 
 
-def _patch_tp_state(monkeypatch, mod, *, initialized: bool, group) -> None:
-    """Replace the module's view of vLLM's parallel state, every field explicit."""
+def _patch_tp_state(
+    monkeypatch, mod, *, initialized: bool, group, cores_per_chip: int
+) -> None:
+    """Replace the module's view of vLLM's parallel state and of the chip."""
     from types import SimpleNamespace
 
     monkeypatch.setattr(
@@ -303,24 +305,31 @@ def _patch_tp_state(monkeypatch, mod, *, initialized: bool, group) -> None:
             get_tp_group=lambda: group,
         ),
     )
+    monkeypatch.setattr(mod, "get_num_cores_per_chip", lambda: cores_per_chip)
 
 
 @pytest.mark.parametrize(
-    "flag,initialized,group,why",
+    "initialized,group,cores_per_chip,why",
     [
-        (False, True, _FakeGroup(4), "flag off"),
-        (True, False, _FakeGroup(4), "model parallel not initialized"),
-        (True, True, None, "no TP group"),
-        (True, True, _FakeGroup(1), "TP world size 1"),
+        (False, _FakeGroup(4), 1, "model parallel not initialized"),
+        (True, None, 1, "no TP group"),
+        (True, _FakeGroup(1), 1, "TP world size 1"),
+        (True, _FakeGroup(4), 2, "two cores per chip: TP spans chips"),
     ],
 )
-def test_tp_shard_declines_silently(monkeypatch, flag, initialized, group, why):
-    """Expected states of a default-on knob: replicate without a warning."""
-    from vllm_torchtpu import envs
+def test_tp_shard_declines_silently(
+    monkeypatch, initialized, group, cores_per_chip, why
+):
+    """Expected states of an always-on path: replicate without a warning."""
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
-    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", flag)
-    _patch_tp_state(monkeypatch, mod, initialized=initialized, group=group)
+    _patch_tp_state(
+        monkeypatch,
+        mod,
+        initialized=initialized,
+        group=group,
+        cores_per_chip=cores_per_chip,
+    )
     monkeypatch.setattr(mod, "_warned", False)
 
     assert mod.tp_shard_group_or_none(3584) is None, why
@@ -328,11 +337,11 @@ def test_tp_shard_declines_silently(monkeypatch, flag, initialized, group, why):
 
 
 def test_tp_shard_declines_uneven_output_with_one_warning(monkeypatch):
-    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
-    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
-    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(3))
+    _patch_tp_state(
+        monkeypatch, mod, initialized=True, group=_FakeGroup(3), cores_per_chip=1
+    )
     monkeypatch.setattr(mod, "_warned", False)
     warnings: list[str] = []
     monkeypatch.setattr(
@@ -344,12 +353,10 @@ def test_tp_shard_declines_uneven_output_with_one_warning(monkeypatch):
     assert len(warnings) == 1
 
 
-def test_tp_shard_uses_the_tp_group_when_output_divides(monkeypatch):
-    from vllm_torchtpu import envs
+def test_tp_shard_uses_the_tp_group_on_one_core_chips(monkeypatch):
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
     group = _FakeGroup(16, rank_in_group=3)
-    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
-    _patch_tp_state(monkeypatch, mod, initialized=True, group=group)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=group, cores_per_chip=1)
 
     assert mod.tp_shard_group_or_none(3584) is group
