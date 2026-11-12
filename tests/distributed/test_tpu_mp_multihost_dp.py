@@ -34,8 +34,24 @@ MASTER_ADDR = "10.0.0.1"
 MASTER_PORT = 29500
 DP_ENV = ("TORCH_TPU_DP_SIZE", "TORCH_TPU_DP_MASTER_ADDR", "TORCH_TPU_DP_MASTER_PORT")
 EP_DEVICE_CONTROL_PLACEHOLDER = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+# Env the multi-host bootstrap exports besides the TORCH_TPU_* variables.
+_BOOTSTRAP_ENV_KEYS = ("MASTER_ADDR", "MASTER_PORT", "TPU_NUM_HOSTS", "NODE_RANK")
+# Plus what a worker process or the test launcher may have set.
+_WORKER_ENV_KEYS = _BOOTSTRAP_ENV_KEYS + (
+    "RANK",
+    "LOCAL_RANK",
+    "WORLD_SIZE",
+    "LOCAL_WORLD_SIZE",
+    "TPU_LOCAL_RANK_OFFSET",
+    "TPU_MULTIHOST_BACKEND",
+)
 
-# (nnodes, chips per host, dp, tp): P-B on v6e-128, DP2xTP16 on v6e-32, and
+
+def _is_torch_tpu_env(key: str) -> bool:
+    return key.startswith(("TORCH_TPU_", "_TORCH_TPU_"))
+
+
+# (nnodes, chips per host, dp, tp): DP8xTP16 on v6e-128, DP2xTP16 on v6e-32, and
 # the 4 "hosts" x 2 chips v6e-8 emulation.
 SHAPES = [(32, 4, 8, 16), (8, 4, 2, 16), (4, 2, 2, 4)]
 SHAPE_IDS = ["v6e128_dp8_tp16", "v6e32_dp2_tp16", "v6e8emul_dp2_tp4"]
@@ -44,18 +60,7 @@ SHAPE_IDS = ["v6e128_dp8_tp16", "v6e32_dp2_tp16", "v6e8emul_dp2_tp4"]
 @pytest.fixture(autouse=True)
 def isolated_environment(monkeypatch):
     for key in list(os.environ):
-        if key.startswith(("TORCH_TPU_", "_TORCH_TPU_")) or key in (
-            "MASTER_ADDR",
-            "MASTER_PORT",
-            "TPU_NUM_HOSTS",
-            "NODE_RANK",
-            "RANK",
-            "LOCAL_RANK",
-            "WORLD_SIZE",
-            "LOCAL_WORLD_SIZE",
-            "TPU_LOCAL_RANK_OFFSET",
-            "TPU_MULTIHOST_BACKEND",
-        ):
+        if _is_torch_tpu_env(key) or key in _WORKER_ENV_KEYS:
             monkeypatch.delenv(key)
     # check_and_update_config writes os.environ directly; restore afterwards.
     saved = dict(os.environ)
@@ -101,12 +106,7 @@ def _nnodes_dp_config(nnodes, chips, dp, tp, node_rank, ep=True):
 
 def _clear_bootstrap_env():
     for key in list(os.environ):
-        if key.startswith(("TORCH_TPU_", "_TORCH_TPU_")) or key in (
-            "MASTER_ADDR",
-            "MASTER_PORT",
-            "TPU_NUM_HOSTS",
-            "NODE_RANK",
-        ):
+        if _is_torch_tpu_env(key) or key in _BOOTSTRAP_ENV_KEYS:
             del os.environ[key]
 
 
@@ -131,7 +131,7 @@ def test_nnodes_dp_exports_torch_tpu_dp_env(nnodes, chips, dp, tp):
         )
         assert os.environ["TORCH_TPU_DP_SIZE"] == str(dp)
         assert os.environ["TORCH_TPU_DP_MASTER_ADDR"] == MASTER_ADDR
-        int(os.environ["TORCH_TPU_DP_MASTER_PORT"])
+        assert os.environ["TORCH_TPU_DP_MASTER_PORT"].isdigit()
         seen.append(os.environ["TORCH_TPU_DP_MASTER_PORT"])
         # EP spans every DP*TP worker, as in the single-host DP branch.
         assert TpuPlatform.device_control_env_var == EP_DEVICE_CONTROL_PLACEHOLDER
@@ -164,7 +164,7 @@ def test_nnodes_without_dp_leaves_dp_env_unset():
 
 
 class _ReachedDistInit(Exception):
-    pass
+    """Raised to stop TPUWorker.init_device at vLLM's distributed init."""
 
 
 def _init_worker_device(vllm_config):
@@ -195,10 +195,7 @@ def _init_worker_device(vllm_config):
 def test_nnodes_dp_worker_init_gets_past_dp_master_port(nnodes, chips, dp, tp):
     """TPUWorker.init_device must not die on the missing DP master port."""
     vllm_config = _nnodes_dp_config(nnodes, chips, dp, tp, node_rank=1)
-    try:
-        worker, dist_init = _init_worker_device(vllm_config)
-    except KeyError as e:
-        pytest.fail(f"TPUWorker.init_device raised KeyError {e}")
+    worker, dist_init = _init_worker_device(vllm_config)
     kwargs = dist_init.call_args.kwargs
     # EP-DP path: upstream re-adds dp_rank * tp, so init_rank is the TP rank.
     assert kwargs["world_size"] == tp

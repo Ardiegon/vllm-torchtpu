@@ -40,7 +40,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig, VllmConfig
+    from vllm.config import ModelConfig, ParallelConfig, VllmConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 
 else:
     ModelConfig = None
+    ParallelConfig = None
     VllmConfig = None
     EngineInput = None
     PoolingParams = None
@@ -70,6 +71,11 @@ else:
     SamplingType = None
 
 logger = init_logger(__name__)
+
+# Ports derived from --master-port on the multi-host mp path: master_port + 1
+# is the TORCH_TPU bootstrap rendezvous (tpu_mp_multihost._rendezvous_port),
+# master_port + 2 the TorchTPU DP master.
+_MP_MULTIHOST_DP_MASTER_PORT_OFFSET = 2
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -515,11 +521,13 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _export_torch_tpu_dp_env(
-        cls, parallel_config, master_addr: str, master_port: int
+        cls, parallel_config: ParallelConfig, master_addr: str, master_port: int
     ) -> None:
         """Export the DP env TPUWorker.init_device reads when DP > 1.
 
         Values the user already exported win over master_addr/master_port.
+        Under expert parallelism this also widens device control to every
+        DP*TP chip (`cls.device_control_env_var`).
         """
         # vLLM may pass per-engine ParallelConfig objects to workers with
         # data_parallel_size collapsed to 1. Preserve the original DP size
@@ -928,12 +936,11 @@ class TpuPlatform(Platform):
             if parallel_config.data_parallel_size > 1:
                 # DP replicas whose TP group spans hosts: every host must
                 # agree on the DP master without coordinating, so derive it
-                # from --master-addr/--master-port. master_port + 1 is the
-                # rendezvous above.
+                # from --master-addr/--master-port.
                 cls._export_torch_tpu_dp_env(
                     parallel_config,
                     parallel_config.master_addr,
-                    parallel_config.master_port + 2,
+                    parallel_config.master_port + _MP_MULTIHOST_DP_MASTER_PORT_OFFSET,
                 )
             logger.info(
                 "Force using TpuMultiprocExecutor for TPU multi-host "

@@ -5473,6 +5473,9 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
+        # DP lockstep pads every rank's batch to a shared token bucket, so the
+        # MoE layers need the padding mask to zero the routing weights of the
+        # padded rows (token_padding.zero_routing_weights_for_padding).
         if (
             envs.TPU_MOE_SKIP_PADDED_TOKENS
             or uses_mxfp4_moe
