@@ -45,12 +45,12 @@ from jax import lax
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
+from vllm_torchtpu.kernels.collectives.one_shot_dma import (
     DEFAULT_MAX_DMA_TOKENS,
     barrier_and_allocate,
     call_kernel,
-    kimi_guarded_psum,
-    kimi_guarded_psum_scatter_rows,
+    guarded_psum,
+    guarded_psum_scatter_rows,
     normalize_axis_name,
     seam_pieces_pack,
     seam_pieces_unpack,
@@ -391,7 +391,7 @@ def hierarchical_combine_rms_slice(
         return routed_full
 
     if dp_size > 1:
-        routed_dp = kimi_guarded_psum_scatter_rows(
+        routed_dp = guarded_psum_scatter_rows(
             moe_out,
             dp_axis_name,
             collective_id=COLLECTIVE_ID_MOE_DP_COMBINE_RS,
@@ -406,7 +406,7 @@ def hierarchical_combine_rms_slice(
         tp_psum_cap = min(
             max_dma_tokens, max(_TP_PSUM_MIN_ROWS, _TP_PSUM_MAX_TOTAL_ROWS // tp_size)
         )
-        routed_full = kimi_guarded_psum(
+        routed_full = guarded_psum(
             routed_dp,
             tp_axis_name,
             collective_id=COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,

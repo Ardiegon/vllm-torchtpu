@@ -11,27 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the shape/tiling helpers of the Kimi K3 one-shot DMA collectives."""
+"""CPU tests for the shape/tiling helpers of the one-shot DMA collectives."""
+
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src import tpu_info
 
-from vllm_torchtpu.kernels.kimi_k3 import pallas_dma as pd
+from vllm_torchtpu.kernels.collectives import one_shot_dma as pd
+
+
+@pytest.fixture(autouse=True)
+def _cpu_v6e_tpu_info():
+    """Answer `pltpu.get_tpu_info()` on CPU with the v6e table."""
+    tpu_info.get_tpu_info.cache_clear()
+    v6e = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion.TPU_V6E, 1)
+    with patch.dict(tpu_info.registry, {"cpu": lambda: v6e}):
+        yield
+    tpu_info.get_tpu_info.cache_clear()
 
 
 @pytest.mark.parametrize(
-    ("axis_name", "normalized", "as_tuple"),
-    [
-        ("tp", "tp", ("tp",)),
-        (("dp",), "dp", ("dp",)),
-        (["dp", "tp"], ("dp", "tp"), ("dp", "tp")),
-    ],
+    ("axis_name", "normalized"),
+    [("tp", "tp"), (("dp",), "dp"), (["dp", "tp"], ("dp", "tp"))],
 )
-def test_axis_name_helpers(axis_name, normalized, as_tuple):
+def test_normalize_axis_name(axis_name, normalized):
     assert pd.normalize_axis_name(axis_name) == normalized
-    assert pd.axis_tuple(axis_name) == as_tuple
 
 
 def test_normalize_axis_name_rejects_empty():
@@ -118,8 +126,6 @@ def test_seam_pieces_round_trip(axis_size, rows, lanes, dtype):
     x = jnp.asarray(rng.standard_normal((axis_size, rows, lanes)), dtype)
     packed = pd.seam_pieces_pack(x, axis_size)
     assert packed.shape[-1] % 128 == 0
-    tile = pd.seam_pieces_tile(axis_size, rows, lanes, dtype)
-    assert (tile.shape, tile.dtype) == (packed.shape, packed.dtype)
     np.testing.assert_array_equal(pd.seam_pieces_unpack(packed, rows, lanes), x)
 
 

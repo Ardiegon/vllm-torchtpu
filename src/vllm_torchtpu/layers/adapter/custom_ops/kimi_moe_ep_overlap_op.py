@@ -57,16 +57,16 @@ from vllm_torchtpu.distributed.dp_tp_mesh import (
     DP_TP_MESH_AXES,
     TP_AXIS_NAME,
 )
+from vllm_torchtpu.kernels.collectives.one_shot_dma import (
+    DEFAULT_MAX_DMA_TOKENS,
+    guarded_all_gather_cols,
+)
 from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
     COLLECTIVE_ID_MOE_TP_LATENT_AG,
     compute_shared_gu_and_act,
     dispatch_overlapping_shared_experts,
     hierarchical_combine_rms_slice,
     unpack_axial_gathered,
-)
-from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
-    DEFAULT_MAX_DMA_TOKENS,
-    kimi_guarded_all_gather_cols,
 )
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -195,7 +195,7 @@ def _make_moe_ep_overlap_jax_fn(
         else:
             # Decode: one-shot TP all-gather of the latent, then the async
             # DP dispatch of latent + metadata.
-            lat_tp = kimi_guarded_all_gather_cols(
+            lat_tp = guarded_all_gather_cols(
                 local_rdown,
                 TP_AXIS_NAME,
                 collective_id=COLLECTIVE_ID_MOE_TP_LATENT_AG,
