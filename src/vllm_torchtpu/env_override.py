@@ -418,11 +418,12 @@ _kimi_spec_kda_mode = envs.TPU_KIMI_OPT_SPEC_KDA
 
 # Tier-2 cache isolation: torch_tpu's /dev/shm/torch_tpu_cache/<name> keys
 # compiled executables by HLO + PjRt version, without LIBTPU_INIT_ARGS. When a
-# Kimi K3 knob changes LIBTPU_INIT_ARGS or the traced program and the caller
-# has not pinned TORCH_TPU_TIER2_COMPILATION_CACHE, namespace the Tier-2
-# directory so processes on the same host with different settings cannot
-# reuse a stale executable.
-if not _existing_tier2_cache:
+# Kimi K3 knob changes LIBTPU_INIT_ARGS or the traced program, rename an
+# enabled Tier-2 cache (the Tier-3 root above enables it) so processes on the
+# same host with different settings cannot reuse a stale executable. A
+# caller-pinned TORCH_TPU_TIER2_COMPILATION_CACHE is never renamed, and the
+# Tier-2 cache is never turned on here.
+if os.environ.get("TORCH_TPU_TIER2_COMPILATION_CACHE") and not _existing_tier2_cache:
     _tier2_name = _kimi_tier2_cache_name(
         os.environ.get("LIBTPU_INIT_ARGS", ""),
         _kimi_exit_fold_mode,

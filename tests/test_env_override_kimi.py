@@ -200,3 +200,9 @@ def test_invalid_mode_fails_at_import_even_with_a_pinned_cache():
         _import_env(
             TPU_KIMI_OPT_EXIT_FOLD="bogus", TORCH_TPU_TIER2_COMPILATION_CACHE="a3"
         )
+
+
+def test_kimi_modes_never_turn_the_tier2_cache_on():
+    env = _import_env(**_PRODUCTION)
+    assert env["TORCH_TPU_TIER2_COMPILATION_CACHE"] is None
+    assert env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] is None
