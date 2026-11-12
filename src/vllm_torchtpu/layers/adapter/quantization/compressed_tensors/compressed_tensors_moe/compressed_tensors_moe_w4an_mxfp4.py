@@ -26,7 +26,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     is_supported_by_planar_t_b11,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     load_w2_planar_t_mxfp4,
     load_w13_planar_t_mxfp4,
     prebuild_fused_moe_kernel,
+    prepare_routes,
     requant_load_kmajor_fp4,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -343,14 +344,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
-        # Ensure correct type for routing inputs
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-
-        if mask_padding:
-            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-                topk_ids, topk_weights, is_local_tensor=pipelined
-            )
+        topk_weights, topk_ids = prepare_routes(
+            x, topk_weights, topk_ids, pipelined=pipelined, mask_padding=mask_padding
+        )
 
         kwargs = {
             "hidden_states": x,

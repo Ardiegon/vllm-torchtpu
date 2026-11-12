@@ -26,6 +26,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
     repack_w2_planar_t,
     repack_w13_planar_t,
 )
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -37,8 +38,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
-_load_w13_planar_t_op = None
-_load_w2_planar_t_op = None
+_planar_t_load_ops: dict[str, Callable] = {}
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
 
@@ -106,28 +106,78 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     return _load_kmajor_fp4_op(w_u8)
 
 
+def _planar_t_load_op(name: str, fn: Callable) -> Callable:
+    """The cached torch bridge of a planar_t load transform."""
+    op = _planar_t_load_ops.get(name)
+    if op is None:
+        op = _planar_t_load_ops[name] = pallas.jax_op(name, fn)
+    return op
+
+
 def load_w13_planar_t_mxfp4(
     w13_u8: torch.Tensor, s13_u8: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One-time load transform of MXFP4 w13 weights + E8M0 scales to planar_t."""
-    global _load_w13_planar_t_op
-    if _load_w13_planar_t_op is None:
-        _load_w13_planar_t_op = pallas.jax_op(
-            "pallas::mxfp4_load_w13_planar_t", repack_w13_planar_t
-        )
-    return _load_w13_planar_t_op(w13_u8, s13_u8)
+    """One-time load transform of MXFP4 gate+up weights to the planar_t layout.
+
+    Args:
+      w13_u8: `[E, 2*N, K/2]` uint8 MXFP4 nibble pairs (gate rows first).
+      s13_u8: `[E, 2*N, K/32]` uint8 E8M0 scales.
+
+    Returns:
+      `(w13, s13)`: `[E, K, N]` uint8 planar_t nibbles and
+      `[E, 2*(K/32), 1, N]` uint8 transposed scales, the operands the
+      float8_e4m3b11fnuz decode kernels read
+      (`kernels.megablox.gmm_v6e_planar_t_b11.repack_w13_planar_t`).
+    """
+    return _planar_t_load_op("pallas::mxfp4_load_w13_planar_t", repack_w13_planar_t)(
+        w13_u8, s13_u8
+    )
 
 
 def load_w2_planar_t_mxfp4(
     w2_u8: torch.Tensor, s2_u8: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One-time load transform of MXFP4 w2 weights + E8M0 scales to planar_t."""
-    global _load_w2_planar_t_op
-    if _load_w2_planar_t_op is None:
-        _load_w2_planar_t_op = pallas.jax_op(
-            "pallas::mxfp4_load_w2_planar_t", repack_w2_planar_t
+    """One-time load transform of MXFP4 down-projection weights to planar_t.
+
+    Args:
+      w2_u8: `[E, K, N/2]` uint8 MXFP4 nibble pairs.
+      s2_u8: `[E, K, N/32]` uint8 E8M0 scales.
+
+    Returns:
+      `(w2, s2)`: `[E, N/2, K]` uint8 planar_t nibbles and `[E, N/32, 1, K]`
+      uint8 transposed scales
+      (`kernels.megablox.gmm_v6e_planar_t_b11.repack_w2_planar_t`).
+    """
+    return _planar_t_load_op("pallas::mxfp4_load_w2_planar_t", repack_w2_planar_t)(
+        w2_u8, s2_u8
+    )
+
+
+def prepare_routes(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    pipelined: bool,
+    mask_padding: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Readies pre-selected routes for the fused MoE bridges.
+
+    Casts the ids to int32 and the weights to the activation dtype, then,
+    with `mask_padding`, zeroes the routing weights of padded tokens
+    (`token_padding.zero_routing_weights_for_padding`; `pipelined` callers
+    pass rank-local tensors).
+
+    Returns:
+      `(topk_weights, topk_ids)`.
+    """
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(x.dtype)
+    if mask_padding:
+        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+            topk_ids, topk_weights, is_local_tensor=pipelined
         )
-    return _load_w2_planar_t_op(w2_u8, s2_u8)
+    return topk_weights, topk_ids
 
 
 def requant_load_kmajor_fp4(

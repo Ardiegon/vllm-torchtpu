@@ -627,17 +627,33 @@ def fused_moe_func(
     rank3_scales: bool | None = None,
     fused_decode_max_tokens: int | None = None,
 ) -> jax.Array:
-    # O6b: speculative-verify batches (65..256 tokens) take the multi-tray
-    # fused decode MoE instead of the routed GMM fallback.
+    """Run MoE with precomputed expert ids and weights.
+
+    Resolves the process-wide fused-decode knobs, then calls the jitted
+    implementation (see `_fused_moe_func_jitted` for the operand contract);
+    the arguments not listed below are passed through unchanged.
+
+    Args:
+      token_trays_mode: row-loop mode of the fused small-batch MXFP4 kernel;
+        None reads it from the compute-polish setting (`active_trays_mode`).
+      rank3_scales: rank-3 scale buffers in that kernel; None reads it from
+        the compute-polish setting (`use_copy_opt`).
+      fused_decode_max_tokens: largest batch the fused small-batch kernel
+        serves. None selects FUSED_VERIFY_MOE_MAX_TOKENS when speculative
+        verify batches use it (`use_spec_o6b`), else
+        FUSED_DECODE_MOE_MAX_TOKENS.
+    """
+    # Speculative-verify batches (65..256 tokens) take the multi-tray fused
+    # small-batch kernel instead of the routed GMM.
     resolved_max_tokens = (
         (FUSED_VERIFY_MOE_MAX_TOKENS if use_spec_o6b() else FUSED_DECODE_MOE_MAX_TOKENS)
         if fused_decode_max_tokens is None
-        else int(fused_decode_max_tokens)
+        else fused_decode_max_tokens
     )
     resolved_trays = (
         active_trays_mode() if token_trays_mode is None else token_trays_mode
     )
-    resolved_rank3 = use_copy_opt() if rank3_scales is None else bool(rank3_scales)
+    resolved_rank3 = use_copy_opt() if rank3_scales is None else rank3_scales
     return _fused_moe_func_jitted(
         hidden_states,
         w1,
