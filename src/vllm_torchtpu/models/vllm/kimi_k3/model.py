@@ -190,9 +190,7 @@ class KimiDecoderLayer(nn.Module):
             positions, hidden_states, sequence_parallel=sequence_parallel
         )
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
-        hidden_states = self.mlp_res(
-            prefix_sum, block_residuals, blocks_first=True
-        )
+        hidden_states = self.mlp_res(prefix_sum, block_residuals, blocks_first=True)
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
@@ -483,12 +481,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 if isinstance(module, KimiDecoderLayer):
                     mlp = getattr(module, "mlp", None)
                     if isinstance(mlp, KimiMLP):
-                        to_sync.extend(
-                            quantize_linear_layer_w8a16(mlp.gate_up_proj)
-                        )
-                        to_sync.extend(
-                            quantize_linear_layer_w8a16(mlp.down_proj)
-                        )
+                        to_sync.extend(quantize_linear_layer_w8a16(mlp.gate_up_proj))
+                        to_sync.extend(quantize_linear_layer_w8a16(mlp.down_proj))
                     if isinstance(module.self_attn, KimiDeltaAttention):
                         to_sync.extend(
                             quantize_linear_layer_w8a16(module.self_attn.o_proj)
@@ -538,14 +532,10 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                                 )
                             )
                         to_sync.extend(
-                            quantize_linear_layer_w8a16(
-                                module.routed_expert_down_proj
-                            )
+                            quantize_linear_layer_w8a16(module.routed_expert_down_proj)
                         )
                         to_sync.extend(
-                            quantize_linear_layer_w8a16(
-                                module.routed_expert_up_proj
-                            )
+                            quantize_linear_layer_w8a16(module.routed_expert_up_proj)
                         )
             if not getattr(self.config, "tie_word_embeddings", False):
                 to_sync.extend(quantize_linear_layer_w8a16(self.lm_head))

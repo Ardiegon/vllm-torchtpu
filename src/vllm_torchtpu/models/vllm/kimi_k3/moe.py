@@ -381,9 +381,10 @@ class KimiMoE(nn.Module):
 
             down_group = getattr(down_proj, "_chip_group", None)
             can_split_down_tp = (
-                (down_group is not None and down_group.world_size == self.tp_size and down_cols == latent_local)
-                or (down_group is None and down_cols == latent_dim)
-            )
+                down_group is not None
+                and down_group.world_size == self.tp_size
+                and down_cols == latent_local
+            ) or (down_group is None and down_cols == latent_dim)
             use_ep_overlap_split = (
                 is_exit_fold_active()
                 and self.use_ep
@@ -396,7 +397,9 @@ class KimiMoE(nn.Module):
                 w_down_tp = (
                     w_down.contiguous()
                     if down_cols == latent_local
-                    else w_down[:, rank * latent_local : (rank + 1) * latent_local].contiguous()
+                    else w_down[
+                        :, rank * latent_local : (rank + 1) * latent_local
+                    ].contiguous()
                 )
                 self._moe_in_down_cols = latent_local
                 self.w_routed_down_tp = fresh_buffer(w_down_tp)
@@ -456,9 +459,7 @@ class KimiMoE(nn.Module):
     def _forward_async_ep_unified(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
         routed = self.experts.routed_experts
-        topk_weights, topk_ids = moe_routing.route(
-            routed, hidden_states, router_logits
-        )
+        topk_weights, topk_ids = moe_routing.route(routed, hidden_states, router_logits)
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
             topk_ids, topk_weights, is_local_tensor=True
         )

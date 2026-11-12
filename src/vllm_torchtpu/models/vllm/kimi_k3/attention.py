@@ -739,9 +739,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.packed_prefill_weight = None
         self.packed_prefill_scale = None
         if not (
-            self.use_full_rank_gate
-            and self.num_heads > 0
-            and self.head_dim == 128
+            self.use_full_rank_gate and self.num_heads > 0 and self.head_dim == 128
         ):
             return
         local_proj = self.num_heads * self.head_dim
@@ -869,7 +867,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 if (self._kda_glue_enabled and beta_pad is not None)
                 else cast(
                     torch.Tensor,
-                    beta if beta is not None else cast(torch.Tensor, beta_pad)[:, : self.num_heads],
+                    beta
+                    if beta is not None
+                    else cast(torch.Tensor, beta_pad)[:, : self.num_heads],
                 )
             )
             output = self._core_attention_pooled(

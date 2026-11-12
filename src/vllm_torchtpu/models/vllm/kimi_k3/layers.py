@@ -72,9 +72,9 @@ def w8a16_matmul(
     if x_2d.device.type == "tpu":
         out_2d = _w8a16_matmul_op(x_2d, w_q, w_scale)
     else:
-        out_2d = (
-            torch.matmul(x_2d.float(), w_q.float()) * w_scale.unsqueeze(0)
-        ).to(x.dtype)
+        out_2d = (torch.matmul(x_2d.float(), w_q.float()) * w_scale.unsqueeze(0)).to(
+            x.dtype
+        )
     if bias is not None:
         out_2d = out_2d + bias
     return out_2d.reshape(*orig_shape[:-1], w_q.shape[1])
@@ -129,9 +129,7 @@ def quantize_linear_layer_w8a16(layer: nn.Module | None) -> list[torch.Tensor]:
     weight.data = torch.empty(0, dtype=w_data.dtype, device=w_data.device)
     del w_data, w_kn
     layer.weight = nn.Parameter(w_q, requires_grad=False)
-    layer.register_parameter(
-        "weight_scale", nn.Parameter(w_scale, requires_grad=False)
-    )
+    layer.register_parameter("weight_scale", nn.Parameter(w_scale, requires_grad=False))
     setattr(layer, WEIGHT_FLIPPED_ATTR, True)
     layer.quant_method = W8A16LinearMethod()
     return [layer.weight, layer.weight_scale]
