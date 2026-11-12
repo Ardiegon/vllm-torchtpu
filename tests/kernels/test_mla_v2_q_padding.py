@@ -16,27 +16,40 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src.pallas.mosaic import tpu_info
 
 from vllm_torchtpu.kernels.mla.v2.kernel import prepare_q_inputs
 
-# (actual heads, q dtype) -> padded heads: at least one 8-sublane tile, and
-# 16 rows for 8-bit q.
+_V6E = tpu_info.ChipVersion.TPU_V6E
+_TPU7X = tpu_info.ChipVersion.TPU_7X
+
+# (chip, actual heads, q dtype) -> padded heads. A chip that packs the dtype
+# pads to the packing; TPU v6e does not pack bf16 and pads to the 8-sublane
+# tile.
 _PADDED_HEADS = [
-    (3, jnp.bfloat16, 8),
-    (6, jnp.bfloat16, 8),
-    (12, jnp.bfloat16, 16),
-    (16, jnp.bfloat16, 16),
-    (3, jnp.float32, 8),
-    (12, jnp.float32, 16),
-    (3, jnp.float8_e4m3fn, 16),
-    (6, jnp.float8_e4m3fn, 16),
-    (16, jnp.float8_e4m3fn, 16),
-    (20, jnp.float8_e4m3fn, 32),
+    (_V6E, 3, jnp.bfloat16, 8),
+    (_V6E, 6, jnp.bfloat16, 8),
+    (_V6E, 12, jnp.bfloat16, 16),
+    (_V6E, 16, jnp.bfloat16, 16),
+    (_V6E, 3, jnp.float8_e4m3fn, 4),
+    (_V6E, 3, jnp.float32, 3),
+    (_TPU7X, 3, jnp.bfloat16, 4),
+    (_TPU7X, 6, jnp.bfloat16, 6),
+    (_TPU7X, 12, jnp.bfloat16, 12),
+    (_TPU7X, 3, jnp.float8_e4m3fn, 4),
+    (_TPU7X, 6, jnp.float8_e4m3fn, 8),
+    (_TPU7X, 3, jnp.float32, 3),
 ]
 
 
-@pytest.mark.parametrize("num_heads,dtype,padded_heads", _PADDED_HEADS)
-def test_prepare_q_inputs_pads_heads_to_sublane_tile(num_heads, dtype, padded_heads):
+@pytest.mark.parametrize("chip,num_heads,dtype,padded_heads", _PADDED_HEADS)
+def test_prepare_q_inputs_pads_heads_to_the_chip_tiling(
+    monkeypatch, chip, num_heads, dtype, padded_heads
+):
+    tpu_info.get_tpu_info.cache_clear()
+    monkeypatch.setitem(
+        tpu_info.registry, "cpu", lambda: tpu_info.get_tpu_info_for_chip(chip, 1)
+    )
     num_tokens, head_dim = 5, 192
     q = (
         jnp.arange(num_tokens * num_heads * head_dim, dtype=jnp.float32)
@@ -45,6 +58,7 @@ def test_prepare_q_inputs_pads_heads_to_sublane_tile(num_heads, dtype, padded_he
     )
 
     padded = prepare_q_inputs(q)
+    tpu_info.get_tpu_info.cache_clear()
 
     assert padded.shape == (num_tokens, padded_heads, 256)
     assert padded.dtype == dtype

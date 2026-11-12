@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from vllm_torchtpu.logger import init_logger
 
@@ -1345,9 +1345,66 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 }
 
 
+# "mixed" tile of BF16 pools whose KV pages also hold recurrent state (a page
+# is 2 * page_size_per_kv_packing tokens, set by the state size). The tile is
+# bound by the page and the local q heads, not by the batch shape, so these
+# rows are keyed by (local q heads, page_size_per_kv_packing) and serve every
+# max_num_seqs and pages_per_seq. One page per block: on TPU v6e four
+# 324-token pages with 512 queries need 65.8 MiB of scoped VMEM and fail to
+# compile under the 60 MiB limit, one page with 256 queries compiles.
+_STATE_POOL_MIXED_PARAMS = TunableParams(
+    num_kv_pages_per_block=1,
+    num_queries_per_block=256,
+    vmem_limit_bytes=62914560,
+    decode_batch_size=1,
+    q_split=2,
+)
+# Smaller batches keep the default tile: q_split halves the query block.
+_STATE_POOL_MIXED_MIN_TOKENS = 64
+
+
+def _without_batch_shape(tuning_key: TuningKey) -> TuningKey:
+    return replace(tuning_key, max_num_tokens=0, max_num_seqs=0, pages_per_seq=0)
+
+
+_STATE_POOL_MIXED_ROWS = frozenset(
+    _without_batch_shape(
+        TuningKey(
+            case="mixed",
+            max_num_tokens=_STATE_POOL_MIXED_MIN_TOKENS,
+            actual_num_q_heads=local_q_heads,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            kv_dtype="bfloat16",
+            q_dtype="bfloat16",
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=2,
+        )
+    )
+    for local_q_heads, page_size_per_kv_packing in (
+        (4, 162),
+        (6, 162),
+        (8, 324),
+        (12, 324),
+    )
+)
+
+
+def _state_pool_mixed_params(tuning_key: TuningKey) -> TunableParams | None:
+    if (
+        tuning_key.max_num_tokens < _STATE_POOL_MIXED_MIN_TOKENS
+        or _without_batch_shape(tuning_key) not in _STATE_POOL_MIXED_ROWS
+    ):
+        return None
+    return _STATE_POOL_MIXED_PARAMS
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
+    state_pool_params = _state_pool_mixed_params(tuning_key)
+    if state_pool_params is not None:
+        return state_pool_params
     else:
         logger.warning(
             "No tuned parameters found for the given tuning key: %s, "

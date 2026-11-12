@@ -2154,21 +2154,22 @@ def _mla_ragged_paged_attention_kernel(
     ### ------- Kernel end ------- ###
 
 
-# Sublanes per vreg tile on TPU (the 8 in an (8, 128) tile).
-_NUM_SUBLANES = 8
-# Rows of q heads per unit of dtype packing that the packed q tile needs.
-_Q_HEAD_ROWS_PER_PACKING = 4
-
-
 def _q_heads_alignment(dtype: jnp.dtype) -> int:
     """Multiple the q head count is padded to.
 
-    Heads land on the sublane axis of the packed q tile, so the padded head
-    count spans at least one full 8-sublane tile, and
-    `packing * _Q_HEAD_ROWS_PER_PACKING` rows for packed dtypes (16 for
-    8-bit q). bf16 and f32 q both pad to 8.
+    Heads sit on the sublane axis of the q tiles, `get_dtype_packing(dtype)`
+    of them per sublane. A chip that does not pack the dtype that densely
+    (bf16 on TPU v6e: one row per sublane) tiles the head axis by whole
+    sublane tiles, and Mosaic rejects a head slice that is not a multiple of
+    the tile ("Slice sizes along tiled dimensions must be aligned to tiles"),
+    so there the heads are padded to the tile.
     """
-    return max(_NUM_SUBLANES, get_dtype_packing(dtype) * _Q_HEAD_ROWS_PER_PACKING)
+    packing = get_dtype_packing(dtype)
+    tpu_info = pltpu.get_tpu_info()
+    sublane_tiling = tpu_info.get_sublane_tiling(dtype)
+    if sublane_tiling == packing * tpu_info.num_sublanes:
+        return packing
+    return sublane_tiling
 
 
 def prepare_q_inputs(
