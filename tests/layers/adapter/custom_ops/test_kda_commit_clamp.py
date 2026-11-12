@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU test for the request clamp of `kimi_pooled_kda_commit`.
+"""CPU test for the request clamp of `pooled_kda_commit`.
 
 The commit clamps the active requests to the window rows the verify input
 caches hold (`cache_qkv.shape[0] // (1 + K)` requests), not to the token rows,
@@ -67,7 +67,7 @@ def test_pooled_kda_commit_clamps_active_requests_to_window_rows():
     with patch.object(
         kda_attention_op, "_run_kda_window_kernel", side_effect=fake_run_kernel
     ):
-        kda_attention_op.kimi_pooled_kda_commit(
+        kda_attention_op.pooled_kda_commit(
             pool,
             cache_qkv,
             cache_gate,

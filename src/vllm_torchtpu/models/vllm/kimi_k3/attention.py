@@ -56,7 +56,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
-    build_kimi_pooled_kda_verify_commit_ops,
+    build_pooled_kda_verify_commit_ops,
+    supports_deferred_spec_commit,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.weight_only_int8 import (
@@ -71,7 +72,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
-from .opt_flags import use_kda_glue, use_spec_kda_verify
+from .opt_flags import use_spec_kda_verify
 
 logger = init_logger(__name__)
 
@@ -504,7 +505,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     supports_dcp = False
     use_full_rank_gate: bool = False
     _tp_exit_psum_op: Callable[[torch.Tensor], torch.Tensor] | None = None
-    _kda_glue_enabled: bool = False
     defers_spec_state_commit: bool = False
 
     def __init__(
@@ -588,15 +588,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             torch.empty(self.conv_size, 3, self.num_heads, self.head_dim),
             persistent=False,
         )
-        self._kda_glue_enabled = bool(
-            use_kda_glue()
-            and envs.TPU_KDA_DIRECT_POOL_STREAMING
-            and not (
-                envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
-                and envs.TPU_RAIDEN_KIMIK3_ADMISSION
-            )
-            and self.num_spec_tokens == 0
-        )
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
             self.projection_size,
@@ -660,7 +651,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
-            kda_glue=self._kda_glue_enabled,
         )
         # With speculative KDA verify/commit enabled (K > 0), the unified-pool
         # KDA runs a side-effect-free W = 1 + K verify that caches its kernel
@@ -668,12 +658,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # rejection sampling (`commit_spec`). The caches hold the leading
         # `max_num_seqs * W` token rows, which cover every windowed row
         # ([decode][verify][prefill] batch order).
-        self.defers_spec_state_commit = use_spec_kda_verify(self.num_spec_tokens)
+        self.defers_spec_state_commit = use_spec_kda_verify(
+            self.num_spec_tokens
+        ) and supports_deferred_spec_commit(vllm_config)
         self.pooled_kda_verify_op = None
         self.pooled_kda_commit_op = None
         if self.defers_spec_state_commit:
             self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
-                build_kimi_pooled_kda_verify_commit_ops(
+                build_pooled_kda_verify_commit_ops(
                     prefix,
                     lower_bound=self.gate_lower_bound,
                     eps=config.rms_norm_eps,
@@ -835,9 +827,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         group = self.prefill_group if sequence_parallel else get_tp_group()
         assert group is not None
         output_gate: torch.Tensor | None = None
-        beta_pad: torch.Tensor | None = None
-        beta: torch.Tensor | None = None
-        query: torch.Tensor | None = None
         # Set and read only on the low-rank gate path.
         gate_input: torch.Tensor | None = None
         local_proj = self.local_projection_size
@@ -866,9 +855,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
                 [qkv_cols, beta_pad_cols, local_proj, self.head_dim], dim=-1
             )
-            if not self._kda_glue_enabled:
-                beta = beta_pad[:, : self.num_heads]
-                query = mixed_qkv[:, :local_proj]
+            beta = beta_pad[:, : self.num_heads]
+            query = mixed_qkv[:, :local_proj]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
@@ -896,33 +884,20 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
-            q_ref = query if query is not None else mixed_qkv[:, :local_proj]
-            output = torch.zeros_like(q_ref)
+            output = torch.zeros_like(query)
         elif len(self.kv_cache) == 1:
             # Unified pool: the single attention-shaped buffer carries both
             # KDA state regions.
-            if self._kda_glue_enabled and beta_pad is not None:
-                pooled_beta = beta_pad
-            elif beta is not None:
-                pooled_beta = beta
-            else:
-                assert beta_pad is not None
-                pooled_beta = beta_pad[:, : self.num_heads]
             output = self._core_attention_pooled(
                 mixed_qkv,
                 raw_gate,
-                pooled_beta,
+                beta,
                 output_gate,
                 self.kv_cache[0],
                 metadata,
             ).flatten(1)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
-            dense_beta = (
-                beta
-                if beta is not None
-                else cast(torch.Tensor, beta_pad)[:, : self.num_heads]
-            )
             window_distribution = metadata.mamba_request_distribution
             if window_distribution is None:
                 window_distribution = metadata.request_distribution
@@ -937,7 +912,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = self.dispatched_kda_op(
                 mixed_qkv,
                 raw_gate,
-                dense_beta,
+                beta,
                 output_gate,
                 sconv_cache,
                 recurrent_cache,

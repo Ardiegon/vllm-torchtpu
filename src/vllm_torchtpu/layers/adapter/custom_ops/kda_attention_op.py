@@ -30,14 +30,11 @@ from vllm_torchtpu.gdn_pool_layout import (
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
     pooled_gdn_state_itemsize,
+    unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
-from vllm_torchtpu.kernels.gdn.v3.gated_output_norm import (
-    gated_output_norm as _gated_output_norm,
-)
-from vllm_torchtpu.kernels.gdn.v3.gated_output_norm import gated_output_norm_2d
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -249,6 +246,20 @@ def _short_conv_tokens(
 # ===========================================================================
 # Shared KDA helpers
 # ===========================================================================
+
+
+def _gated_output_norm(
+    output: jax.Array,  # [num_rows, H, D]
+    output_gate: jax.Array,  # [num_rows, H * D] raw gate
+    norm_weight: jax.Array,  # [D]
+    eps: float,
+    activation_dtype,
+) -> jax.Array:
+    """Per-head ``o_norm`` followed by the sigmoid output gate."""
+    output = output.astype(activation_dtype).astype(jnp.float32)
+    output *= jax.lax.rsqrt(jnp.mean(output * output, axis=-1, keepdims=True) + eps)
+    output = (output * norm_weight.astype(jnp.float32)).astype(activation_dtype)
+    return output * jax.nn.sigmoid(output_gate.reshape(output.shape))
 
 
 def _check_kda_abi(
@@ -645,31 +656,6 @@ def _kernel_conv_weight(conv_weight: jax.Array) -> jax.Array:
     return jnp.transpose(conv_weight_flat, (1, 0))[:, None]
 
 
-def _kda_beta_heads(beta: jax.Array, num_heads: int) -> jax.Array:
-    """The real beta columns of a possibly lane-padded beta.
-
-    Callers may hand in beta already zero-padded past `num_heads` columns (the
-    kda_glue polish passes the 128-column lane-padded beta). Only the leading
-    `num_heads` columns carry data, and the verify input cache stores exactly
-    those.
-    """
-    return beta[:, :num_heads] if beta.shape[1] > num_heads else beta
-
-
-def _kda_conv_weight_4d(
-    conv_weight: jax.Array, dtype: jnp.dtype, num_heads: int, head_dim: int
-) -> jax.Array:
-    """The fused [K, 3, H, D] conv weight.
-
-    A load-time [K, 1, 3 * H * D] float32 copy is cast back to the activation
-    dtype and reshaped; a fused 4D weight passes through unchanged.
-    """
-    if conv_weight.ndim != 3:
-        return conv_weight
-    kernel_size = conv_weight.shape[0]
-    return conv_weight.astype(dtype).reshape(kernel_size, 3, num_heads, head_dim)
-
-
 def _run_kda_window_kernel(
     mixed_qkv: jax.Array,
     raw_gate: jax.Array,
@@ -689,7 +675,6 @@ def _run_kda_window_kernel(
     batched_state_write: gdn_config.StateWrite = gdn_config.StateWrite.ALL,
     window_lens: jax.Array | None = None,
     batched_only: bool = False,
-    conv_weight_is_kernel_layout: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """One fused conv1d + KDA pass streaming state directly from/to `pool`.
 
@@ -701,16 +686,13 @@ def _run_kda_window_kernel(
     direct-streaming decode/prefill pass.
 
     `conv_weight` is the fused [K, 3, H, D] weight (or any [K, ...] layout
-    with the same flat channel order), or already the kernel layout
-    [K, 1, 3 * H * D] when `conv_weight_is_kernel_layout` is set.
+    with the same flat channel order).
 
     Returns `(new_pool, out)` with `out` of shape [T, H * D].
     """
     num_heads = a_log.shape[0]
     head_dim = dt_bias.shape[0] // num_heads
     kernel_size = conv_weight.shape[0]
-    if not conv_weight_is_kernel_layout:
-        conv_weight = _kernel_conv_weight(conv_weight)
     return gdn_wrapper.fused_conv1d_gdn(
         qkv=mixed_qkv,
         # Raw: the kernel applies sigmoid to `b` and the gate activation to
@@ -719,8 +701,8 @@ def _run_kda_window_kernel(
         a=raw_gate,
         conv_state=None,
         recurrent_state=None,
-        conv_weight=conv_weight,
-        # Kimi's short convolution is bias-free.
+        conv_weight=_kernel_conv_weight(conv_weight),
+        # The short convolution is bias-free.
         conv_bias=None,
         a_log=a_log,
         # Per-channel under KDA, and Mosaic rejects the flat form.
@@ -742,7 +724,6 @@ def _run_kda_window_kernel(
         batched_only=batched_only,
         state_source=pool,
         state_plan=plan,
-        conv_weight_is_kernel_layout=conv_weight_is_kernel_layout,
         batched_state_write=batched_state_write,
         window_lens=window_lens,
     )
@@ -822,19 +803,13 @@ def _pooled_kda_core(
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
-    kda_glue: bool = False,
-    direct_pool_streaming: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """One pooled KDA step: state read from and written back to `pool`.
 
     Streams both state regions directly between `pool` and the fused kernel
-    when `direct_pool_streaming` is set, the conv state is a single shard and
-    there is no checkpoint window; otherwise gathers the regions into dense
-    buffers, runs the fused kernel and scatters them back.
-
-    `kda_glue` (direct streaming only) feeds the conv weight in the kernel
-    layout and runs the 2D gated norm, returning `[T, H * D]` instead of
-    `[T, H, D]`.
+    when the conv state is a single shard and there is no checkpoint window;
+    otherwise gathers the regions into dense buffers, runs the fused kernel
+    and scatters them back.
     """
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
@@ -869,7 +844,7 @@ def _pooled_kda_core(
         conv_shard_heads=conv_shard_heads,
     )
 
-    if direct_pool_streaming and geom.conv_shards == 1 and num_spec_tokens == 0:
+    if geom.conv_shards == 1 and num_spec_tokens == 0:
         return _pooled_kda_direct(
             mixed_qkv,
             raw_gate,
@@ -889,7 +864,6 @@ def _pooled_kda_core(
             geom=geom,
             lower_bound=lower_bound,
             eps=eps,
-            kda_glue=kda_glue,
         )
     return _pooled_kda_gather_scatter(
         mixed_qkv,
@@ -927,7 +901,6 @@ def _pooled_kda_direct(
     geom: _KdaPoolGeometry,
     lower_bound: float | None,
     eps: float,
-    kda_glue: bool,
 ) -> tuple[jax.Array, jax.Array]:
     """K = 0 pooled KDA with in-kernel pool streaming.
 
@@ -940,7 +913,6 @@ def _pooled_kda_direct(
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
     kernel_size = conv_weight.shape[0]
-    conv_dim = 3 * num_heads * head_dim
     plan = _kda_direct_state_plan(
         pool,
         geom,
@@ -948,13 +920,6 @@ def _pooled_kda_direct(
         head_dim=head_dim,
         kernel_size=kernel_size,
     )
-    if kda_glue and not (
-        conv_weight.ndim == 3 and conv_weight.shape == (kernel_size, 1, conv_dim)
-    ):
-        # Zero-copy reshape of [K, 3, H, D] -> [K, 1, 3*H*D] (a weight
-        # already in that layout is passed through), skipping the
-        # transpose -> swapaxes(0, 2) round trip.
-        conv_weight = conv_weight.reshape(kernel_size, 1, conv_dim)
     new_pool, out = _run_kda_window_kernel(
         mixed_qkv,
         raw_gate,
@@ -970,23 +935,9 @@ def _pooled_kda_direct(
         plan=plan,
         lower_bound=lower_bound,
         num_spec_tokens=0,
-        conv_weight_is_kernel_layout=kda_glue,
     )
-    if kda_glue:
-        output = gated_output_norm_2d(
-            out,
-            output_gate,
-            norm_weight,
-            eps,
-            mixed_qkv.dtype,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        )
-    else:
-        output = out.reshape(num_tokens, num_heads, head_dim)
-        output = _gated_output_norm(
-            output, output_gate, norm_weight, eps, mixed_qkv.dtype
-        )
+    output = out.reshape(num_tokens, num_heads, head_dim)
+    output = _gated_output_norm(output, output_gate, norm_weight, eps, mixed_qkv.dtype)
     return output, new_pool
 
 
@@ -1081,18 +1032,14 @@ def _pooled_kda_gather_scatter(
     # kernel gates their state DMAs to zero size rather than redirecting them
     # to the null slot.
     fused_core = _build_fused_core(lower_bound, eps, num_spec_tokens)
-    beta_for_core = _kda_beta_heads(beta, num_heads)
-    conv_w_for_core = _kda_conv_weight_4d(
-        conv_weight, mixed_qkv.dtype, num_heads, head_dim
-    )
     output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,
-        beta_for_core,
+        beta,
         output_gate,
         conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
         ssm_buf,
-        conv_w_for_core,
+        conv_weight,
         a_log,
         dt_bias,
         norm_weight,
@@ -1139,6 +1086,37 @@ def _pooled_kda_gather_scatter(
     return output, pool
 
 
+def _pooled_conv_shard_heads(vllm_config: VllmConfig) -> int | None:
+    """Heads per stored conv-state shard, or None for an unsharded conv state."""
+    if not (
+        tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+        and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION
+    ):
+        return None
+    total_heads = int(
+        vllm_config.model_config.hf_text_config.linear_attn_config["num_heads"]
+    )
+    source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
+    if source_tp <= 0 or total_heads % source_tp:
+        raise ValueError("KDA conv source TP must divide num_heads")
+    return total_heads // source_tp
+
+
+def supports_deferred_spec_commit(vllm_config: VllmConfig) -> bool:
+    """Whether pooled KDA can verify without state writes and commit afterwards.
+
+    The verify and commit ops stream each sequence's state straight between
+    its own pool block and VMEM, which needs the unified KV pool and an
+    unsharded conv state. Other deployments keep the checkpoint-window op.
+    """
+    return (
+        unified_kv_layout_enabled_for_architecture(
+            vllm_config.model_config.architecture
+        )
+        and _pooled_conv_shard_heads(vllm_config) is None
+    )
+
+
 def build_kimi_pooled_kda_op(
     prefix: str,
     *,
@@ -1146,18 +1124,15 @@ def build_kimi_pooled_kda_op(
     eps: float,
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
-    kda_glue: bool = False,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
     Same torch-level contract as the dense dispatched op, except the two
     state caches are replaced by the single attention-shaped pool buffer,
-    and the output is [T, H, D] -- or [T, H * D] when `kda_glue` is set and
-    the op takes the direct-streaming K = 0 path, whose 2D gated norm avoids
-    the 2D <-> 3D relayout (callers flatten the output either way). The state
-    regions are streamed through (or gathered out of the pool into) the fused
-    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
-    unfused core is not available here) and written back.
+    and the output is [T, H, D]. The state regions are streamed through (or
+    gathered out of the pool into) the fused conv1d + GDN v3 kernel (the only
+    kernel the pooled path supports — the unfused core is not available
+    here) and written back.
 
     The manager block size (``cache_config.block_size``) lets the op size
     the state regions against the manager block and derive the
@@ -1168,28 +1143,7 @@ def build_kimi_pooled_kda_op(
     pre-adjustment one (16) and the op would size its regions against the
     wrong manager block.
     """
-
-    conv_shard_heads = None
-    if (
-        tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
-        and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION
-    ):
-        total_heads = int(
-            vllm_config.model_config.hf_text_config.linear_attn_config["num_heads"]
-        )
-        source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
-        if source_tp <= 0 or total_heads % source_tp:
-            raise ValueError("KDA conv source TP must divide num_heads")
-        conv_shard_heads = total_heads // source_tp
-
-    # Read once here and passed down: the op body runs under trace, where an
-    # env read would be captured silently.
-    direct_pool_streaming = tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING
-    # The glue fusion exists only on the direct-streaming K = 0 path.
-    direct_eligible = (
-        direct_pool_streaming and conv_shard_heads is None and num_spec_tokens == 0
-    )
-    kda_glue_active = bool(kda_glue and direct_eligible)
+    conv_shard_heads = _pooled_conv_shard_heads(vllm_config)
 
     def pooled_core(
         mixed_qkv: jax.Array,
@@ -1233,8 +1187,6 @@ def build_kimi_pooled_kda_op(
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
-            kda_glue=kda_glue_active,
-            direct_pool_streaming=direct_pool_streaming,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op
@@ -1243,16 +1195,15 @@ def build_kimi_pooled_kda_op(
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
     op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
-    if direct_pool_streaming:
-        op_name += "_direct_pool"
+    # The op streams state straight from the pool where it can; the tag keeps
+    # programs cached for the gather/scatter-only op from being reused.
+    op_name += "_direct_pool"
     if num_spec_tokens:
         op_name += f"_window{num_spec_tokens + 1}"
     if conv_shard_heads is not None:
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.
         op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
-    if kda_glue_active:
-        op_name += "_kdaglue"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
 
     def _fake_pooled(
@@ -1268,13 +1219,8 @@ def build_kimi_pooled_kda_op(
         *args,
         **kwargs,
     ):
-        out_shape = (
-            (mixed_qkv.size(0), a_log.shape[0] * norm_weight.shape[0])
-            if kda_glue_active
-            else (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0])
-        )
         output = torch.empty(
-            out_shape,
+            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
             dtype=mixed_qkv.dtype,
             device=mixed_qkv.device,
         )
@@ -1324,7 +1270,7 @@ def build_kimi_pooled_kda_op(
     return pooled_impl
 
 
-def kimi_pooled_kda_verify(
+def pooled_kda_verify(
     mixed_qkv: jax.Array,
     raw_gate: jax.Array,
     beta: jax.Array,
@@ -1355,7 +1301,7 @@ def kimi_pooled_kda_verify(
     writes no window checkpoint back (`StateWrite.NONE`: the returned pool
     aliases the donated input with its bytes untouched; prefill segments
     still commit their single final state). The accepted prefix is committed
-    later by `kimi_pooled_kda_commit`. The kernel inputs of the leading
+    later by `pooled_kda_commit`. The kernel inputs of the leading
     `cache_*.shape[0]` token rows -- which hold every windowed row, since the
     persistent batch is ordered [decode][verify][prefill] -- are cached for
     that commit. Returns `(output [T, H, D], pool, cache_qkv, cache_gate,
@@ -1396,9 +1342,9 @@ def kimi_pooled_kda_verify(
     new_pool, out = _run_kda_window_kernel(
         mixed_qkv,
         raw_gate,
-        _kda_beta_heads(beta, num_heads),
+        beta,
         pool,
-        _kda_conv_weight_4d(conv_weight, mixed_qkv.dtype, num_heads, head_dim),
+        conv_weight,
         a_log,
         dt_bias,
         reqs.query_start_loc,
@@ -1416,7 +1362,6 @@ def kimi_pooled_kda_verify(
     output = _gated_output_norm(output, output_gate, norm_weight, eps, mixed_qkv.dtype)
 
     rows = min(num_tokens, cache_qkv.shape[0])
-    beta_heads = _kda_beta_heads(beta, num_heads)
 
     def _cache(cache: jax.Array, value: jax.Array) -> jax.Array:
         return jax.lax.dynamic_update_slice(
@@ -1428,11 +1373,11 @@ def kimi_pooled_kda_verify(
         new_pool,
         _cache(cache_qkv, mixed_qkv),
         _cache(cache_gate, raw_gate),
-        _cache(cache_beta, beta_heads),
+        _cache(cache_beta, beta),
     )
 
 
-def kimi_pooled_kda_commit(
+def pooled_kda_commit(
     pool: jax.Array,
     cache_qkv: jax.Array,
     cache_gate: jax.Array,
@@ -1517,7 +1462,7 @@ def kimi_pooled_kda_commit(
     return new_pool
 
 
-def build_kimi_pooled_kda_verify_commit_ops(
+def build_pooled_kda_verify_commit_ops(
     prefix: str,
     *,
     lower_bound: float | None,
@@ -1527,8 +1472,8 @@ def build_kimi_pooled_kda_verify_commit_ops(
 ):
     """Build the speculative verify and masked-commit pooled KDA ops.
 
-    Used instead of the checkpoint-window pooled op when
-    `TPU_KIMI_OPT_SPEC_KDA` enables the masked commit. Returns
+    Used instead of the checkpoint-window pooled op when the layer defers its
+    speculative state commit (`supports_deferred_spec_commit`). Returns
     ``(verify_impl, commit_impl)``. ``verify_impl`` has the pooled op's
     torch-level contract plus three per-layer input caches that it refreshes
     in place; ``commit_impl`` advances the pool by each windowed row's
@@ -1536,10 +1481,11 @@ def build_kimi_pooled_kda_verify_commit_ops(
     """
     if num_spec_tokens <= 0:
         raise ValueError("Pooled KDA verify/commit ops require num_spec_tokens > 0")
-    if not tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING:
+    if not supports_deferred_spec_commit(vllm_config):
         raise NotImplementedError(
-            "Pooled KDA speculative verify needs TPU_KDA_DIRECT_POOL_STREAMING=1; "
-            "set it or disable TPU_KIMI_OPT_SPEC_KDA"
+            "Pooled KDA verify/commit ops stream state straight from the unified "
+            "KV pool and need an unsharded conv state; use the checkpoint-window "
+            "pooled op for this deployment."
         )
     window = num_spec_tokens + 1
     conv_tag = DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch.")
@@ -1564,7 +1510,7 @@ def build_kimi_pooled_kda_verify_commit_ops(
         cache_gate: jax.Array,
         cache_beta: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        return kimi_pooled_kda_verify(
+        return pooled_kda_verify(
             mixed_qkv,
             raw_gate,
             beta,
@@ -1602,7 +1548,7 @@ def build_kimi_pooled_kda_verify_commit_ops(
         window_distribution: jax.Array,
         accepted_lens: jax.Array,
     ) -> jax.Array:
-        return kimi_pooled_kda_commit(
+        return pooled_kda_commit(
             pool,
             cache_qkv,
             cache_gate,
@@ -1623,12 +1569,10 @@ def build_kimi_pooled_kda_verify_commit_ops(
     # The variant and window are part of the op name so a program cached for
     # the checkpoint-window or K=0 op is never reused.
     verify_name = (
-        f"pallas::kimi_pooled_kda_verify_w{window}_{layer_tag}"
-        f"_conv_{conv_tag}_direct_pool"
+        f"pallas::kda_pooled_verify_w{window}_{layer_tag}_conv_{conv_tag}_direct_pool"
     )
     commit_name = (
-        f"pallas::kimi_pooled_kda_commit_w{window}_{layer_tag}"
-        f"_conv_{conv_tag}_direct_pool"
+        f"pallas::kda_pooled_commit_w{window}_{layer_tag}_conv_{conv_tag}_direct_pool"
     )
     verify_op = pallas.jax_op(verify_name, verify_core, donate_argnums=(4, 14, 15, 16))
     commit_op = pallas.jax_op(commit_name, commit_core, donate_argnums=(0,))

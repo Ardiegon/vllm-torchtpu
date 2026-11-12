@@ -364,14 +364,12 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
-        "conv_weight_is_kernel_layout",
-        "skip_empty_per_seq",
         "batched_state_write",
     ),
 )
 def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
-    b: jax.Array,  # [batch_size, n_v] or [batch_size, aligned_num_v_heads]
+    b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
     recurrent_state: jax.Array | None,  # [num_seqs + 1, nv, dk, dv]
@@ -403,8 +401,6 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
-    conv_weight_is_kernel_layout: bool = False,
-    skip_empty_per_seq: bool = False,
     batched_state_write: config.StateWrite = config.StateWrite.ALL,
     window_lens: jax.Array | None = None,  # [num_seqs]
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
@@ -413,9 +409,7 @@ def fused_conv1d_gdn(
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
             where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
-        b: b tensor (for beta) of shape [batch_size, n_v], or
-            [batch_size, aligned_num_v_heads] if the caller already padded the
-            heads to a lane multiple.
+        b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
             kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
@@ -426,9 +420,7 @@ def fused_conv1d_gdn(
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
             sequence. None when `state_source` carries the states.
-        conv_weight: Convolution weight tensor of shape [dim_size, 1,
-            kernel_size], or [kernel_size, 1, dim_size] (the kernel's own
-            layout) when `conv_weight_is_kernel_layout` is set.
+        conv_weight: Convolution weight tensor of shape [dim_size, 1, kernel_size].
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].
         dt_bias: dt_bias tensor of shape [n_v]; [n_v, d_k] under KDA, whose
@@ -483,11 +475,6 @@ def fused_conv1d_gdn(
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
-        conv_weight_is_kernel_layout: `conv_weight` is already
-            [kernel_size, 1, dim_size] (kernel layout) instead of
-            [dim_size, 1, kernel_size], so no transpose is needed.
-        skip_empty_per_seq: Pooled path only. Skip the PER_SEQ pallas_call
-            (via `lax.cond`) when the batch has no prefill/mixed sequences.
         batched_state_write: Which BATCHED-segment window checkpoints are
             written back to `state_source` (see `config.StateWrite`):
             `ALL` (default), `NONE` (side-effect-free verify) or `LAST`
@@ -558,10 +545,7 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    if conv_weight_is_kernel_layout:
-        assert conv_weight.shape == (kernel_size, 1, dim)
-    else:
-        assert conv_weight.shape == (dim, 1, kernel_size)
+    assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -653,8 +637,7 @@ def fused_conv1d_gdn(
         decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
-    assert b.shape[0] == batch_size and b.shape[1] in (n_v, aligned_num_v_heads)
-    num_v_padding_size = aligned_num_v_heads - b.shape[1]
+    num_v_padding_size = aligned_num_v_heads - n_v
     # KDA's gate carries d_k channels per value head, so it pads out to a
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
@@ -678,10 +661,7 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = cast(jax.Array, conv_state).shape
         conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
-    if conv_weight_is_kernel_layout:
-        conv_weight = conv_weight.astype(jnp.float32)
-    else:
-        conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
@@ -829,17 +809,9 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
-            if skip_empty_per_seq and out_act is not None:
-                out_act, out_source, _ = jax.lax.cond(
-                    distribution[0] < distribution[-1],
-                    lambda op: call_kernel(op[1], None, op[0], config.GDNMode.PER_SEQ),
-                    lambda op: (op[0], op[1], None),
-                    (out_act, out_source),
-                )
-            else:
-                out_act, out_source, _ = call_kernel(
-                    out_source, None, out_act, config.GDNMode.PER_SEQ
-                )
+            out_act, out_source, _ = call_kernel(
+                out_source, None, out_act, config.GDNMode.PER_SEQ
+            )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 

@@ -225,14 +225,7 @@ def _fused_kda_core_dense(inputs, conv_init, ssm_init, distribution):
 
 
 def _run_pooled(
-    inputs,
-    pool,
-    block_ids,
-    distribution,
-    pool_block_tokens,
-    conv_shard_heads=None,
-    *,
-    direct_pool_streaming: bool = True,
+    inputs, pool, block_ids, distribution, pool_block_tokens, conv_shard_heads=None
 ):
     return _pooled_kda_core(
         inputs["mixed_qkv"],
@@ -252,12 +245,10 @@ def _run_pooled(
         eps=EPS,
         pool_block_tokens=pool_block_tokens,
         conv_shard_heads=conv_shard_heads,
-        direct_pool_streaming=direct_pool_streaming,
     )
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("direct_pool_streaming", [True, False])
 @pytest.mark.parametrize(
     ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
@@ -273,45 +264,28 @@ def _run_pooled(
     ids=["mixed", "decode-only", "prefill-fresh", "rank-blocked"],
 )
 def test_pooled_kda_matches_dense_bitwise(
-    query_lens, seq_lens, decode_end, conv_shard_heads, direct_pool_streaming
+    query_lens, seq_lens, decode_end, conv_shard_heads
 ):
     _check_pooled_matches_dense(
-        query_lens,
-        seq_lens,
-        decode_end,
-        conv_shard_heads,
-        jnp.bfloat16,
-        direct_pool_streaming=direct_pool_streaming,
+        query_lens, seq_lens, decode_end, conv_shard_heads, jnp.bfloat16
     )
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("direct_pool_streaming", [True, False])
 @pytest.mark.parametrize(
     "conv_shard_heads", [None, 1], ids=["one-shard", "rank-blocked"]
 )
-def test_pooled_kda_fp8_pool_keeps_bf16_conv(conv_shard_heads, direct_pool_streaming):
+def test_pooled_kda_fp8_pool_keeps_bf16_conv(conv_shard_heads):
     """An fp8 KV pool changes how many tokens an attention row packs, not the
     KDA state. Conv stays bf16 in the rows that block sizing and the Raiden
     manifest reserve for it, so it round-trips the pool bit for bit."""
     _check_pooled_matches_dense(
-        [1, 5, 3],
-        [9, 5, 11],
-        1,
-        conv_shard_heads,
-        jnp.float8_e4m3fn,
-        direct_pool_streaming=direct_pool_streaming,
+        [1, 5, 3], [9, 5, 11], 1, conv_shard_heads, jnp.float8_e4m3fn
     )
 
 
 def _check_pooled_matches_dense(
-    query_lens,
-    seq_lens,
-    decode_end,
-    conv_shard_heads,
-    pool_dtype,
-    *,
-    direct_pool_streaming: bool = True,
+    query_lens, seq_lens, decode_end, conv_shard_heads, pool_dtype
 ):
     num_seqs = len(query_lens)
     rng = np.random.default_rng(0)
@@ -333,7 +307,6 @@ def _check_pooled_matches_dense(
         distribution,
         pool_block_tokens=BLOCK_SIZE * _pool_pack(pool_dtype),
         conv_shard_heads=conv_shard_heads,
-        direct_pool_streaming=direct_pool_streaming,
     )
 
     # Same arithmetic on identical values, but compiled in a different graph
@@ -722,25 +695,27 @@ def test_pooled_kda_speculative_checkpoints(split, seed, pool_dtype):
         )
 
 
-@pytest.mark.parametrize("direct_pool_streaming", [True, False])
-def test_build_pooled_op_respects_direct_pool_streaming_env(
-    monkeypatch: pytest.MonkeyPatch, direct_pool_streaming: bool
+@pytest.mark.parametrize(
+    ("raiden_admission", "conv_shard_heads"), [(False, None), (True, 2)]
+)
+def test_build_pooled_op_derives_conv_sharding(
+    monkeypatch: pytest.MonkeyPatch,
+    raiden_admission: bool,
+    conv_shard_heads: int | None,
 ) -> None:
-    """TPU_KDA_DIRECT_POOL_STREAMING selects direct vs gather/scatter."""
+    """The conv-state sharding comes from the deployment and tags the op name."""
     from types import SimpleNamespace
 
     from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kop
 
     monkeypatch.setattr(
-        kop.tpu_envs, "TPU_KDA_DIRECT_POOL_STREAMING", direct_pool_streaming
+        kop.tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", raiden_admission
     )
-    monkeypatch.setattr(kop.tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+    monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_KIMIK3_ADMISSION", raiden_admission)
+    monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 4)
     registered: dict[str, object] = {}
 
     class _FakeOp:
-        def __init__(self, fn):
-            self.fn = fn
-
         def register_fake(self, _fake):
             pass
 
@@ -748,7 +723,7 @@ def test_build_pooled_op_respects_direct_pool_streaming_env(
         del donate_argnums
         registered["name"] = name
         registered["fn"] = fn
-        return _FakeOp(fn)
+        return _FakeOp()
 
     seen: dict[str, object] = {}
 
@@ -759,20 +734,24 @@ def test_build_pooled_op_respects_direct_pool_streaming_env(
 
     monkeypatch.setattr(kop.pallas, "jax_op", fake_jax_op)
     monkeypatch.setattr(kop, "_pooled_kda_core", fake_core)
-    vllm_cfg = SimpleNamespace(cache_config=SimpleNamespace(block_size=128))
+    vllm_cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(linear_attn_config={"num_heads": 8})
+        ),
+    )
     kop.build_kimi_pooled_kda_op(
         "model.layers.0.self_attn",
         lower_bound=LOWER_BOUND,
         eps=EPS,
         vllm_config=vllm_cfg,
         num_spec_tokens=0,
-        kda_glue=True,
     )
     op_name = str(registered["name"])
-    assert ("_direct_pool" in op_name) is direct_pool_streaming
-    assert ("_kdaglue" in op_name) is direct_pool_streaming
+    assert op_name.endswith("_direct_pool") is not raiden_admission
+    assert ("_conv_rank_blocks_v1_h2" in op_name) is raiden_admission
     fn = registered["fn"]
     assert callable(fn)
     fn(*([None] * 13))
-    assert seen["direct_pool_streaming"] is direct_pool_streaming
-    assert seen["kda_glue"] is direct_pool_streaming
+    assert seen["conv_shard_heads"] == conv_shard_heads
+    assert seen["pool_block_tokens"] == 128
