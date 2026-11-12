@@ -3199,3 +3199,183 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+class _FakeSpecCommitLayer(torch.nn.Module):
+    """Minimal SpecStateCommitLayer: records each commit_spec call."""
+
+    def __init__(self, prefix: str, num_spec_tokens: int, defers: bool = True):
+        super().__init__()
+        self.prefix = prefix
+        self.num_spec_tokens = num_spec_tokens
+        self.defers_spec_state_commit = defers
+        self.calls: list[tuple[torch.Tensor, ...]] = []
+
+    def commit_spec(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_distribution: torch.Tensor,
+        accepted_lens: torch.Tensor,
+    ) -> None:
+        self.calls.append(
+            (
+                query_start_loc,
+                state_indices,
+                seq_lens,
+                window_distribution,
+                accepted_lens,
+            )
+        )
+
+
+def _spec_commit_runner(layers: tuple[_FakeSpecCommitLayer, ...]) -> SimpleNamespace:
+    # The compiled commit is replaced by the eager implementation, so the
+    # fake layers record exactly what the compiled program would receive.
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _stage_timing=SimpleNamespace(stage=lambda name: contextlib.nullcontext()),
+        _spec_commit_layers_cache=layers,
+        _spec_commit_fn=lambda *args: tpu_runner._spec_state_commit_impl(layers, *args),
+    )
+    runner._spec_commit_layers = TPUModelRunner._spec_commit_layers.__get__(runner)
+    return runner
+
+
+def _spec_commit_metadata(prefix: str, width: int, *, mamba_distribution: bool):
+    distribution = torch.tensor([0, 2, 2], dtype=torch.int32)
+    return {
+        prefix: SimpleNamespace(
+            mamba_state_indices=torch.arange(1, width + 1, dtype=torch.int32),
+            mamba_request_distribution=distribution if mamba_distribution else None,
+            request_distribution=distribution,
+            query_start_loc=torch.arange(width + 1, dtype=torch.int32) * 4,
+            seq_lens=torch.full((width,), 9, dtype=torch.int32),
+        )
+    }
+
+
+class TestSpecStateCommit:
+    """sample_tokens commits each request's accepted prefix to the layers
+    that defer their speculative state commit."""
+
+    def _commit(self, next_tokens, num_reqs, *, mamba_distribution=True):
+        layer = _FakeSpecCommitLayer("layers.0.attn", num_spec_tokens=3)
+        runner = _spec_commit_runner((layer,))
+        metadata = _spec_commit_metadata(
+            layer.prefix, width=4, mamba_distribution=mamba_distribution
+        )
+        TPUModelRunner._commit_spec_state(runner, metadata, next_tokens, num_reqs)
+        assert len(layer.calls) == 1
+        return layer.calls[0]
+
+    def test_accepted_lens_count_valid_tokens_per_request(self):
+        invalid = tpu_runner.INVALID_TOKEN_ID
+        next_tokens = torch.tensor(
+            [[5, 6, invalid, invalid], [5, invalid, invalid, invalid]]
+        )
+        *_, accepted = self._commit(next_tokens, num_reqs=2)
+        assert accepted.tolist() == [2, 1, 0, 0]
+        assert accepted.dtype == torch.int32
+
+    def test_rows_beyond_num_reqs_commit_nothing(self):
+        invalid = tpu_runner.INVALID_TOKEN_ID
+        next_tokens = torch.tensor([[5, invalid, invalid], [5, 6, 7]])
+        *_, accepted = self._commit(next_tokens, num_reqs=1)
+        assert accepted.tolist() == [1, 0, 0, 0]
+
+    def test_chunk_without_drafts_commits_full_windows(self):
+        *_, accepted = self._commit(None, num_reqs=2)
+        assert accepted.tolist() == [4, 4, 0, 0]
+
+    def test_window_distribution_falls_back_to_request_distribution(self):
+        _, state_indices, _, window_distribution, _ = self._commit(
+            None, num_reqs=2, mamba_distribution=False
+        )
+        assert window_distribution.tolist() == [0, 2, 2]
+        assert state_indices.tolist() == [1, 2, 3, 4]
+
+    def test_no_deferred_layers_is_a_noop(self):
+        runner = _spec_commit_runner(())
+        runner._spec_commit_fn = MagicMock()
+        TPUModelRunner._commit_spec_state(runner, {}, None, 2)
+        runner._spec_commit_fn.assert_not_called()
+
+    def test_layers_discovered_by_protocol_and_flag(self):
+        deferring = _FakeSpecCommitLayer("b.attn", num_spec_tokens=3)
+        other = _FakeSpecCommitLayer("a.attn", num_spec_tokens=3)
+        not_deferring = _FakeSpecCommitLayer("c.attn", 3, defers=False)
+        runner = SimpleNamespace(
+            _spec_commit_layers_cache=None,
+            _spec_commit_fn=None,
+            vllm_config=SimpleNamespace(
+                compilation_config=SimpleNamespace(
+                    static_forward_context={
+                        "b.attn": deferring,
+                        "c.attn": not_deferring,
+                        "mla": torch.nn.Linear(2, 2),
+                        "a.attn": other,
+                    }
+                )
+            ),
+        )
+        layers = TPUModelRunner._spec_commit_layers(runner)
+        assert layers == (other, deferring)
+        assert runner._spec_commit_layers_cache == layers
+        assert runner._spec_commit_fn is not None
+
+    def test_offsets_reset_after_a_deferred_commit(self):
+        runner = SimpleNamespace(
+            _commit_spec_state=MagicMock(), _update_mamba_slot_read_offsets=MagicMock()
+        )
+        next_tokens = torch.tensor([[5, 6]])
+        metadata = {"layers.0.attn": object()}
+        TPUModelRunner._commit_spec_state_and_offsets(
+            runner, metadata, ["indices"], next_tokens, 1
+        )
+        runner._commit_spec_state.assert_called_once_with(metadata, next_tokens, 1)
+        runner._update_mamba_slot_read_offsets.assert_called_once_with(
+            ["indices"], None, 1
+        )
+
+    def test_offsets_follow_next_tokens_without_a_deferred_commit(self):
+        runner = SimpleNamespace(
+            _commit_spec_state=MagicMock(), _update_mamba_slot_read_offsets=MagicMock()
+        )
+        next_tokens = torch.tensor([[5, 6]])
+        TPUModelRunner._commit_spec_state_and_offsets(
+            runner, None, ["indices"], next_tokens, 1
+        )
+        runner._commit_spec_state.assert_not_called()
+        runner._update_mamba_slot_read_offsets.assert_called_once_with(
+            ["indices"], next_tokens, 1
+        )
+
+    def test_multi_chunk_step_fails_closed(self):
+        layer = _FakeSpecCommitLayer("layers.0.attn", num_spec_tokens=3)
+        with pytest.raises(NotImplementedError, match="single-chunk"):
+            tpu_runner._check_single_chunk_spec_commit((layer,), 2)
+        tpu_runner._check_single_chunk_spec_commit((layer,), 1)
+        tpu_runner._check_single_chunk_spec_commit((), 2)
+
+
+class TestDpZeroTokensAcrossDp:
+    """A non-lockstep DP dummy forward hands vLLM all-zero token counts."""
+
+    @staticmethod
+    def _runner(dp_size: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(data_parallel_size=dp_size)
+            )
+        )
+
+    def test_single_dp_rank_returns_none(self):
+        assert TPUModelRunner._dp_zero_tokens_across_dp(self._runner(1)) is None
+
+    def test_multi_dp_ranks_return_int32_zeros(self):
+        counts = TPUModelRunner._dp_zero_tokens_across_dp(self._runner(4))
+        assert counts is not None
+        assert counts.dtype == torch.int32
+        assert counts.tolist() == [0, 0, 0, 0]

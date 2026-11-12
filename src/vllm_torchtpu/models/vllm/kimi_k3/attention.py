@@ -651,10 +651,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # accepted prefix after rejection sampling (`commit_spec`). The
         # caches hold the leading `max_num_seqs * W` token rows, which cover
         # every windowed row ([decode][verify][prefill] batch order).
-        self.spec_kda_o6a = use_spec_kda_o6a(self.num_spec_tokens)
+        self.defers_spec_state_commit = use_spec_kda_o6a(self.num_spec_tokens)
         self.pooled_kda_verify_op = None
         self.pooled_kda_commit_op = None
-        if self.spec_kda_o6a:
+        if self.defers_spec_state_commit:
             self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
                 build_kimi_pooled_kda_o6a_ops(
                     prefix,
@@ -971,7 +971,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             if (self._kda_glue_enabled and self.conv_weight_f32 is not None)
             else self.conv_weight_fused
         )
-        if self.spec_kda_o6a:
+        if self.defers_spec_state_commit:
             assert self.pooled_kda_verify_op is not None
             return self.pooled_kda_verify_op(
                 mixed_qkv,
@@ -1033,7 +1033,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         Advances the KDA conv + recurrent state in the unified pool exactly
         as that many sequential 1-token decode steps would.
         """
-        assert self.spec_kda_o6a and self.pooled_kda_commit_op is not None
+        assert self.defers_spec_state_commit and self.pooled_kda_commit_op is not None
         if self.kv_cache is None or len(self.kv_cache) != 1:
             raise RuntimeError("O6a KDA commit requires the unified KV pool")
         self.pooled_kda_commit_op(

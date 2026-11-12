@@ -124,6 +124,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
 )
+from vllm_torchtpu.layers.adapter.spec_state_commit import SpecStateCommitLayer
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -218,11 +219,11 @@ class ExecuteModelState:
     # logits_list holds the greedy tokens ([rows, 1]), not logits
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
-    # Kimi K3 Phase O6a (`TPU_KIMI_OPT_SPEC_KDA`): per chunk, the attention
-    # metadata dict of the verify forward, so sample_tokens can commit each
-    # request's accepted KDA prefix once rejection sampling is done. None
-    # entries when O6a is inactive.
-    kda_commit_metadata_list: list[dict[str, Any] | None] = field(default_factory=list)
+    # Per chunk, the attention metadata dict of a verify forward whose
+    # spec-state layers defer their commit, so sample_tokens can commit each
+    # request's accepted prefix once rejection sampling is done. None entries
+    # when no layer defers.
+    spec_commit_metadata_list: list[dict[str, Any] | None] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -261,15 +262,15 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
-def _o6a_kda_commit_impl(
-    layers: tuple[Any, ...],
+def _spec_state_commit_impl(
+    layers: tuple[SpecStateCommitLayer, ...],
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
     window_distribution: torch.Tensor,
     state_indices: list[torch.Tensor],
     accepted_lens: torch.Tensor,
 ) -> None:
-    """Kimi K3 Phase O6a: masked KDA commit of every layer in one program."""
+    """Masked commit of every deferred-commit layer in one program."""
     for layer, layer_state_indices in zip(layers, state_indices):
         layer.commit_spec(
             query_start_loc,
@@ -277,6 +278,22 @@ def _o6a_kda_commit_impl(
             seq_lens,
             window_distribution,
             accepted_lens,
+        )
+
+
+def _check_single_chunk_spec_commit(
+    layers: tuple[SpecStateCommitLayer, ...], num_chunks: int
+) -> None:
+    """Fail closed on multi-chunk steps when a layer defers its commit.
+
+    Every chunk's verify refreshes the same per-layer input caches, so only
+    the last chunk could be committed.
+    """
+    if layers and num_chunks > 1:
+        raise NotImplementedError(
+            "Speculative verify with deferred state commit supports "
+            f"single-chunk steps only (got {num_chunks} forward chunks); "
+            "lower max_num_batched_tokens or disable chunking."
         )
 
 
@@ -1066,6 +1083,10 @@ class TPUModelRunner(GPUModelRunner):
         # `upload_host_temporary`), held until the staging fence covering
         # their upload has been waited on.
         self._host_uploads = HostUploadKeepalive()
+        # Layers that defer their speculative state commit to sample_tokens,
+        # and the compiled commit over all of them (built on first use).
+        self._spec_commit_layers_cache: tuple[SpecStateCommitLayer, ...] | None = None
+        self._spec_commit_fn: Callable[..., None] | None = None
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -3758,8 +3779,8 @@ class TPUModelRunner(GPUModelRunner):
         all-reduce, which otherwise has to pair with the peer engine's
         collectives by emission order: during single-host DP start-up with
         speculative decoding (profile_run) it paired with an unrelated
-        collective and returned garbage (`DPMetadata.make` "AssertionError:
-        6 0", O6a §7 item 1).
+        collective and returned garbage (`DPMetadata.make` asserted on the
+        token counts).
         """
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         if dp_size <= 1:
@@ -3904,15 +3925,9 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs_list = []
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
-        kda_commit_metadata_list: list[dict[str, Any] | None] = []
-        o6a_layers = self._o6a_kda_layers()
-        if o6a_layers and target_num_chunks > 1:
-            # Every chunk's verify refreshes the same per-layer input caches,
-            # so only the last chunk could be committed. Fail closed.
-            raise NotImplementedError(
-                "TPU_KIMI_OPT_SPEC_KDA=o6a supports single-chunk steps only "
-                f"(got {target_num_chunks} forward chunks)"
-            )
+        spec_commit_metadata_list: list[dict[str, Any] | None] = []
+        spec_commit_layers = self._spec_commit_layers()
+        _check_single_chunk_spec_commit(spec_commit_layers, target_num_chunks)
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
@@ -4168,7 +4183,9 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
-            kda_commit_metadata_list.append(attn_metadata if o6a_layers else None)
+            spec_commit_metadata_list.append(
+                attn_metadata if spec_commit_layers else None
+            )
             ctx = self._attn_metadata_builder_ctx
             if self.mamba_slot_read_offsets is None:
                 # No mamba layers, or no spec decoding: nothing to roll back.
@@ -4223,7 +4240,7 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
-            kda_commit_metadata_list=kda_commit_metadata_list,
+            spec_commit_metadata_list=spec_commit_metadata_list,
         )
 
         if self.is_pooling_model:
@@ -4392,31 +4409,32 @@ class TPUModelRunner(GPUModelRunner):
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
 
-    def _o6a_kda_layers(self) -> tuple[Any, ...]:
-        """KDA layers running the Phase O6a verify + masked commit (cached)."""
-        layers = getattr(self, "_o6a_kda_layers_cache", None)
+    def _spec_commit_layers(self) -> tuple[SpecStateCommitLayer, ...]:
+        """Layers that defer their speculative state commit (cached)."""
+        layers = self._spec_commit_layers_cache
         if layers is None:
             context = self.vllm_config.compilation_config.static_forward_context
             layers = tuple(
                 module
                 for _, module in sorted(context.items())
-                if getattr(module, "spec_kda_o6a", False)
+                if isinstance(module, SpecStateCommitLayer)
+                and module.defers_spec_state_commit
             )
-            self._o6a_kda_layers_cache = layers
+            self._spec_commit_layers_cache = layers
             if layers:
-                self._o6a_kda_commit_fn = _tpu_compile(
-                    functools.partial(_o6a_kda_commit_impl, layers)
+                self._spec_commit_fn = _tpu_compile(
+                    functools.partial(_spec_state_commit_impl, layers)
                 )
         return layers
 
     @torch.no_grad()
-    def _commit_kda_spec(
+    def _commit_spec_state(
         self,
         attn_metadata: dict[str, Any],
         next_tokens: torch.Tensor | None,
         num_reqs: int,
     ) -> None:
-        """Kimi K3 Phase O6a: commit this chunk's accepted KDA prefixes.
+        """Commit this chunk's accepted prefixes of the deferred-commit layers.
 
         `next_tokens` is the rejection sampler's [rows, 1 + K] output (None
         for a chunk without drafts, whose windows are committed in full).
@@ -4424,7 +4442,7 @@ class TPUModelRunner(GPUModelRunner):
         accepted drafts + bonus -- i.e. the window tokens whose inputs became
         context; padded rows commit nothing.
         """
-        layers = self._o6a_kda_layers()
+        layers = self._spec_commit_layers()
         if not layers:
             return
         first = attn_metadata[layers[0].prefix]
@@ -4447,14 +4465,33 @@ class TPUModelRunner(GPUModelRunner):
         state_indices = [
             attn_metadata[layer.prefix].mamba_state_indices for layer in layers
         ]
-        with self._stage_timing.stage("o6a_kda_commit"):
-            self._o6a_kda_commit_fn(
+        assert self._spec_commit_fn is not None
+        with self._stage_timing.stage("spec_state_commit"):
+            self._spec_commit_fn(
                 first.query_start_loc,
                 first.seq_lens,
                 window_distribution,
                 state_indices,
                 accepted,
             )
+
+    def _commit_spec_state_and_offsets(
+        self,
+        spec_commit_metadata: dict[str, Any] | None,
+        mamba_indices: list[torch.Tensor] | None,
+        next_tokens: torch.Tensor | None,
+        num_reqs: int,
+    ) -> None:
+        """Commit deferred spec state (if any), then update the read offsets.
+
+        `next_tokens` is None for a chunk without drafts. A deferred commit
+        always leaves the committed state in checkpoint 0, so the read
+        offsets are then reset as for a chunk without drafts.
+        """
+        if spec_commit_metadata is not None:
+            self._commit_spec_state(spec_commit_metadata, next_tokens, num_reqs)
+            next_tokens = None
+        self._update_mamba_slot_read_offsets(mamba_indices, next_tokens, num_reqs)
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -4777,7 +4814,9 @@ class TPUModelRunner(GPUModelRunner):
         mamba_idx_list = state.mamba_state_indices_list or [None] * len(
             state.logits_list
         )
-        kda_md_list = state.kda_commit_metadata_list or [None] * len(state.logits_list)
+        spec_commit_md_list = state.spec_commit_metadata_list or [None] * len(
+            state.logits_list
+        )
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -4789,12 +4828,12 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices, kda_md in zip(
+            for logits, num_reqs, md, mamba_indices, spec_commit_md in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
-                kda_md_list,
+                spec_commit_md_list,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -4813,17 +4852,9 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    if kda_md is not None:
-                        # O6a: commit the accepted prefix; the committed state
-                        # is always checkpoint 0, so the read offsets stay 0.
-                        self._commit_kda_spec(kda_md, next_tokens, num_reqs)
-                        self._update_mamba_slot_read_offsets(
-                            mamba_indices, None, num_reqs
-                        )
-                    else:
-                        self._update_mamba_slot_read_offsets(
-                            mamba_indices, next_tokens, num_reqs
-                        )
+                    self._commit_spec_state_and_offsets(
+                        spec_commit_md, mamba_indices, next_tokens, num_reqs
+                    )
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -4901,11 +4932,12 @@ class TPUModelRunner(GPUModelRunner):
                                 row_starts=np.arange(num_reqs),
                             )
                         )
-                    # Non-verify chunk in a spec step: reset the read offsets
-                    # (the latest state checkpoint is at the group base).
-                    if kda_md is not None:
-                        self._commit_kda_spec(kda_md, None, num_reqs)
-                    self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                    # Non-verify chunk in a spec step: commit deferred state
+                    # in full and reset the read offsets (the latest state
+                    # checkpoint is at the group base).
+                    self._commit_spec_state_and_offsets(
+                        spec_commit_md, mamba_indices, None, num_reqs
+                    )
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
@@ -4914,17 +4946,20 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, mamba_indices, kda_md in zip(
-                state.logits_list, state.num_reqs_list, mamba_idx_list, kda_md_list
+            for logits, num_reqs, mamba_indices, spec_commit_md in zip(
+                state.logits_list,
+                state.num_reqs_list,
+                mamba_idx_list,
+                spec_commit_md_list,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
-                # O6a: a step without drafts still ran the side-effect-free
-                # verify over its 1-token windows; commit them in full.
-                if kda_md is not None:
-                    self._commit_kda_spec(kda_md, None, num_reqs)
-                # Non-spec step (prefill / plain decode): reset the mamba
-                # read offsets so the next step resumes from the group base.
-                self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                # Non-spec step (prefill / plain decode): a deferred-commit
+                # layer still ran its side-effect-free verify over 1-token
+                # windows, so commit them in full; then reset the mamba read
+                # offsets so the next step resumes from the group base.
+                self._commit_spec_state_and_offsets(
+                    spec_commit_md, mamba_indices, None, num_reqs
+                )
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
