@@ -12,15 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm_torchtpu.kernels.kimi_k3 import (
-    exit_fold,
-    pallas_dma,
-)
 from vllm_torchtpu.kernels.kimi_k3.kda import kda_step, ragged_kda
 
-__all__ = [
-    "exit_fold",
-    "kda_step",
-    "pallas_dma",
-    "ragged_kda",
-]
+__all__ = ["kda_step", "ragged_kda"]
