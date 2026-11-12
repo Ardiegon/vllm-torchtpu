@@ -253,13 +253,8 @@ class KimiModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        tap_mode = envs.TPU_KIMI_DSPARK_TAP
-        if tap_mode not in ("prefix", "attn_res"):
-            raise ValueError(
-                f"Invalid TPU_KIMI_DSPARK_TAP={tap_mode!r}; expected 'prefix' "
-                "or 'attn_res'."
-            )
-        self.aux_tap_mode = tap_mode
+        # "prefix" or "attn_res"; envs rejects any other value.
+        self.aux_tap_mode = envs.TPU_KIMI_DSPARK_TAP
         if self.attn_res_block_size is not None:
             self.output_attn_res = AttentionResidual(
                 config.hidden_size,

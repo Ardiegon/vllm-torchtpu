@@ -18,6 +18,8 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from vllm_torchtpu.kimi_k3_opt_modes import normalize_spec_kda_mode
+
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -202,6 +204,7 @@ if TYPE_CHECKING:
     TPU_KIMI_OPT_XLA_OVERLAP: str = "off"
     TPU_KIMI_OPT_SC_OFFLOAD: str = "off"
     TPU_KIMI_OPT_EXIT_FOLD: str = "off"
+    TPU_KIMI_OPT_COMPUTE_POLISH: str = "off"
     TPU_KIMI_OPT_SPEC_KDA: str = "off"
     TPU_KIMI_DSPARK_TAP: str = "prefix"
 
@@ -337,16 +340,64 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
     return _get_float_env
 
 
-def env_str(env_name: str, default: str) -> Callable[[], str]:
-    """String knob with a default, surrounding whitespace stripped."""
+def env_str(
+    env_name: str, default: str, *, empty_is_default: bool = False
+) -> Callable[[], str]:
+    """String knob with a default, surrounding whitespace stripped.
+
+    With ``empty_is_default`` an empty (or all-whitespace) value also
+    returns ``default``.
+    """
 
     def _get_str_env() -> str:
         value = os.getenv(env_name)
         if value is None:
             return default
-        return value.strip()
+        value = value.strip()
+        if empty_is_default and not value:
+            return default
+        return value
 
     return _get_str_env
+
+
+def env_canonical(
+    env_name: str, canonicalize: Callable[[str | None], str]
+) -> Callable[[], str]:
+    """Mode knob whose value is mapped to one canonical spelling.
+
+    ``canonicalize`` receives the raw value (None when unset), returns the
+    canonical mode and raises ``ValueError`` on an unknown value, so every
+    alias of a mode reads (and is compile-hashed) the same.
+    """
+
+    def _get_canonical_env() -> str:
+        return canonicalize(os.getenv(env_name))
+
+    return _get_canonical_env
+
+
+# `TPU_KIMI_DSPARK_TAP` spellings -> canonical tap mode.
+_DSPARK_TAP_ALIASES: dict[str, str] = {
+    "": "prefix",
+    "0": "prefix",
+    "prefix": "prefix",
+    "prefix_only": "prefix",
+    "1": "attn_res",
+    "attn_res": "attn_res",
+    "stream": "attn_res",
+    "attn_res_stream": "attn_res",
+}
+
+
+def _canonical_dspark_tap(raw: str | None) -> str:
+    value = "prefix" if raw is None else raw.strip().lower()
+    try:
+        return _DSPARK_TAP_ALIASES[value]
+    except KeyError:
+        raise ValueError(
+            f"Invalid TPU_KIMI_DSPARK_TAP={value!r}; expected 'prefix' or 'attn_res'."
+        ) from None
 
 
 def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
@@ -1163,79 +1214,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_2D_EP_MESH": env_bool("TPU_KIMI_OPT_2D_EP_MESH", False),
     # Coalesce Kimi K3's 3 per-layer DP all_gather calls (latent, topk_ids,
     # topk_weights) into 1 packed [B_dp, latent_dim + 3*K] bfloat16 tensor
-    # (works with both XLA dp_group.all_gather and 1-shot Pallas latency_all_gather_rows).
+    # (works with both the XLA DP all-gather and the one-shot DMA all-gather).
     "TPU_KIMI_OPT_PACKED_DP_AG": env_bool("TPU_KIMI_OPT_PACKED_DP_AG", False),
-    # Replace Kimi K3 decode (T_padded <= 64 inside @jax_op, XLA fallback > 64)
-    # narrow TP latent all_gather (cid=0), DP dispatch all_gather (cid=1), and
-    # DP post-MoE combine reduce_scatter (cid=2) with 1-shot Pallas remote-DMA ops.
+    # Replace Kimi K3's decode-sized (at most 64 padded tokens; larger batches
+    # fall back to XLA) TP latent all-gather, DP dispatch all-gather and DP
+    # post-MoE reduce-scatter with one-shot Pallas remote-DMA collectives.
     "TPU_KIMI_OPT_LATENCY_COLLECTIVES": env_bool(
         "TPU_KIMI_OPT_LATENCY_COLLECTIVES", False
     ),
-    # Wire 1-shot deterministic Pallas latency_psum (cid=3, 4, 5) into Kimi K3
-    # row-parallel TP exits ("off", "tp16"/"auto", "routed_only", "all", or an
-    # integer max_dma_tokens threshold string such as "8").
-    "TPU_KIMI_OPT_LATENCY_TP_PSUM": lambda: os.getenv(
-        "TPU_KIMI_OPT_LATENCY_TP_PSUM", "off"
-    ).strip(),
-    # Kimi K3 Phase O3 XLA async-copy / collective overlap presets in
-    # LIBTPU_INIT_ARGS ("off"/"0" default; "msa_r8", "msa_r12", "msa_r16",
-    # "async_coll", "+"-joined combinations like "msa_r12+async_coll", or
-    # "1"/"auto"/"c1" for the Cycle-1 verified preset "msa_r12+async_coll").
-    # Must be set before PjRt client initialization.
-    "TPU_KIMI_OPT_XLA_OVERLAP": lambda: os.getenv(
-        "TPU_KIMI_OPT_XLA_OVERLAP", "off"
-    ).strip(),
-    # Kimi K3 Phase O3 SparseCore collective offload control in
-    # LIBTPU_INIT_ARGS ("off"/"0" default keeps the chip VMEM threshold cap;
-    # "<bytes>" / "min_<bytes>" enables v6e SC AR+AG offload above <bytes>;
-    # "ar_<bytes>" enables v6e SC AR-only offload above <bytes>;
-    # "thresh_<bytes>" lowers only min_size_in_bytes thresholds; "1" -> "8192";
-    # "auto"/"c1" -> Cycle-1 verified setting "off").
-    "TPU_KIMI_OPT_SC_OFFLOAD": lambda: os.getenv(
-        "TPU_KIMI_OPT_SC_OFFLOAD", "off"
-    ).strip(),
+    # Route Kimi K3's row-parallel TP exit psums through the one-shot,
+    # deterministic Pallas DMA psum: "off" (default), "tp16"/"auto",
+    # "routed_only", "all", or an integer row cap such as "8" (parsed by
+    # kimi_k3_opt_modes.normalize_latency_tp_psum_mode).
+    "TPU_KIMI_OPT_LATENCY_TP_PSUM": env_str("TPU_KIMI_OPT_LATENCY_TP_PSUM", "off"),
+    # XLA async-copy / collective overlap flags appended to LIBTPU_INIT_ARGS
+    # for Kimi K3: "off"/"0" (default), "+"-joined tokens "msa_r<1..31>",
+    # "async_coll" and "cpp_256", or "1"/"auto"/"c1" for the default preset
+    # "msa_r12+async_coll". Must be set before PjRt client initialization.
+    "TPU_KIMI_OPT_XLA_OVERLAP": env_str("TPU_KIMI_OPT_XLA_OVERLAP", "off"),
+    # SparseCore collective offload flags in LIBTPU_INIT_ARGS for Kimi K3:
+    # "off"/"0"/"auto"/"c1" (default) keep the chip VMEM threshold cap;
+    # "<bytes>" (also "min_<bytes>" / "full_<bytes>") offloads AR+AG above
+    # <bytes>; "ar_<bytes>" offloads AR only; "thresh_<bytes>" only lowers the
+    # min_size_in_bytes thresholds; "1" means "8192".
+    "TPU_KIMI_OPT_SC_OFFLOAD": env_str("TPU_KIMI_OPT_SC_OFFLOAD", "off"),
     # Kimi K3 fused EP-overlap MoE exit (parsed by kimi_k3_opt_modes): "off"
     # (default) keeps the packed MoE input path; "c2"/"auto"/"1" (or its
     # explicit name "o4d"/"c2b") runs one jax_op with the axial TP -> DP async
     # EP dispatch overlapped by the shared experts, the hierarchical DP
     # reduce-scatter + TP psum combine, and the exact routed-expert RMSNorm.
-    "TPU_KIMI_OPT_EXIT_FOLD": lambda: os.getenv(
-        "TPU_KIMI_OPT_EXIT_FOLD", "off"
-    ).strip(),
-    # Kimi K3 compute polish (parsed by kimi_k3_opt_modes): "off" (default) or
-    # '+'-joined tokens "trays"/"trays4", "vmem_chain", "kda_glue",
-    # "copy_opt", "all", or "c2"/"auto"/"1" for the verified set
-    # ("vmem_chain",).
-    "TPU_KIMI_OPT_COMPUTE_POLISH": lambda: (
-        os.getenv("TPU_KIMI_OPT_COMPUTE_POLISH", "off").strip() or "off"
+    # Read raw: the spelling is part of the DMA collectives' op-name tag.
+    "TPU_KIMI_OPT_EXIT_FOLD": env_str("TPU_KIMI_OPT_EXIT_FOLD", "off"),
+    # Kimi K3 compute polish (parsed by kimi_k3_opt_modes): "off" (default,
+    # also for an empty value) or '+'-joined tokens "trays"/"trays4",
+    # "vmem_chain", "kda_glue", "copy_opt", "all", or "c2"/"auto"/"1" for the
+    # verified set ("vmem_chain",).
+    "TPU_KIMI_OPT_COMPUTE_POLISH": env_str(
+        "TPU_KIMI_OPT_COMPUTE_POLISH", "off", empty_is_default=True
     ),
-    # Kimi K3 Cycle 3 Phase O6a speculative-decode KDA mode ("off"/"0" default
-    # keeps every pre-O6a KDA op byte-identical; "o6a" or "c3"/"auto"/"1"
-    # selects the side-effect-free W = 1 + num_speculative_tokens KDA verify
-    # (direct StateSourcePlan pool streaming, no checkpoint blocks) plus the
-    # post-rejection masked commit of each request's accepted prefix). Only
-    # takes effect when speculative decoding is configured. "o6b" (Phase O6b)
-    # adds the multi-tray fused verify MoE (<= 256 tokens) and the TP-sharded
-    # DSpark context projections on top of "o6a".
-    # Canonicalized here so aliases share one Tier-1 compile-hash factor;
-    # env_override validates the value (fails closed) at import.
-    # Kimi K3 DSpark/DFlash auxiliary hidden-state tap (Phase O6b). "prefix"
-    # (default) hands the drafter the AttnRes partial block sum after each
-    # tapped layer, matching upstream vLLM's default
-    # (VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0) used by the published Inferact
-    # Kimi-K3-DSpark recipe; "attn_res" taps the pre-norm AttnRes mixture the
-    # next layer consumes (upstream VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1).
-    # Changes only the drafter input, never the target outputs.
-    "TPU_KIMI_DSPARK_TAP": lambda: (
-        lambda v: "attn_res"
-        if v in ("attn_res", "stream", "attn_res_stream", "1")
-        else ("prefix" if v in ("", "prefix", "prefix_only", "0") else v)
-    )(os.getenv("TPU_KIMI_DSPARK_TAP", "prefix").strip().lower()),
-    "TPU_KIMI_OPT_SPEC_KDA": lambda: (
-        lambda v: "off"
-        if v in ("", "0", "false", "no", "off", "none")
-        else ("o6a" if v in ("o6a", "c3", "auto", "1", "true", "yes") else v)
-    )(os.getenv("TPU_KIMI_OPT_SPEC_KDA", "off").strip().lower()),
+    # Kimi K3 speculative-decode KDA mode, canonicalized by
+    # kimi_k3_opt_modes.normalize_spec_kda_mode: "off" (default) keeps the
+    # checkpointed KDA path; "o6a" (aliases "c3"/"auto"/"1") runs the W = 1 + K
+    # verify without state writes plus the masked commit of each request's
+    # accepted prefix after rejection sampling; "o6b" adds the multi-tray
+    # fused verify MoE (<= 256 tokens) and the TP-sharded DSpark context
+    # projections. Only takes effect with speculative decoding.
+    "TPU_KIMI_OPT_SPEC_KDA": env_canonical(
+        "TPU_KIMI_OPT_SPEC_KDA", normalize_spec_kda_mode
+    ),
+    # Kimi K3 DSpark/DFlash auxiliary hidden-state tap. "prefix" (default)
+    # hands the drafter the AttnRes partial block sum after each tapped layer,
+    # matching upstream vLLM's default (VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0)
+    # used by the published Inferact Kimi-K3-DSpark recipe; "attn_res" taps
+    # the pre-norm AttnRes mixture the next layer consumes (upstream
+    # VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1). Changes only the drafter input,
+    # never the target outputs.
+    "TPU_KIMI_DSPARK_TAP": env_canonical("TPU_KIMI_DSPARK_TAP", _canonical_dspark_tap),
 }
 
 
