@@ -33,6 +33,8 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import vllm.distributed
 from vllm.config import VllmConfig
@@ -260,25 +262,9 @@ class DSparkProposer(DFlashProposer):
         sample_start = 0 if self.sample_from_anchor else 1
 
         if self._position_major_logits:
-            # Phase O6b: viewing the [rows, vocab] logits as
-            # [reqs, block, vocab] relayouts the whole full-vocab tensor
-            # (a ~1.3 ms while/dynamic-update-slice loop per draft on v6e
-            # when `reqs` is not a multiple of the 8-row tile). Reorder the
-            # (small) hidden rows position-major instead, padding requests
-            # to the tile, so each position's logits are one aligned slab.
-            reqs_tile = round_up(padded_num_reqs, _SUBLANE_ROWS)
-            hidden_pm = valid_hidden.view(
-                padded_num_reqs, block_size, valid_hidden.shape[-1]
-            ).transpose(0, 1)
-            if reqs_tile != padded_num_reqs:
-                hidden_pm = torch.nn.functional.pad(
-                    hidden_pm, (0, 0, 0, reqs_tile - padded_num_reqs)
-                )
-            flat_pm = hidden_pm.reshape(block_size * reqs_tile, valid_hidden.shape[-1])
-            prev = ids_3d[:, 0]
-            if reqs_tile != padded_num_reqs:
-                prev = torch.nn.functional.pad(prev, (0, reqs_tile - padded_num_reqs))
-            draft_tokens = []
+            flat_pm, prev, reqs_tile = self._position_major_hidden(
+                valid_hidden, ids_3d[:, 0], block_size
+            )
             w2_local = self._markov_w2_local
             if w2_local is not None:
                 # This rank's vocab slice of the logits (no TP gather), like
@@ -289,43 +275,100 @@ class DSparkProposer(DFlashProposer):
                 local_logits = local_logits.view(
                     block_size, reqs_tile, local_logits.shape[-1]
                 )
-                for i in range(sample_start, block_size):
-                    bias = torch.nn.functional.linear(
-                        self.draft_model.markov_embed(prev), w2_local
-                    )
-                    step = self._vocab_parallel_argmax(
-                        local_logits[i] + bias, reqs_tile
-                    )
-                    draft_tokens.append(step)
-                    prev = step
-                draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
+                draft_tokens_chunk = self._greedy_markov_chain(
+                    lambda i: local_logits[i],
+                    prev,
+                    sample_start,
+                    block_size,
+                    bias_fn=lambda e: torch.nn.functional.linear(e, w2_local),
+                    select_fn=lambda s: self._vocab_parallel_argmax(s, reqs_tile),
+                )
                 return draft_tokens_chunk[:padded_num_reqs], hidden
             logits_pm = self.draft_model.compute_draft_logits(flat_pm)
             logits_pm = logits_pm.view(block_size, reqs_tile, logits_pm.shape[-1])
-            for i in range(sample_start, block_size):
-                bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
-                step = self.draft_model.map_draft_to_target(
-                    (logits_pm[i] + bias).argmax(dim=-1)
-                )
-                draft_tokens.append(step)
-                prev = step
-            draft_tokens_chunk = torch.stack(draft_tokens, dim=1)[:padded_num_reqs]
-            return draft_tokens_chunk, hidden
+            draft_tokens_chunk = self._greedy_markov_chain(
+                lambda i: logits_pm[i],
+                prev,
+                sample_start,
+                block_size,
+                bias_fn=self.draft_model.markov_bias,
+                select_fn=self._greedy_draft_to_target,
+            )
+            return draft_tokens_chunk[:padded_num_reqs], hidden
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+        draft_tokens_chunk = self._greedy_markov_chain(
+            lambda i: logits_3d[:, i],
+            ids_3d[:, 0],
+            sample_start,
+            block_size,
+            bias_fn=self.draft_model.markov_bias,
+            select_fn=self._greedy_draft_to_target,
+        )
+        return draft_tokens_chunk, hidden
 
-        prev = ids_3d[:, 0]
+    @staticmethod
+    def _position_major_hidden(
+        valid_hidden: torch.Tensor, anchor_ids: torch.Tensor, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Reorder ``[reqs * block, H]`` hidden rows position-major.
+
+        Viewing the ``[rows, vocab]`` logits as ``[reqs, block, vocab]``
+        relayouts the whole full-vocab tensor (a ~1.3 ms
+        while/dynamic-update-slice loop per draft on v6e when ``reqs`` is
+        not a multiple of the 8-row tile). Reordering the small hidden rows
+        instead, with requests padded to the tile, makes each position's
+        logits one aligned ``[reqs_tile, vocab]`` slab. Returns the flat
+        ``[block * reqs_tile, H]`` hidden rows, the anchor ids padded to
+        ``reqs_tile``, and ``reqs_tile``.
+        """
+        padded_num_reqs = valid_hidden.shape[0] // block_size
+        hidden_size = valid_hidden.shape[-1]
+        reqs_tile = round_up(padded_num_reqs, _SUBLANE_ROWS)
+        hidden_pm = valid_hidden.view(
+            padded_num_reqs, block_size, hidden_size
+        ).transpose(0, 1)
+        if reqs_tile != padded_num_reqs:
+            hidden_pm = torch.nn.functional.pad(
+                hidden_pm, (0, 0, 0, reqs_tile - padded_num_reqs)
+            )
+        flat_pm = hidden_pm.reshape(block_size * reqs_tile, hidden_size)
+        prev = anchor_ids
+        if reqs_tile != padded_num_reqs:
+            prev = torch.nn.functional.pad(prev, (0, reqs_tile - padded_num_reqs))
+        return flat_pm, prev, reqs_tile
+
+    def _greedy_draft_to_target(self, scores: torch.Tensor) -> torch.Tensor:
+        """Greedy pick over replicated draft-vocab scores, as target ids."""
+        assert self.draft_model is not None
+        return self.draft_model.map_draft_to_target(scores.argmax(dim=-1))
+
+    def _greedy_markov_chain(
+        self,
+        position_logits: Callable[[int], torch.Tensor],
+        prev: torch.Tensor,
+        sample_start: int,
+        block_size: int,
+        *,
+        bias_fn: Callable[[torch.Tensor], torch.Tensor],
+        select_fn: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Sequential greedy Markov sampling of positions
+        ``sample_start..block_size-1``.
+
+        Each step adds the Markov bias of the previously sampled token to
+        that position's logits and picks the next token with ``select_fn``.
+        The loop is static, so it unrolls when traced. Returns
+        ``[rows, block_size - sample_start]`` token ids.
+        """
+        assert self.draft_model is not None
         draft_tokens = []
         for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
-            step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
-            )
+            bias = bias_fn(self.draft_model.markov_embed(prev))
+            step = select_fn(position_logits(i) + bias)
             draft_tokens.append(step)
             prev = step
-        draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
-
-        return draft_tokens_chunk, hidden
+        return torch.stack(draft_tokens, dim=1)
