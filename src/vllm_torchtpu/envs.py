@@ -1208,23 +1208,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_SC_OFFLOAD": lambda: os.getenv(
         "TPU_KIMI_OPT_SC_OFFLOAD", "off"
     ).strip(),
-    # Kimi K3 Phase O4/O4d unified-@jax_op async EP DMA overlap + exact
-    # routed_expert_norm exit-fold mode ("off"/"0" default retains O3's
-    # packed_moe_in_weight path; "o4a" runs world owner-combine + exact local
-    # RMSNorm + TP seam_exit_split cid=6; "o4b" runs flat world async dispatch +
-    # DP psum_scatter cid=2 + guarded TP latency_psum cid=3 + fused RMSNorm +
-    # slice; "o4d"/"c2b" runs 2-stage axial TP->DP async dispatch cid=0+cid1 +
-    # O4-B hierarchical combine cid=2+cid3 + 1D axial prefill fallback;
-    # "o4a_sync" / "o4b_sync" / "o4d_sync" disable async w_shared_gu overlap for
-    # ablation; "c2"/"auto"/"1" selects the Cycle-2b verified axial policy "o4d").
+    # Kimi K3 fused EP-overlap MoE exit (parsed by kimi_k3_opt_modes): "off"
+    # (default) keeps the packed MoE input path; "c2"/"auto"/"1" (or its
+    # explicit name "o4d"/"c2b") runs one jax_op with the axial TP -> DP async
+    # EP dispatch overlapped by the shared experts, the hierarchical DP
+    # reduce-scatter + TP psum combine, and the exact routed-expert RMSNorm.
     "TPU_KIMI_OPT_EXIT_FOLD": lambda: os.getenv(
         "TPU_KIMI_OPT_EXIT_FOLD", "off"
     ).strip(),
-    # Kimi K3 Phase O5 compute & VMEM polish sub-knobs ("off"/"0" default is
-    # 100% invariant with O4; supports '+'-joined tokens "trays"/"trays4",
-    # "trays2", "trays32", "vmem_chain", "vmem_src", "kda_glue", "kda_cond",
-    # "kda_cw_f32", "copy_opt", "all", or "c2"/"auto"/"1" for the Cycle-2
-    # verified strictly-positive set ("vmem_chain",)).
+    # Kimi K3 compute polish (parsed by kimi_k3_opt_modes): "off" (default) or
+    # '+'-joined tokens "trays"/"trays4", "vmem_chain", "kda_glue",
+    # "copy_opt", "all", or "c2"/"auto"/"1" for the verified set
+    # ("vmem_chain",).
     "TPU_KIMI_OPT_COMPUTE_POLISH": lambda: (
         os.getenv("TPU_KIMI_OPT_COMPUTE_POLISH", "off").strip() or "off"
     ),

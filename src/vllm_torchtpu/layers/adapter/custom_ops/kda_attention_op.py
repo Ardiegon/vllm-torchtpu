@@ -690,7 +690,6 @@ def _run_kda_window_kernel(
     window_lens: jax.Array | None = None,
     batched_only: bool = False,
     conv_weight_is_kernel_layout: bool = False,
-    skip_empty_per_seq: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """One fused conv1d + KDA pass streaming state directly from/to `pool`.
 
@@ -744,7 +743,6 @@ def _run_kda_window_kernel(
         state_source=pool,
         state_plan=plan,
         conv_weight_is_kernel_layout=conv_weight_is_kernel_layout,
-        skip_empty_per_seq=skip_empty_per_seq,
         batched_state_write=batched_state_write,
         window_lens=window_lens,
     )
@@ -825,7 +823,6 @@ def _pooled_kda_core(
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
     kda_glue: bool = False,
-    kda_cond: bool = False,
     direct_pool_streaming: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """One pooled KDA step: state read from and written back to `pool`.
@@ -837,7 +834,7 @@ def _pooled_kda_core(
 
     `kda_glue` (direct streaming only) feeds the conv weight in the kernel
     layout and runs the 2D gated norm, returning `[T, H * D]` instead of
-    `[T, H, D]`; `kda_cond` skips the empty PER_SEQ pass with a `lax.cond`.
+    `[T, H, D]`.
     """
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
@@ -893,7 +890,6 @@ def _pooled_kda_core(
             lower_bound=lower_bound,
             eps=eps,
             kda_glue=kda_glue,
-            kda_cond=kda_cond,
         )
     return _pooled_kda_gather_scatter(
         mixed_qkv,
@@ -932,7 +928,6 @@ def _pooled_kda_direct(
     lower_bound: float | None,
     eps: float,
     kda_glue: bool,
-    kda_cond: bool,
 ) -> tuple[jax.Array, jax.Array]:
     """K = 0 pooled KDA with in-kernel pool streaming.
 
@@ -956,9 +951,9 @@ def _pooled_kda_direct(
     if kda_glue and not (
         conv_weight.ndim == 3 and conv_weight.shape == (kernel_size, 1, conv_dim)
     ):
-        # Zero-copy reshape of bf16[K, 3, H, D] -> bf16[K, 1, 3*H*D] (a
-        # load-time f32[K, 1, 3*H*D] copy is already in that layout), skipping
-        # the transpose -> swapaxes(0, 2) round trip.
+        # Zero-copy reshape of [K, 3, H, D] -> [K, 1, 3*H*D] (a weight
+        # already in that layout is passed through), skipping the
+        # transpose -> swapaxes(0, 2) round trip.
         conv_weight = conv_weight.reshape(kernel_size, 1, conv_dim)
     new_pool, out = _run_kda_window_kernel(
         mixed_qkv,
@@ -976,7 +971,6 @@ def _pooled_kda_direct(
         lower_bound=lower_bound,
         num_spec_tokens=0,
         conv_weight_is_kernel_layout=kda_glue,
-        skip_empty_per_seq=kda_cond,
     )
     if kda_glue:
         output = gated_output_norm_2d(
@@ -1153,7 +1147,6 @@ def build_kimi_pooled_kda_op(
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
     kda_glue: bool = False,
-    kda_cond: bool = False,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -1164,8 +1157,7 @@ def build_kimi_pooled_kda_op(
     the 2D <-> 3D relayout (callers flatten the output either way). The state
     regions are streamed through (or gathered out of the pool into) the fused
     conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
-    unfused core is not available here) and written back. `kda_cond` skips
-    the empty PER_SEQ kernel pass with a `lax.cond` on that path too.
+    unfused core is not available here) and written back.
 
     The manager block size (``cache_config.block_size``) lets the op size
     the state regions against the manager block and derive the
@@ -1193,13 +1185,11 @@ def build_kimi_pooled_kda_op(
     # Read once here and passed down: the op body runs under trace, where an
     # env read would be captured silently.
     direct_pool_streaming = tpu_envs.TPU_KDA_DIRECT_POOL_STREAMING
-    # The glue fusion and the PER_SEQ skip exist only on the
-    # direct-streaming K = 0 path.
+    # The glue fusion exists only on the direct-streaming K = 0 path.
     direct_eligible = (
         direct_pool_streaming and conv_shard_heads is None and num_spec_tokens == 0
     )
     kda_glue_active = bool(kda_glue and direct_eligible)
-    kda_cond_active = bool(kda_cond and direct_eligible)
 
     def pooled_core(
         mixed_qkv: jax.Array,
@@ -1244,7 +1234,6 @@ def build_kimi_pooled_kda_op(
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
             kda_glue=kda_glue_active,
-            kda_cond=kda_cond_active,
             direct_pool_streaming=direct_pool_streaming,
         )
 
@@ -1264,8 +1253,6 @@ def build_kimi_pooled_kda_op(
         op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
     if kda_glue_active:
         op_name += "_kdaglue"
-    if kda_cond_active:
-        op_name += "_kdacond"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
 
     def _fake_pooled(

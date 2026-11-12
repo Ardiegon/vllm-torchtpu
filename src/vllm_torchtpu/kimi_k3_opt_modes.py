@@ -30,9 +30,6 @@ OFF_TOKENS: frozenset[str] = frozenset({"", "0", "false", "no", "off", "none"})
 # ("c2") and its explicit name ("o4d", alias "c2b") run the axial
 # TP -> DP async EP dispatch with the hierarchical DP reduce-scatter +
 # TP psum combine.
-_EXIT_FOLD_ABLATION_MODES: frozenset[str] = frozenset(
-    {"o4a", "o4b", "o4a_sync", "o4b_sync", "o4d_sync"}
-)
 _EXIT_FOLD_PRESET_ALIASES: frozenset[str] = frozenset(
     {"1", "true", "yes", "auto", "c2"}
 )
@@ -49,9 +46,6 @@ ALL_COMPUTE_POLISH_TOKENS: tuple[str, ...] = (
 _COMPUTE_POLISH_PRESET_ALIASES: frozenset[str] = frozenset(
     {"c2", "auto", "1", "true", "yes"}
 )
-# At most one of each group may be active.
-_COMPUTE_POLISH_TRAY_TOKENS: frozenset[str] = frozenset({"trays", "trays2", "trays32"})
-_COMPUTE_POLISH_VMEM_TOKENS: frozenset[str] = frozenset({"vmem_chain", "vmem_src"})
 
 _SPEC_KDA_VERIFY_ALIASES: frozenset[str] = frozenset(
     {"o6a", "c3", "auto", "1", "true", "yes"}
@@ -62,23 +56,20 @@ def normalize_exit_fold_mode(raw: str | None) -> str:
     """Canonicalize `TPU_KIMI_OPT_EXIT_FOLD`.
 
     Returns `"off"` (default and the `OFF_TOKENS` spellings), `"c2"` (the
-    verified preset; aliases `"auto"`, `"1"`, `"true"`, `"yes"`), `"o4d"`
+    verified preset; aliases `"auto"`, `"1"`, `"true"`, `"yes"`) or `"o4d"`
     (alias `"c2b"`), which selects the same plan as `"c2"` under its own
-    name, or one of the ablation modes `"o4a"`, `"o4b"`, `"o4a_sync"`,
-    `"o4b_sync"`, `"o4d_sync"`.
+    name.
     """
     val = (raw or "off").strip().lower()
     if val in OFF_TOKENS:
         return "off"
-    if val == "c2b":
+    if val in ("o4d", "c2b"):
         return "o4d"
-    if val == "o4d" or val in _EXIT_FOLD_ABLATION_MODES:
-        return val
     if val in _EXIT_FOLD_PRESET_ALIASES:
         return "c2"
     raise ValueError(
-        f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4a', 'o4b', "
-        "'o4d'/'c2b', 'o4a_sync', 'o4b_sync', 'o4d_sync', or 'c2'/'auto'/'1'."
+        f"Invalid TPU_KIMI_OPT_EXIT_FOLD={raw!r}; expected 'off', 'o4d'/'c2b', "
+        "or 'c2'/'auto'/'1'."
     )
 
 
@@ -86,9 +77,7 @@ def normalize_compute_polish_mode(raw: str | None) -> tuple[str, frozenset[str]]
     """Canonicalize `TPU_KIMI_OPT_COMPUTE_POLISH`.
 
     The value is a `+`-joined list of tokens: `"trays"` (alias `"trays4"`),
-    `"trays2"`, `"trays32"`, `"vmem_chain"`, `"vmem_src"`, `"kda_glue"`,
-    `"kda_cond"`, `"kda_cw_f32"`, `"copy_opt"`, `"all"` (`trays`,
-    `vmem_chain`, `kda_glue`, `copy_opt`) and the
+    `"vmem_chain"`, `"kda_glue"`, `"copy_opt"`, `"all"` (all four) and the
     preset `"c2"` (aliases `"auto"`, `"1"`, `"true"`, `"yes"`), which expands
     to `DEFAULT_COMPUTE_POLISH_TOKENS`. `OFF_TOKENS` spellings are ignored.
 
@@ -107,16 +96,7 @@ def normalize_compute_polish_mode(raw: str | None) -> tuple[str, frozenset[str]]
             continue
         if tok in ("trays", "trays4"):
             tokens.add("trays")
-        elif tok in (
-            "trays2",
-            "trays32",
-            "vmem_chain",
-            "vmem_src",
-            "kda_glue",
-            "kda_cond",
-            "kda_cw_f32",
-            "copy_opt",
-        ):
+        elif tok in ("vmem_chain", "kda_glue", "copy_opt"):
             tokens.add(tok)
         elif tok == "all":
             tokens.update(ALL_COMPUTE_POLISH_TOKENS)
@@ -125,18 +105,8 @@ def normalize_compute_polish_mode(raw: str | None) -> tuple[str, frozenset[str]]
         else:
             raise ValueError(
                 f"Invalid TPU_KIMI_OPT_COMPUTE_POLISH token {tok!r} in {raw!r}; "
-                "expected 'off', 'trays'/'trays4', 'trays2', 'trays32', "
-                "'vmem_chain', 'vmem_src', 'kda_glue', 'kda_cond', 'kda_cw_f32', "
+                "expected 'off', 'trays'/'trays4', 'vmem_chain', 'kda_glue', "
                 "'copy_opt', 'all', 'c2'/'auto'/'1', or '+'-joined combinations."
-            )
-
-    for group in (_COMPUTE_POLISH_TRAY_TOKENS, _COMPUTE_POLISH_VMEM_TOKENS):
-        active = tokens & group
-        if len(active) > 1:
-            raise ValueError(
-                f"Conflicting tokens {sorted(active)} in "
-                f"TPU_KIMI_OPT_COMPUTE_POLISH={raw!r}; choose at most one of "
-                f"{sorted(group)}."
             )
 
     if not tokens:

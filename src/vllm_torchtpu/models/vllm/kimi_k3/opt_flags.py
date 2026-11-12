@@ -53,31 +53,21 @@ def _compute_polish_tokens() -> frozenset[str]:
 def active_trays_mode() -> str:
     """Row-loop mode of the fused small-batch MXFP4 MoE kernel.
 
-    Returns `"trays"` (16-row trays), `"trays2"` (32-row trays from 64 rows)
-    or `"trays32"` (16-row trays above 16 rows) when that compute-polish
-    token is set, else `"off"` (one tile).
+    Returns `"trays"` (16-row trays) when the `trays` compute-polish token is
+    set, else `"off"` (one tile).
     """
-    tokens = _compute_polish_tokens()
-    for mode in ("trays", "trays2", "trays32"):
-        if mode in tokens:
-            return mode
-    return "off"
+    return "trays" if "trays" in _compute_polish_tokens() else "off"
 
 
 def vmem_chain_mode() -> str:
-    """`"vmem_chain"`, `"vmem_src"` or `"off"`: VMEM use of the EP-overlap op.
+    """`"vmem_chain"` when the EP-overlap collectives receive into VMEM.
 
-    With `vmem_chain` the async dispatch wait leaves the gathered rows in
-    its receive buffer and the combine collectives use VMEM receive
-    buffers up to their DMA token cap; `vmem_src` also stages the combine
-    sources in VMEM.
+    With the `vmem_chain` compute-polish token the async dispatch wait
+    leaves the gathered rows in its receive buffer and the combine
+    collectives use VMEM receive buffers up to their DMA token cap.
+    Returns `"off"` otherwise.
     """
-    tokens = _compute_polish_tokens()
-    if "vmem_chain" in tokens:
-        return "vmem_chain"
-    if "vmem_src" in tokens:
-        return "vmem_src"
-    return "off"
+    return "vmem_chain" if "vmem_chain" in _compute_polish_tokens() else "off"
 
 
 def use_copy_opt() -> bool:
@@ -92,16 +82,6 @@ def use_kda_glue() -> bool:
     gated output norm.
     """
     return "kda_glue" in _compute_polish_tokens()
-
-
-def use_kda_cond() -> bool:
-    """Whether K = 0 pooled KDA skips the empty PER_SEQ pass (`kda_cond`)."""
-    return "kda_cond" in _compute_polish_tokens()
-
-
-def use_kda_cw_f32() -> bool:
-    """Whether KDA keeps a load-time f32 copy of the conv weight (`kda_cw_f32`)."""
-    return "kda_cw_f32" in _compute_polish_tokens()
 
 
 def spec_kda_mode() -> str:

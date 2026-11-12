@@ -252,10 +252,7 @@ def _resolve_fused_decode_options() -> _FusedDecodeOptions:
     _, polish_tokens = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
     spec_kda_mode = normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA)
     return (
-        next(
-            (m for m in ("trays", "trays2", "trays32") if m in polish_tokens),
-            "off",
-        ),
+        "trays" if "trays" in polish_tokens else "off",
         "copy_opt" in polish_tokens,
         FUSED_VERIFY_MOE_MAX_TOKENS
         if spec_kda_mode == "o6b"

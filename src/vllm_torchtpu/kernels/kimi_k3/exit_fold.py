@@ -31,11 +31,7 @@ Implements (`1_v6e_128_design_doc.md §7.2 Step 5`, `D87`, `D89`):
          for `T_global <= 64`, `moe_gmm` fallback for `T_global > 64`, with zero
          Python branching on `hidden_states.shape[0]`), and
        - Mathematically exact `routed_expert_norm` (`RMSNorm(latent_dim)`)
-         combine + `[latent_local]` exit-fold (`O4-A` vs `O4-B`):
-           * `O4-A`: `world`-way slot-owner `psum_scatter` + exact local
-             `RMSNorm(latent_dim)` + barrier-free `'tp'` `seam_exit_split`
-             (`cid=6`), deleting all `routed_out` `TP` `all-reduce`s (`-92` on
-             `93L`, `-4` on `L5`).
+         combine + `[latent_local]` exit-fold:
            * `O4-B`: 1-shot `'dp'` `latency_psum_scatter_rows` (`cid=2`) +
              width-guarded `'tp'` `latency_psum` (`cid=3`) + in-`@jax_op`
              fused `RMSNorm(latent_dim)` + `[latent_local]` slice.
@@ -60,7 +56,6 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     COLLECTIVE_ID_MOE_DP_COMBINE_RS,
     COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-    COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
     COLLECTIVE_ID_MOE_TP_LATENT_AG,
     COLLECTIVE_ID_MOE_TP_ROUTED_PSUM,
     DEFAULT_MAX_DMA_TOKENS,
@@ -70,12 +65,10 @@ from vllm_torchtpu.kernels.kimi_k3.pallas_dma import (
     barrier_and_allocate,
     call_kernel,
     kimi_guarded_all_gather_cols,
-    kimi_guarded_all_gather_rows,
     kimi_guarded_psum,
     kimi_guarded_psum_scatter_rows,
     normalize_axis_name,
     seam_pieces_pack,
-    seam_pieces_tile,
     seam_pieces_unpack,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
@@ -97,19 +90,7 @@ DEFAULT_C2_DISPATCH_KIND = "axial"
 def resolve_effective_exit_fold_plan(mode: str) -> tuple[str, bool, str]:
     """Map canonical ``exit_fold_mode`` + static shape to ``(combine_kind, async_dispatch, dispatch_kind)``."""
     norm = normalize_exit_fold_mode(mode)
-    if norm == "o4a":
-        return "o4a", True, "world"
-    if norm == "o4b":
-        return "o4b", True, "world"
-    if norm == "o4d":
-        return "o4b", True, "axial"
-    if norm == "o4a_sync":
-        return "o4a", False, "world"
-    if norm == "o4b_sync":
-        return "o4b", False, "world"
-    if norm == "o4d_sync":
-        return "o4b", False, "axial"
-    if norm == "c2":
+    if norm in ("o4d", "c2"):
         return DEFAULT_C2_COMBINE_KIND, True, DEFAULT_C2_DISPATCH_KIND
     raise ValueError(f"resolve_effective_exit_fold_plan called with inactive mode={mode!r}")
 
@@ -422,431 +403,9 @@ def _unpack_axial_gathered(
     return ag_latent, ag_ids, ag_weights
 
 
-def _unpack_world_gathered(
-    gathered_3d: jax.Array,
-    *,
-    dp_size: int,
-    tp_size: int,
-    b_dp: int,
-    d_local: int,
-    m_per_tp: int,
-    topk: int,
-    copy_opt: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Unpack `[world_size, b_dp, d_local + m_per_tp]` -> `(ag_latent, ag_ids, ag_weights)`."""
-    if copy_opt and b_dp == 1:
-        ag_latent = gathered_3d[..., :d_local].reshape(dp_size, tp_size * d_local)
-        ag_meta_padded = gathered_3d[..., d_local:].reshape(
-            dp_size, tp_size * m_per_tp
-        )
-    else:
-        gathered_4d = gathered_3d.reshape(dp_size, tp_size, b_dp, d_local + m_per_tp)
-        lat_4d = gathered_4d[..., :d_local]
-        meta_4d = gathered_4d[..., d_local:]
-        ag_latent = jnp.swapaxes(lat_4d, 1, 2).reshape(
-            dp_size * b_dp, tp_size * d_local
-        )
-        ag_meta_padded = jnp.swapaxes(meta_4d, 1, 2).reshape(
-            dp_size * b_dp, tp_size * m_per_tp
-        )
-    ag_ids, ag_weights = _unpack_meta_columns(ag_meta_padded, topk=topk)
-    return ag_latent, ag_ids, ag_weights
-
-
 # =============================================================================
-# Option `O4-A` (`world` Owner Combine + Local `RMSNorm` + `seam_exit_split`, `cid=6`)
-# and Option `O4-B` (`cid=2` + `cid=3` + Fused `RMSNorm` + `[latent_local]` Slice)
+# Option `O4-B` (`cid=2` + `cid=3` + Fused `RMSNorm` + `[latent_local]` Slice)
 # =============================================================================
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class O4ACombineSeamState:
-    """Layer-barrier-born state for `O4-A` owner combine + barrier-free `seam_exit_split`."""
-
-    combine_recv: Any
-    combine_recv_sem: Ref
-    seam_exit_recv: Any
-    seam_exit_recv_sem: Ref
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class O4AOwnerOnlyState:
-    combine_recv: Any
-    combine_recv_sem: Ref
-
-
-def o4a_owner_combine_rms_seam_split(
-    moe_out: jax.Array,
-    local_norm_w: jax.Array,
-    local_tp_rank: jax.Array,
-    *,
-    dp_size: int,
-    tp_size: int,
-    b_dp: int,
-    latent_dim: int,
-    use_norm: bool,
-    rms_eps: float,
-    max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
-    collective_id: int = COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
-    vmem_mode: str = "off",
-) -> jax.Array:
-    """Option `O4-A`: `world` owner combine + exact local `RMSNorm(latent_dim)` + `'tp'` `seam_exit_split`."""
-    latent_local = latent_dim // tp_size
-    world_size = dp_size * tp_size
-    b_global = dp_size * b_dp
-
-    # Prefill fallback (`T_global > max_dma_tokens`) inside JAX — zero Python shape branching!
-    if b_global > max_dma_tokens or world_size == 1:
-        routed_dp = (
-            lax.psum_scatter(moe_out, DP_AXIS_NAME, scatter_dimension=0, tiled=True)
-            if dp_size > 1
-            else moe_out
-        )
-        routed_full = (
-            lax.psum(routed_dp, TP_AXIS_NAME) if tp_size > 1 else routed_dp
-        )
-        if use_norm:
-            routed_full = _jax_rms_norm(routed_full, local_norm_w, rms_eps)
-        if tp_size > 1:
-            return lax.dynamic_slice_in_dim(
-                routed_full,
-                local_tp_rank[0, 0] * latent_local,
-                latent_local,
-                axis=1,
-            )
-        return routed_full
-
-    world_axis: str | tuple[str, str] = (
-        TP_AXIS_NAME if dp_size == 1 else (DP_AXIS_NAME, TP_AXIS_NAME)
-    )
-
-    # Pad each DP group's token count up to a multiple of `tp_size` (`s_dp = tp_size * slots_per_tp`)
-    # so every `(d, t)` rank owns `slots_per_tp >= 1` tokens of its own DP group `d`!
-    slots_per_tp = (b_dp + tp_size - 1) // tp_size
-    s_dp = tp_size * slots_per_tp
-    moe_by_dp = moe_out.reshape(dp_size, b_dp, latent_dim)
-    if s_dp > b_dp:
-        moe_by_dp = jnp.pad(moe_by_dp, ((0, 0), (0, s_dp - b_dp), (0, 0)))
-    moe_3d = moe_by_dp.reshape(world_size, slots_per_tp, latent_dim)
-    moe_packed = seam_pieces_pack(moe_3d, world_size)
-
-    if tp_size == 1:
-        init_only = barrier_and_allocate(
-            O4AOwnerOnlyState(
-                combine_recv=pltpu.HBM(
-                    shape=moe_packed.shape, dtype=moe_packed.dtype
-                ),
-                combine_recv_sem=pltpu.SemaphoreType.DMA,
-            ),
-            collective_id=collective_id,
-            axis_name=world_axis,
-            order_dep=moe_packed,
-            allow_pin=True,
-        )
-
-        def _owner_only_kernel(
-            moe_ref: Any,
-            state_ref: O4AOwnerOnlyState,
-            *,
-            send_sem: Any,
-            local_sem: Any,
-        ) -> None:
-            barrier_sem = pltpu.get_barrier_semaphore()
-            pl.semaphore_wait(barrier_sem, world_size)
-            my_w = jnp.uint32(jax.lax.axis_index(world_axis))
-            for i in range(world_size):
-
-                @pl.when(i != my_w)
-                def _(i: int = i) -> None:
-                    pltpu.make_async_remote_copy(
-                        src_ref=moe_ref.at[pl.ds(i, 1)],
-                        dst_ref=state_ref.combine_recv.at[pl.ds(my_w, 1)],
-                        send_sem=send_sem,
-                        recv_sem=state_ref.combine_recv_sem,
-                        device_id={world_axis: i},
-                    ).start()
-
-            pltpu.make_async_copy(
-                src_ref=moe_ref.at[pl.ds(my_w, 1)],
-                dst_ref=state_ref.combine_recv.at[pl.ds(my_w, 1)],
-                sem=local_sem,
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=moe_ref.at[pl.ds(my_w, 1)],
-                dst_ref=state_ref.combine_recv.at[pl.ds(my_w, 1)],
-                sem=local_sem,
-            ).wait()
-            wait_ref = moe_ref.at[pl.ds(0, world_size - 1)]
-            pltpu.make_async_copy(
-                src_ref=wait_ref, dst_ref=wait_ref, sem=state_ref.combine_recv_sem
-            ).wait()
-            pltpu.make_async_copy(
-                src_ref=wait_ref, dst_ref=wait_ref, sem=send_sem
-            ).wait()
-
-        (state_only_out,) = call_kernel(
-            _owner_only_kernel,
-            args=(moe_packed,),
-            inout=(init_only,),
-            scoped={
-                "send_sem": pltpu.SemaphoreType.DMA,
-                "local_sem": pltpu.SemaphoreType.DMA,
-            },
-            compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-            allow_pin=True,
-            name="kimi_o4a_owner_combine",
-        )
-        recv_unpacked = seam_pieces_unpack(
-            state_only_out.combine_recv, slots_per_tp, latent_dim
-        )
-        owned_sum = recv_unpacked.astype(jnp.float32).sum(axis=0).astype(moe_out.dtype)
-        if use_norm:
-            owned_sum = _jax_rms_norm(owned_sum, local_norm_w, rms_eps)
-        return owned_sum[:b_dp, :]
-
-    # `tp_size > 1`: allocate BOTH `combine_recv` AND `seam_exit_recv` under ONE
-    # `world_axis` barrier so `seam_exit_split` needs ZERO extra barrier wave!
-    seam_tile = seam_pieces_tile(tp_size, slots_per_tp, latent_local, moe_out.dtype)
-    seam_shape = seam_tile.shape
-
-    use_vmem_src = vmem_mode in ("vmem_chain", "vmem_src")
-    use_vmem_recv = vmem_mode == "vmem_chain"
-    recv_ctor = pltpu.VMEM if use_vmem_recv else pltpu.HBM
-    vmem_fields: tuple[str, ...] = (
-        ("combine_recv", "seam_exit_recv") if use_vmem_recv else ()
-    )
-
-    init_state = barrier_and_allocate(
-        O4ACombineSeamState(
-            combine_recv=recv_ctor(shape=moe_packed.shape, dtype=moe_packed.dtype),
-            combine_recv_sem=pltpu.SemaphoreType.DMA,
-            seam_exit_recv=recv_ctor(shape=seam_shape, dtype=moe_out.dtype),
-            seam_exit_recv_sem=pltpu.SemaphoreType.DMA,
-        ),
-        collective_id=collective_id,
-        axis_name=world_axis,
-        order_dep=moe_packed,
-        allow_pin=True,
-        order_dep_vmem=use_vmem_src,
-    )
-
-    def _owner_combine_kernel(
-        moe_ref: Any,
-        state_ref: O4ACombineSeamState,
-        *,
-        send_sem: Any,
-        local_sem: Any,
-    ) -> None:
-        with jax.named_scope("o4a_combine_barrier_wait"):
-            barrier_sem = pltpu.get_barrier_semaphore()
-            pl.semaphore_wait(barrier_sem, world_size)
-        my_w = jnp.uint32(jax.lax.axis_index(world_axis))
-        with jax.named_scope("o4a_send_owner_partials"):
-            for i in range(world_size):
-
-                @pl.when(i != my_w)
-                def _(i: int = i) -> None:
-                    pltpu.make_async_remote_copy(
-                        src_ref=moe_ref.at[pl.ds(i, 1)],
-                        dst_ref=state_ref.combine_recv.at[pl.ds(my_w, 1)],
-                        send_sem=send_sem,
-                        recv_sem=state_ref.combine_recv_sem,
-                        device_id={world_axis: i},
-                    ).start()
-
-        with jax.named_scope("o4a_local_owner_copy"):
-            pltpu.make_async_copy(
-                src_ref=moe_ref.at[pl.ds(my_w, 1)],
-                dst_ref=state_ref.combine_recv.at[pl.ds(my_w, 1)],
-                sem=local_sem,
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=moe_ref.at[pl.ds(my_w, 1)],
-                dst_ref=state_ref.combine_recv.at[pl.ds(my_w, 1)],
-                sem=local_sem,
-            ).wait()
-
-        with jax.named_scope("o4a_wait_owner_partials"):
-            wait_ref = moe_ref.at[pl.ds(0, world_size - 1)]
-            pltpu.make_async_copy(
-                src_ref=wait_ref, dst_ref=wait_ref, sem=state_ref.combine_recv_sem
-            ).wait()
-            pltpu.make_async_copy(
-                src_ref=wait_ref, dst_ref=wait_ref, sem=send_sem
-            ).wait()
-
-    owner_scoped: dict[str, Any] = {
-        "send_sem": pltpu.SemaphoreType.DMA,
-        "local_sem": pltpu.SemaphoreType.DMA,
-    }
-
-    (state_after_combine,) = call_kernel(
-        _owner_combine_kernel,
-        args=(moe_packed,),
-        inout=(init_state,),
-        scoped=owner_scoped,
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-        allow_pin=True,
-        vmem_args=use_vmem_src,
-        vmem_inout_fields=vmem_fields,
-        name=(
-            f"kimi_o4a_owner_combine_{vmem_mode}"
-            if use_vmem_src
-            else "kimi_o4a_owner_combine"
-        ),
-    )
-
-    # Extract only `seam_exit_recv` + `seam_exit_recv_sem` so `combine_recv` dies right after sum!
-    combine_raw = state_after_combine.combine_recv
-    seam_exit_recv = state_after_combine.seam_exit_recv
-    seam_exit_recv_sem = state_after_combine.seam_exit_recv_sem
-    del state_after_combine
-
-    received_3d = seam_pieces_unpack(combine_raw, slots_per_tp, latent_dim)
-    owned_sum = received_3d.astype(jnp.float32).sum(axis=0).astype(moe_out.dtype)
-    owned_norm = (
-        _jax_rms_norm(owned_sum, local_norm_w, rms_eps) if use_norm else owned_sum
-    )
-
-    pieces = jnp.swapaxes(
-        owned_norm.reshape(slots_per_tp, tp_size, latent_local), 0, 1
-    )
-    pieces_packed = seam_pieces_pack(pieces, tp_size)
-
-    if use_vmem_src:
-        def _seam_exit_split_inplace_kernel(
-            pieces_ref: Any,
-            seam_recv_ref: Any,
-            seam_sem_ref: Any,
-            *,
-            send_sem: Any,
-            local_sem: Any,
-        ) -> None:
-            my_tp = jnp.uint32(jax.lax.axis_index(TP_AXIS_NAME))
-            with jax.named_scope("seam_send_pieces"):
-                for p in range(tp_size):
-
-                    @pl.when(p != my_tp)
-                    def _(p: int = p) -> None:
-                        pltpu.make_async_remote_copy(
-                            src_ref=pieces_ref.at[pl.ds(p, 1)],
-                            dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
-                            send_sem=send_sem,
-                            recv_sem=seam_sem_ref,
-                            device_id={TP_AXIS_NAME: p},
-                        ).start()
-
-            with jax.named_scope("seam_local_piece_copy"):
-                pltpu.make_async_copy(
-                    src_ref=pieces_ref.at[pl.ds(my_tp, 1)],
-                    dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
-                    sem=local_sem,
-                ).start()
-                pltpu.make_async_copy(
-                    src_ref=pieces_ref.at[pl.ds(my_tp, 1)],
-                    dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
-                    sem=local_sem,
-                ).wait()
-
-            with jax.named_scope("seam_wait_pieces"):
-                wait_tp_ref = pieces_ref.at[pl.ds(0, tp_size - 1)]
-                pltpu.make_async_copy(
-                    src_ref=wait_tp_ref, dst_ref=wait_tp_ref, sem=seam_sem_ref
-                ).wait()
-                pltpu.make_async_copy(
-                    src_ref=wait_tp_ref, dst_ref=wait_tp_ref, sem=send_sem
-                ).wait()
-
-        seam_scoped: dict[str, Any] = {
-            "send_sem": pltpu.SemaphoreType.DMA,
-            "local_sem": pltpu.SemaphoreType.DMA,
-        }
-
-        seam_out_raw, _ = call_kernel(
-            _seam_exit_split_inplace_kernel,
-            args=(pieces_packed,),
-            inout=(seam_exit_recv, seam_exit_recv_sem),
-            scoped=seam_scoped,
-            compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-            allow_pin=True,
-            vmem_args=True,
-            vmem_inout_all=use_vmem_recv,
-            name=f"kimi_o4a_seam_exit_split_{vmem_mode}",
-        )
-        recv_pieces = seam_pieces_unpack(seam_out_raw, slots_per_tp, latent_local)
-        return recv_pieces.reshape(tp_size * slots_per_tp, latent_local)[:b_dp, :]
-
-    def _seam_exit_split_kernel(
-        pieces_ref: Any,
-        seam_recv_ref: Any,
-        seam_sem_ref: Any,
-        out_ref: Any,
-        *,
-        send_sem: Any,
-        local_sem: Any,
-        out_sem: Any,
-    ) -> None:
-        my_tp = jnp.uint32(jax.lax.axis_index(TP_AXIS_NAME))
-        with jax.named_scope("seam_send_pieces"):
-            for p in range(tp_size):
-
-                @pl.when(p != my_tp)
-                def _(p: int = p) -> None:
-                    pltpu.make_async_remote_copy(
-                        src_ref=pieces_ref.at[pl.ds(p, 1)],
-                        dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
-                        send_sem=send_sem,
-                        recv_sem=seam_sem_ref,
-                        device_id={TP_AXIS_NAME: p},
-                    ).start()
-
-        with jax.named_scope("seam_local_piece_copy"):
-            pltpu.make_async_copy(
-                src_ref=pieces_ref.at[pl.ds(my_tp, 1)],
-                dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
-                sem=local_sem,
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=pieces_ref.at[pl.ds(my_tp, 1)],
-                dst_ref=seam_recv_ref.at[pl.ds(my_tp, 1)],
-                sem=local_sem,
-            ).wait()
-
-        with jax.named_scope("seam_wait_pieces"):
-            wait_tp_ref = pieces_ref.at[pl.ds(0, tp_size - 1)]
-            pltpu.make_async_copy(
-                src_ref=wait_tp_ref, dst_ref=wait_tp_ref, sem=seam_sem_ref
-            ).wait()
-            pltpu.make_async_copy(
-                src_ref=wait_tp_ref, dst_ref=wait_tp_ref, sem=send_sem
-            ).wait()
-
-        with jax.named_scope("seam_emit_rows"):
-            pltpu.make_async_copy(
-                src_ref=seam_recv_ref, dst_ref=out_ref, sem=out_sem
-            ).start()
-            pltpu.make_async_copy(
-                src_ref=seam_recv_ref, dst_ref=out_ref, sem=out_sem
-            ).wait()
-
-    _, _, seam_out_raw = call_kernel(
-        _seam_exit_split_kernel,
-        args=(pieces_packed,),
-        inout=(seam_exit_recv, seam_exit_recv_sem),
-        output=(pltpu.HBM(shape=seam_shape, dtype=moe_out.dtype),),
-        scoped={
-            "send_sem": pltpu.SemaphoreType.DMA,
-            "local_sem": pltpu.SemaphoreType.DMA,
-            "out_sem": pltpu.SemaphoreType.DMA,
-        },
-        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-        allow_pin=True,
-        name="kimi_o4a_seam_exit_split",
-    )
-    recv_pieces = seam_pieces_unpack(seam_out_raw, slots_per_tp, latent_local)
-    return recv_pieces.reshape(tp_size * slots_per_tp, latent_local)[:b_dp, :]
 
 
 def o4b_dp_rs_tp_psum_fused_rms_slice(
@@ -885,11 +444,7 @@ def o4b_dp_rs_tp_psum_fused_rms_slice(
             )
         return routed_full
 
-    vmax = (
-        max_dma_tokens
-        if vmem_mode in ("vmem_chain", "vmem_src")
-        else DEFAULT_VMEM_MAX_TOKENS
-    )
+    vmax = max_dma_tokens if vmem_mode == "vmem_chain" else DEFAULT_VMEM_MAX_TOKENS
     if dp_size > 1:
         routed_dp = kimi_guarded_psum_scatter_rows(
             moe_out,
@@ -1014,21 +569,13 @@ def _make_moe_ep_overlap_jax_fn(
     onehot_thresh = int(cfg["onehot_thresh"])
     skip_padded = bool(cfg["skip_padded"])
     _, polish_tokens = normalize_compute_polish_mode(envs.TPU_KIMI_OPT_COMPUTE_POLISH)
-    polish_trays = next(
-        (m for m in ("trays", "trays2", "trays32") if m in polish_tokens), "off"
-    )
-    polish_vmem = next(
-        (m for m in ("vmem_chain", "vmem_src") if m in polish_tokens), "off"
-    )
+    polish_trays = "trays" if "trays" in polish_tokens else "off"
+    polish_vmem = "vmem_chain" if "vmem_chain" in polish_tokens else "off"
     polish_copy = "copy_opt" in polish_tokens
     fused_decode_max_tokens = (
         FUSED_VERIFY_MOE_MAX_TOKENS
         if normalize_spec_kda_mode(envs.TPU_KIMI_OPT_SPEC_KDA) == "o6b"
         else FUSED_DECODE_MOE_MAX_TOKENS
-    )
-
-    world_axis: str | tuple[str, str] = (
-        TP_AXIS_NAME if dp_size == 1 else (DP_AXIS_NAME, TP_AXIS_NAME)
     )
 
     spec_hidden = PartitionSpec(DP_AXIS_NAME, None)
@@ -1102,18 +649,12 @@ def _make_moe_ep_overlap_jax_fn(
             b_dp, d_local = local_rdown.shape
             latent_dim = tp_size * d_local
             b_global = dp_size * b_dp
-            zero_wait_copy = polish_vmem in ("vmem_chain", "vmem_src")
+            zero_wait_copy = polish_vmem == "vmem_chain"
 
-            combine_kind, async_dispatch, dispatch_kind = (
-                resolve_effective_exit_fold_plan(exit_fold_mode)
-            )
-
-            # 1. Dispatch + Shared Gate/Up Compute:
-            #    - "axial" (`o4d` / `c2` / `o4d_sync`): 2-stage `TP` (`cid=0`) -> async `DP` (`cid=1`)
-            #      for decode (`<= max_dma_tokens`), and 1D axial `TP` (`axis=1`) -> `DP` (`axis=0`) XLA
-            #      `all_gather` (`0` 4D `swapaxes`!) for prefill (`> max_dma_tokens`).
-            #    - "world" (`o4a` / `o4b` / `o4a_sync` / `o4b_sync`): flat `('dp', 'tp')` dispatch
-            #      preserved for exact A/B reproducibility (with 1D axial prefill fallback on `o4b`).
+            # 1. Dispatch + Shared Gate/Up Compute: 2-stage `TP` (`cid=0`) ->
+            #    async `DP` (`cid=1`) for decode (`<= max_dma_tokens`), and 1D
+            #    axial `TP` (`axis=1`) -> `DP` (`axis=0`) XLA `all_gather` for
+            #    prefill (`> max_dma_tokens`).
             if b_global > max_dma_tokens:
                 shared_act = _compute_shared_gu_and_act(
                     local_hidden,
@@ -1122,263 +663,122 @@ def _make_moe_ep_overlap_jax_fn(
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
                 )
-                if combine_kind == "o4a" and dispatch_kind == "world":
-                    m_padded = local_meta.shape[1]
-                    m_per_tp = m_padded // tp_size
-                    col_start = local_tp_rank[0, 0] * m_per_tp
-                    local_meta_shard = lax.dynamic_slice_in_dim(
-                        local_meta, col_start, m_per_tp, axis=1
-                    )
-                    send_shard = jnp.concatenate(
-                        (local_rdown, local_meta_shard), axis=-1
-                    )
-                    gathered_3d = (
-                        lax.all_gather(send_shard, world_axis, axis=0, tiled=False)
-                        if (dp_size * tp_size > 1)
-                        else send_shard[None, :, :]
-                    )
-                    ag_latent, ag_ids, ag_weights = _unpack_world_gathered(
-                        gathered_3d,
-                        dp_size=dp_size,
-                        tp_size=tp_size,
-                        b_dp=b_dp,
-                        d_local=d_local,
-                        m_per_tp=m_per_tp,
-                        topk=topk,
-                        copy_opt=polish_copy,
-                    )
-                else:
-                    # Fix #3 (`D91` / `OG-4`): 1D axial XLA gathers on contiguous dims (`0` swapaxes!).
-                    lat_tp = (
-                        lax.all_gather(local_rdown, TP_AXIS_NAME, axis=1, tiled=True)
-                        if tp_size > 1
-                        else local_rdown
-                    )
-                    if dp_size > 1:
-                        packed_dp = jnp.concatenate(
-                            (lat_tp, local_meta[:, : 3 * topk]), axis=-1
-                        )
-                        gathered_dp = lax.all_gather(
-                            packed_dp, DP_AXIS_NAME, axis=0, tiled=True
-                        )
-                        ag_latent, ag_ids, ag_weights = _unpack_axial_gathered(
-                            gathered_dp, latent_dim=latent_dim, topk=topk
-                        )
-                    else:
-                        ag_latent = lat_tp
-                        ag_ids, ag_weights = _unpack_meta_columns(
-                            local_meta, topk=topk
-                        )
-            elif dispatch_kind == "axial":
+                lat_tp = (
+                    lax.all_gather(local_rdown, TP_AXIS_NAME, axis=1, tiled=True)
+                    if tp_size > 1
+                    else local_rdown
+                )
                 if dp_size > 1:
-                    lat_tp = (
-                        kimi_guarded_all_gather_cols(
-                            local_rdown,
-                            TP_AXIS_NAME,
-                            collective_id=COLLECTIVE_ID_MOE_TP_LATENT_AG,
-                            recv_memory_space="auto",
-                            max_dma_tokens=max_dma_tokens,
-                        )
-                        if tp_size > 1
-                        else local_rdown
-                    )
-                    dp_orig_lanes = latent_dim + 3 * topk
                     packed_dp = jnp.concatenate(
                         (lat_tp, local_meta[:, : 3 * topk]), axis=-1
                     )
-                    if async_dispatch:
-                        rx_state, start_tok = async_ep_dispatch_start(
-                            packed_dp,
-                            DP_AXIS_NAME,
-                            collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                        )
-                        hidden_after_start, start_tok = lax.optimization_barrier(
-                            (local_hidden, start_tok)
-                        )
-                        shared_act = _compute_shared_gu_and_act(
-                            hidden_after_start,
-                            local_w_shared_gu,
-                            act_kind=shared_act_kind,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                        )
-                        wait_tok, shared_act = lax.optimization_barrier(
-                            (start_tok, shared_act)
-                        )
-                        gathered_dp_3d = async_ep_dispatch_wait(
-                            rx_state,
-                            wait_tok,
-                            DP_AXIS_NAME,
-                            rows=b_dp,
-                            orig_lanes=dp_orig_lanes,
-                            collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                            zero_extra_copy=zero_wait_copy,
-                        )
-                        gathered_dp = gathered_dp_3d.reshape(
-                            dp_size * b_dp, dp_orig_lanes
-                        )
-                    else:
-                        gathered_dp = kimi_guarded_all_gather_rows(
-                            packed_dp,
-                            DP_AXIS_NAME,
-                            collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                            recv_memory_space="hbm",
-                            max_dma_tokens=max_dma_tokens,
-                        )
-                        gathered_dp, local_hidden_sync = lax.optimization_barrier(
-                            (gathered_dp, local_hidden)
-                        )
-                        shared_act = _compute_shared_gu_and_act(
-                            local_hidden_sync,
-                            local_w_shared_gu,
-                            act_kind=shared_act_kind,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                        )
+                    gathered_dp = lax.all_gather(
+                        packed_dp, DP_AXIS_NAME, axis=0, tiled=True
+                    )
                     ag_latent, ag_ids, ag_weights = _unpack_axial_gathered(
                         gathered_dp, latent_dim=latent_dim, topk=topk
                     )
-                elif tp_size > 1:
-                    if async_dispatch:
-                        rx_state, start_tok = async_ep_dispatch_start(
-                            local_rdown,
-                            TP_AXIS_NAME,
-                            collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                        )
-                        hidden_after_start, start_tok = lax.optimization_barrier(
-                            (local_hidden, start_tok)
-                        )
-                        shared_act = _compute_shared_gu_and_act(
-                            hidden_after_start,
-                            local_w_shared_gu,
-                            act_kind=shared_act_kind,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                        )
-                        wait_tok, shared_act = lax.optimization_barrier(
-                            (start_tok, shared_act)
-                        )
-                        lat_tp_3d = async_ep_dispatch_wait(
-                            rx_state,
-                            wait_tok,
-                            TP_AXIS_NAME,
-                            rows=b_dp,
-                            orig_lanes=d_local,
-                            collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                            zero_extra_copy=zero_wait_copy,
-                        )
-                    else:
-                        lat_tp_2d = kimi_guarded_all_gather_rows(
-                            local_rdown,
-                            TP_AXIS_NAME,
-                            collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                            recv_memory_space="hbm",
-                            max_dma_tokens=max_dma_tokens,
-                        )
-                        lat_tp_3d = lat_tp_2d.reshape(tp_size, b_dp, d_local)
-                        lat_tp_3d, local_hidden_sync = lax.optimization_barrier(
-                            (lat_tp_3d, local_hidden)
-                        )
-                        shared_act = _compute_shared_gu_and_act(
-                            local_hidden_sync,
-                            local_w_shared_gu,
-                            act_kind=shared_act_kind,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                        )
-                    ag_latent = (
-                        lat_tp_3d.reshape(1, latent_dim)
-                        if b_dp == 1
-                        else jnp.swapaxes(lat_tp_3d, 0, 1).reshape(b_dp, latent_dim)
-                    )
+                else:
+                    ag_latent = lat_tp
                     ag_ids, ag_weights = _unpack_meta_columns(
                         local_meta, topk=topk
                     )
-                else:
-                    shared_act = _compute_shared_gu_and_act(
-                        local_hidden,
-                        local_w_shared_gu,
-                        act_kind=shared_act_kind,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                    )
-                    ag_latent = local_rdown
-                    ag_ids, ag_weights = _unpack_meta_columns(
-                        local_meta, topk=topk
-                    )
-            else:
-                m_padded = local_meta.shape[1]
-                m_per_tp = m_padded // tp_size
-                col_start = local_tp_rank[0, 0] * m_per_tp
-                local_meta_shard = lax.dynamic_slice_in_dim(
-                    local_meta, col_start, m_per_tp, axis=1
-                )
-                send_shard = jnp.concatenate(
-                    (local_rdown, local_meta_shard), axis=-1
-                )
-                orig_lanes = d_local + m_per_tp
-                if async_dispatch and (dp_size * tp_size > 1):
-                    rx_state, start_tok = async_ep_dispatch_start(
-                        send_shard,
-                        world_axis,
-                        collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                    )
-                    # Topological HLO fence: guarantees XLA schedules
-                    # [ep_dispatch_start] -> [w_shared_gu + act] -> [ep_dispatch_wait]!
-                    hidden_after_start, start_tok = lax.optimization_barrier(
-                        (local_hidden, start_tok)
-                    )
-                    shared_act = _compute_shared_gu_and_act(
-                        hidden_after_start,
-                        local_w_shared_gu,
-                        act_kind=shared_act_kind,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                    )
-                    wait_tok, shared_act = lax.optimization_barrier(
-                        (start_tok, shared_act)
-                    )
-                    gathered_3d = async_ep_dispatch_wait(
-                        rx_state,
-                        wait_tok,
-                        world_axis,
-                        rows=b_dp,
-                        orig_lanes=orig_lanes,
-                        collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                        zero_extra_copy=zero_wait_copy,
-                    )
-                else:
-                    # Synchronous dispatch ablation (`o4a_sync` / `o4b_sync`) or 1-rank edge case:
-                    gathered_2d = kimi_guarded_all_gather_rows(
-                        send_shard,
-                        world_axis,
-                        collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-                        recv_memory_space="hbm",
+            elif dp_size > 1:
+                lat_tp = (
+                    kimi_guarded_all_gather_cols(
+                        local_rdown,
+                        TP_AXIS_NAME,
+                        collective_id=COLLECTIVE_ID_MOE_TP_LATENT_AG,
+                        recv_memory_space="auto",
                         max_dma_tokens=max_dma_tokens,
                     )
-                    gathered_3d = gathered_2d.reshape(
-                        dp_size * tp_size, b_dp, orig_lanes
-                    )
-                    gathered_3d, local_hidden_sync = lax.optimization_barrier(
-                        (gathered_3d, local_hidden)
-                    )
-                    shared_act = _compute_shared_gu_and_act(
-                        local_hidden_sync,
-                        local_w_shared_gu,
-                        act_kind=shared_act_kind,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                    )
-
-                ag_latent, ag_ids, ag_weights = _unpack_world_gathered(
-                    gathered_3d,
-                    dp_size=dp_size,
-                    tp_size=tp_size,
-                    b_dp=b_dp,
-                    d_local=d_local,
-                    m_per_tp=m_per_tp,
-                    topk=topk,
-                    copy_opt=polish_copy,
+                    if tp_size > 1
+                    else local_rdown
+                )
+                dp_orig_lanes = latent_dim + 3 * topk
+                packed_dp = jnp.concatenate(
+                    (lat_tp, local_meta[:, : 3 * topk]), axis=-1
+                )
+                rx_state, start_tok = async_ep_dispatch_start(
+                    packed_dp,
+                    DP_AXIS_NAME,
+                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+                )
+                hidden_after_start, start_tok = lax.optimization_barrier(
+                    (local_hidden, start_tok)
+                )
+                shared_act = _compute_shared_gu_and_act(
+                    hidden_after_start,
+                    local_w_shared_gu,
+                    act_kind=shared_act_kind,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+                wait_tok, shared_act = lax.optimization_barrier(
+                    (start_tok, shared_act)
+                )
+                gathered_dp_3d = async_ep_dispatch_wait(
+                    rx_state,
+                    wait_tok,
+                    DP_AXIS_NAME,
+                    rows=b_dp,
+                    orig_lanes=dp_orig_lanes,
+                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+                    zero_extra_copy=zero_wait_copy,
+                )
+                gathered_dp = gathered_dp_3d.reshape(
+                    dp_size * b_dp, dp_orig_lanes
+                )
+                ag_latent, ag_ids, ag_weights = _unpack_axial_gathered(
+                    gathered_dp, latent_dim=latent_dim, topk=topk
+                )
+            elif tp_size > 1:
+                rx_state, start_tok = async_ep_dispatch_start(
+                    local_rdown,
+                    TP_AXIS_NAME,
+                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+                )
+                hidden_after_start, start_tok = lax.optimization_barrier(
+                    (local_hidden, start_tok)
+                )
+                shared_act = _compute_shared_gu_and_act(
+                    hidden_after_start,
+                    local_w_shared_gu,
+                    act_kind=shared_act_kind,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+                wait_tok, shared_act = lax.optimization_barrier(
+                    (start_tok, shared_act)
+                )
+                lat_tp_3d = async_ep_dispatch_wait(
+                    rx_state,
+                    wait_tok,
+                    TP_AXIS_NAME,
+                    rows=b_dp,
+                    orig_lanes=d_local,
+                    collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+                    zero_extra_copy=zero_wait_copy,
+                )
+                ag_latent = (
+                    lat_tp_3d.reshape(1, latent_dim)
+                    if b_dp == 1
+                    else jnp.swapaxes(lat_tp_3d, 0, 1).reshape(b_dp, latent_dim)
+                )
+                ag_ids, ag_weights = _unpack_meta_columns(
+                    local_meta, topk=topk
+                )
+            else:
+                shared_act = _compute_shared_gu_and_act(
+                    local_hidden,
+                    local_w_shared_gu,
+                    act_kind=shared_act_kind,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+                ag_latent = local_rdown
+                ag_ids, ag_weights = _unpack_meta_columns(
+                    local_meta, topk=topk
                 )
 
             # 2. Routed MoE Compute (`fused_decode_moe_v6e_planar_t_b11` for <=64, or
@@ -1407,36 +807,18 @@ def _make_moe_ep_overlap_jax_fn(
             )
 
             # 3. Mathematically Exact Combine + `RMSNorm(latent_dim)` + `[latent_local]` Exit-Fold
-            if combine_kind == "o4a":
-                routed_local = o4a_owner_combine_rms_seam_split(
-                    moe_out,
-                    local_norm_w,
-                    local_tp_rank,
-                    dp_size=dp_size,
-                    tp_size=tp_size,
-                    b_dp=b_dp,
-                    latent_dim=latent_dim,
-                    use_norm=use_norm,
-                    rms_eps=rms_eps,
-                    max_dma_tokens=max_dma_tokens,
-                    collective_id=COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT,
-                    vmem_mode=polish_vmem,
-                )
-            elif combine_kind == "o4b":
-                routed_local = o4b_dp_rs_tp_psum_fused_rms_slice(
-                    moe_out,
-                    local_norm_w,
-                    local_tp_rank,
-                    dp_size=dp_size,
-                    tp_size=tp_size,
-                    latent_dim=latent_dim,
-                    use_norm=use_norm,
-                    rms_eps=rms_eps,
-                    max_dma_tokens=max_dma_tokens,
-                    vmem_mode=polish_vmem,
-                )
-            else:
-                raise ValueError(f"Unknown combine_kind={combine_kind!r}")
+            routed_local = o4b_dp_rs_tp_psum_fused_rms_slice(
+                moe_out,
+                local_norm_w,
+                local_tp_rank,
+                dp_size=dp_size,
+                tp_size=tp_size,
+                latent_dim=latent_dim,
+                use_norm=use_norm,
+                rms_eps=rms_eps,
+                max_dma_tokens=max_dma_tokens,
+                vmem_mode=polish_vmem,
+            )
 
             # Concatenate `(shared_act, routed_local)` inside `@jax_op` so `packed_moe_out`
             # receives a single contiguous `[B_dp, s_inter_tp + latent_local]` tensor!
@@ -1504,11 +886,7 @@ def build_kimi_moe_ep_overlap_op(
     combine_kind_sig, _, dispatch_kind_sig = resolve_effective_exit_fold_plan(
         norm_mode
     )
-    impl_tag = (
-        f"_{dispatch_kind_sig}_{combine_kind_sig}"
-        if dispatch_kind_sig == "axial"
-        else ""
-    )
+    impl_tag = f"_{dispatch_kind_sig}_{combine_kind_sig}"
     spec_tag = (
         f"{norm_mode}{impl_tag}_k{cfg['topk']}_{sanitize_tag(cfg['shared_act_kind'])}"
         f"_q{int(cfg['has_scales'])}_n{int(cfg['use_norm'])}"
@@ -1517,9 +895,7 @@ def build_kimi_moe_ep_overlap_op(
         kind="moe_ep_overlap",
         spec_tag=spec_tag,
         axis_name=("dp", "tp"),
-        collective_id=COLLECTIVE_ID_MOE_OWNER_SEAM_SPLIT
-        if combine_kind_sig == "o4a"
-        else COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+        collective_id=COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
         recv_memory_space="hbm",
         max_dma_tokens=max_dma_tokens,
         dp_size=dp_size,

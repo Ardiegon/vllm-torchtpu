@@ -67,12 +67,7 @@ from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 from .layers import quantize_weight_w8a16, w8a16_matmul
-from .opt_flags import (
-    use_kda_cond,
-    use_kda_cw_f32,
-    use_kda_glue,
-    use_spec_kda_verify,
-)
+from .opt_flags import use_kda_glue, use_spec_kda_verify
 
 logger = init_logger(__name__)
 
@@ -572,7 +567,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             torch.empty(self.conv_size, 3, self.num_heads, self.head_dim),
             persistent=False,
         )
-        self.register_buffer("conv_weight_f32", None, persistent=False)
         self._kda_glue_enabled = bool(
             use_kda_glue()
             and envs.TPU_KDA_DIRECT_POOL_STREAMING
@@ -581,9 +575,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 and envs.TPU_RAIDEN_KIMIK3_ADMISSION
             )
             and self.num_spec_tokens == 0
-        )
-        self._kda_cw_f32_enabled = bool(
-            self._kda_glue_enabled and use_kda_cw_f32()
         )
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -649,7 +640,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
             kda_glue=self._kda_glue_enabled,
-            kda_cond=use_kda_cond(),
         )
         # Kimi K3 Cycle 3 Phase O6a (`TPU_KIMI_OPT_SPEC_KDA="o6a"`, K > 0):
         # the unified-pool KDA runs a side-effect-free W = 1 + K verify that
@@ -742,14 +732,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # lazy chain so PJRT ships a plain row-major buffer.
         out = fresh_buffer(fused)
         self.conv_weight_fused = out
-        if self._kda_cw_f32_enabled:
-            self.conv_weight_f32 = fresh_buffer(
-                out.to(torch.float32).reshape(
-                    self.conv_size, 1, 3 * self.local_projection_size
-                )
-            )
-        else:
-            self.conv_weight_f32 = None
         self._pack_prefill_projection()
 
     def _pack_prefill_projection(self):
@@ -972,11 +954,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
         ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
-        conv_weight = (
-            self.conv_weight_f32
-            if (self._kda_glue_enabled and self.conv_weight_f32 is not None)
-            else self.conv_weight_fused
-        )
+        conv_weight = self.conv_weight_fused
         if self.defers_spec_state_commit:
             assert self.pooled_kda_verify_op is not None
             return self.pooled_kda_verify_op(

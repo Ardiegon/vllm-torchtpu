@@ -203,12 +203,12 @@ class TestPooledCorePathSelection:
         assert out.shape == (16, H, D)
         assert pool is b["pool"]
 
-    def test_kda_glue_and_cond(self, kernel, pallas_interpret):
+    def test_kda_glue(self, kernel, pallas_interpret):
         b, dist = self._decode_batch()
-        out, _ = _core(b, distribution=dist, kda_glue=True, kda_cond=True)
+        out, _ = _core(b, distribution=dist, kda_glue=True)
         (call,) = kernel.calls
         assert call["conv_weight_is_kernel_layout"]
-        assert call["skip_empty_per_seq"]
+        assert not call["skip_empty_per_seq"]
         assert call["conv_weight"].shape == (KS, 1, 3 * H * D)
         # The 2D gated norm keeps the [T, H * D] layout.
         assert out.shape == (16, H * D)

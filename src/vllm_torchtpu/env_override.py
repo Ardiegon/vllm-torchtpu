@@ -403,9 +403,7 @@ _kimi_o4_exit_fold_mode = normalize_exit_fold_mode(
     os.environ.get("TPU_KIMI_OPT_EXIT_FOLD")
 )
 _kimi_o4_t2_impl_salt = (
-    "|impl=o4d_axial_v1"
-    if _kimi_o4_exit_fold_mode in ("c2", "o4d", "o4d_sync")
-    else ""
+    "|impl=o4d_axial_v1" if _kimi_o4_exit_fold_mode in ("c2", "o4d") else ""
 )
 _kimi_o5_polish_tag, _ = normalize_compute_polish_mode(
     os.environ.get("TPU_KIMI_OPT_COMPUTE_POLISH")
