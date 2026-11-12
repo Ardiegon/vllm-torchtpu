@@ -232,32 +232,32 @@ def _vmem_bytes(
     lhs_bytes: int,
     rhs_pairs: int = 1,
 ) -> int:
-  """VMEM a single grid step needs, the terms that actually scale.
+    """VMEM a single grid step needs, the terms that actually scale.
 
-  Pallas double-buffers every block, the accumulator is a f32 scratch,
-  and the dequant holds an i32 code plane plus f32 value and scale
-  planes for the chunk in flight. The fused gate+up kernel streams TWO
-  `(packed, scales)` pairs against one lhs block (`rhs_pairs=2`), so
-  the rhs blocks, the accumulators and the dequant working set double
-  while the lhs and out terms do not.
-  """
-  packed_rows, scale_rows = k // 2, k // SCALE_GROUP
-  blocks = 2 * (
-      tm * k * lhs_bytes  # lhs, whole contraction
-      + rhs_pairs * tn * packed_rows  # packed u8 nibbles
-      + rhs_pairs * tn * scale_rows  # scales u8
-      + tm * tn * 2  # bf16 out
-  )
-  accumulator = rhs_pairs * tm * tn * 4
-  # Codes i32, values f32, scaled f32 per pair: the fused kernel
-  # interleaves the two dequants inside one chunk iteration, so count
-  # both in flight (Mosaic may overlap them).
-  dequant = rhs_pairs * tn * chunk * (4 + 4 + 4)
-  # The rolled kernel's `[k/chunk, tn, chunk/32]` u8 scratch per pair
-  # (see `mxfp4_gmm`), whose sub-lane minor pads out to a full lane of
-  # VMEM.
-  scale_codes = rhs_pairs * max(k // chunk, 1) * tn * _LANES
-  return blocks + accumulator + dequant + scale_codes
+    Pallas double-buffers every block, the accumulator is a f32 scratch,
+    and the dequant holds an i32 code plane plus f32 value and scale
+    planes for the chunk in flight. The fused gate+up kernel streams TWO
+    `(packed, scales)` pairs against one lhs block (`rhs_pairs=2`), so
+    the rhs blocks, the accumulators and the dequant working set double
+    while the lhs and out terms do not.
+    """
+    packed_rows, scale_rows = k // 2, k // SCALE_GROUP
+    blocks = 2 * (
+        tm * k * lhs_bytes  # lhs, whole contraction
+        + rhs_pairs * tn * packed_rows  # packed u8 nibbles
+        + rhs_pairs * tn * scale_rows  # scales u8
+        + tm * tn * 2  # bf16 out
+    )
+    accumulator = rhs_pairs * tm * tn * 4
+    # Codes i32, values f32, scaled f32 per pair: the fused kernel
+    # interleaves the two dequants inside one chunk iteration, so count
+    # both in flight (Mosaic may overlap them).
+    dequant = rhs_pairs * tn * chunk * (4 + 4 + 4)
+    # The rolled kernel's `[k/chunk, tn, chunk/32]` u8 scratch per pair
+    # (see `mxfp4_gmm`), whose sub-lane minor pads out to a full lane of
+    # VMEM.
+    scale_codes = rhs_pairs * max(k // chunk, 1) * tn * _LANES
+    return blocks + accumulator + dequant + scale_codes
 
 
 # Per-chip bytes the register allocator holds live per `[tn, chunk]`
@@ -290,20 +290,20 @@ SCOPED_ELEM_BYTES_GHOSTFISH = 28
 def _scoped_vmem_bytes(
     tm: int, tn: int, chunk: int, rhs_pairs: int, scoped_elem_bytes: int
 ) -> int:
-  """Kernel STACK bytes Mosaic allocates, against `_SCOPED_VMEM_LIMIT`.
+    """Kernel STACK bytes Mosaic allocates, against `_SCOPED_VMEM_LIMIT`.
 
-  A model of the register allocator's live set: the dominant term is
-  the per-pair dequant chain at `scoped_elem_bytes` per `[tn, chunk]`
-  element (per-chip calibration above; the single-pair kernel lands at
-  ~15.7M under the GhostLite constant and compiles today, consistent).
-  The accumulators are VMEM scratch, which shares the same budget, and
-  the fused epilogue holds a few f32 SiTU planes on the `[tm, tn]`
-  tile.
-  """
-  dequant = rhs_pairs * tn * chunk * scoped_elem_bytes
-  accumulators = rhs_pairs * tm * tn * 4
-  situ = 3 * tm * tn * 4 if rhs_pairs > 1 else 0
-  return dequant + accumulators + situ
+    A model of the register allocator's live set: the dominant term is
+    the per-pair dequant chain at `scoped_elem_bytes` per `[tn, chunk]`
+    element (per-chip calibration above; the single-pair kernel lands at
+    ~15.7M under the GhostLite constant and compiles today, consistent).
+    The accumulators are VMEM scratch, which shares the same budget, and
+    the fused epilogue holds a few f32 SiTU planes on the `[tm, tn]`
+    tile.
+    """
+    dequant = rhs_pairs * tn * chunk * scoped_elem_bytes
+    accumulators = rhs_pairs * tm * tn * 4
+    situ = 3 * tm * tn * 4 if rhs_pairs > 1 else 0
+    return dequant + accumulators + situ
 
 
 # The smallest row tile the expected-rows heuristic will pick. Below
@@ -324,119 +324,119 @@ def default_tiling(
     scoped_elem_bytes: int = SCOPED_ELEM_BYTES_GHOSTLITE,
     force_chunk: int | None = None,
 ) -> tuple[int, int, int]:
-  """The largest valid `(tm, k_chunk, tn)` that fits the VMEM budget.
+    """The largest valid `(tm, k_chunk, tn)` that fits the VMEM budget.
 
-  Chosen explicitly rather than left to chance: an oversized choice
-  does not degrade, it fails the whole compile late, in Mosaic (the
-  first version of this kernel dequantized the whole contraction at
-  once and the 2048-bucket compile died with 127.49M of
-  register-allocator spill slots against a 127.94M VMEM budget).
+    Chosen explicitly rather than left to chance: an oversized choice
+    does not degrade, it fails the whole compile late, in Mosaic (the
+    first version of this kernel dequantized the whole contraction at
+    once and the 2048-bucket compile died with 127.49M of
+    register-allocator spill slots against a 127.94M VMEM budget).
 
-  `vmem_budget` (None = the module's 64 MiB GhostLite constant)
-  bounds the per-grid-step working set; Ghostfish configs pass 32 MiB
-  (half of the 64 MiB core, the same one-half discipline;
-  `K3MoeConfig.gmm_vmem_budget_bytes`). The scoped-stack CEILING is
-  chip-independent (both chips default --xla_tpu_scoped_vmem_limit_kib
-  to 32 MiB; target_ghostlite.h and target_ghostfish.h agree) but the
-  bytes the allocator actually holds per dequant element are NOT:
-  `scoped_elem_bytes` carries the per-chip calibration
-  (`SCOPED_ELEM_BYTES_GHOSTLITE` = 56, the default;
-  `SCOPED_ELEM_BYTES_GHOSTFISH` = 28, the gen-7 Mosaic measurement -
-  `K3MoeConfig.gmm_scoped_elem_bytes` threads the chip value). Under
-  the gf constant the search admits the (512, 512, 512) two-pair
-  prefill tile that measured 15.5% faster on gf silicon
-  (perf/gf_tile_cap_bench_forge_test); GhostLite behavior is byte
-  identical to before the seam existed.
+    `vmem_budget` (None = the module's 64 MiB GhostLite constant)
+    bounds the per-grid-step working set; Ghostfish configs pass 32 MiB
+    (half of the 64 MiB core, the same one-half discipline;
+    `K3MoeConfig.gmm_vmem_budget_bytes`). The scoped-stack CEILING is
+    chip-independent (both chips default --xla_tpu_scoped_vmem_limit_kib
+    to 32 MiB; target_ghostlite.h and target_ghostfish.h agree) but the
+    bytes the allocator actually holds per dequant element are NOT:
+    `scoped_elem_bytes` carries the per-chip calibration
+    (`SCOPED_ELEM_BYTES_GHOSTLITE` = 56, the default;
+    `SCOPED_ELEM_BYTES_GHOSTFISH` = 28, the gen-7 Mosaic measurement -
+    `K3MoeConfig.gmm_scoped_elem_bytes` threads the chip value). Under
+    the gf constant the search admits the (512, 512, 512) two-pair
+    prefill tile that measured 15.5% faster on gf silicon
+    (perf/gf_tile_cap_bench_forge_test); GhostLite behavior is byte
+    identical to before the seam existed.
 
-  Validity, in the order the search relaxes it: `tm` divides m and is
-  8-divisible (or is all of m), `tn` is lane-divisible (or all of n),
-  and `chunk` divides k and is scale-group-divisible.
+    Validity, in the order the search relaxes it: `tm` divides m and is
+    8-divisible (or is all of m), `tn` is lane-divisible (or all of n),
+    and `chunk` divides k and is scale-group-divisible.
 
-  `expected_rows` opts into the sparse EXPERT-PARALLEL regime: each
-  shard sorts ALL M assignment rows but owns only ~M/shards of them
-  (7 of 896 experts at the 8x16 mesh), so at the spec round's width-7
-  shape (M = 7168, ~56 owned rows) the default 512-row tile made
-  every group visit move a ~90%-padding lhs block and output tile
-  (profiled at 4.17 ms per grouped-matmul event against plain
-  decode's 0.25). When set, `tm` becomes the smallest candidate
-  covering the expected rows (floored at `_MIN_EXPECTED_TM`). Groups
-  larger than expected (routing skew) stay CORRECT, they just take
-  more visits, each re-dequantizing its weight tile; that trade is
-  deliberate and the reason the dense regimes (single-device,
-  `expected_rows=None`) keep the large default. A whole-N tile (one
-  contiguous weight fetch per group visit) was measured back when the
-  k walk was a compile-time unroll and REJECTED: tn = 3072 meant a
-  56-iteration two-pair dequant chain that Mosaic chewed on for over
-  9.5 minutes per shape without finishing. The walk is a real loop now
-  for 256-divisible chunks (`_use_k_loop`, via per-element scale codes
-  that make the chunk slices lane-aligned), which removes that compile
-  blowup; whole-N remains unadopted pending a fresh measurement.
+    `expected_rows` opts into the sparse EXPERT-PARALLEL regime: each
+    shard sorts ALL M assignment rows but owns only ~M/shards of them
+    (7 of 896 experts at the 8x16 mesh), so at the spec round's width-7
+    shape (M = 7168, ~56 owned rows) the default 512-row tile made
+    every group visit move a ~90%-padding lhs block and output tile
+    (profiled at 4.17 ms per grouped-matmul event against plain
+    decode's 0.25). When set, `tm` becomes the smallest candidate
+    covering the expected rows (floored at `_MIN_EXPECTED_TM`). Groups
+    larger than expected (routing skew) stay CORRECT, they just take
+    more visits, each re-dequantizing its weight tile; that trade is
+    deliberate and the reason the dense regimes (single-device,
+    `expected_rows=None`) keep the large default. A whole-N tile (one
+    contiguous weight fetch per group visit) was measured back when the
+    k walk was a compile-time unroll and REJECTED: tn = 3072 meant a
+    56-iteration two-pair dequant chain that Mosaic chewed on for over
+    9.5 minutes per shape without finishing. The walk is a real loop now
+    for 256-divisible chunks (`_use_k_loop`, via per-element scale codes
+    that make the chunk slices lane-aligned), which removes that compile
+    blowup; whole-N remains unadopted pending a fresh measurement.
 
-  Args:
-    m: lhs rows.
-    k: contraction.
-    n: output columns.
-    lhs_bytes: activation element size.
-    rhs_pairs: how many `(packed, scales)` stacks stream against the lhs (1 for
-      the plain kernel, 2 for the fused gate+up kernel).
-    expected_rows: rows this caller expects to actually own (the EP shard's
-      share of M), or None for the dense default.
-    vmem_budget: per-grid-step VMEM bound in bytes, or None for the module's
-      GhostLite constant (see the docstring note).
-    scoped_elem_bytes: per-chip scoped-stack bytes per dequant element
-      (`SCOPED_ELEM_BYTES_GHOSTLITE` / `SCOPED_ELEM_BYTES_GHOSTFISH`;
-      `K3MoeConfig.gmm_scoped_elem_bytes` threads the chip value).
-    force_chunk: pin the k chunk to this value when it is a valid candidate
-      (planar weights require chunk == PLANAR_WINDOW). When the shape cannot
-      serve it the normal search runs instead and `can_use_kernel` rejects the
-      result for planar modes (reference fallback), so this never errors on toy
-      shapes.
+    Args:
+      m: lhs rows.
+      k: contraction.
+      n: output columns.
+      lhs_bytes: activation element size.
+      rhs_pairs: how many `(packed, scales)` stacks stream against the lhs (1 for
+        the plain kernel, 2 for the fused gate+up kernel).
+      expected_rows: rows this caller expects to actually own (the EP shard's
+        share of M), or None for the dense default.
+      vmem_budget: per-grid-step VMEM bound in bytes, or None for the module's
+        GhostLite constant (see the docstring note).
+      scoped_elem_bytes: per-chip scoped-stack bytes per dequant element
+        (`SCOPED_ELEM_BYTES_GHOSTLITE` / `SCOPED_ELEM_BYTES_GHOSTFISH`;
+        `K3MoeConfig.gmm_scoped_elem_bytes` threads the chip value).
+      force_chunk: pin the k chunk to this value when it is a valid candidate
+        (planar weights require chunk == PLANAR_WINDOW). When the shape cannot
+        serve it the normal search runs instead and `can_use_kernel` rejects the
+        result for planar modes (reference fallback), so this never errors on toy
+        shapes.
 
-  Returns:
-    `(tm, k_chunk, tn)`.
+    Returns:
+      `(tm, k_chunk, tn)`.
 
-  Raises:
-    ValueError: if even the smallest valid tiling exceeds the budget.
-  """
-  budget = _VMEM_BUDGET if vmem_budget is None else vmem_budget
-  tms = [t for t in (512, 256, 128, 64, 32, 16, 8) if m % t == 0] or [m]
-  tns = [t for t in (512, 256, 128) if n % t == 0] or [n]
-  chunks = [
-      c for c in (512, 256, 128, 64, SCALE_GROUP) if c <= k and k % c == 0
-  ] or [k]
-  if force_chunk is not None and force_chunk in chunks:
-    chunks = [force_chunk]
-  if expected_rows is not None and expected_rows < tms[0]:
-    fitting = [t for t in tms if t >= max(expected_rows, _MIN_EXPECTED_TM)]
-    if fitting:
-      pick = min(fitting)
-      # Keep the smaller candidates as budget fallbacks (they only
-      # ever need LESS VMEM, so in practice the pick wins).
-      tms = [pick] + [t for t in tms if t < pick]
-  for tm in tms:
-    for tn in tns:
-      for chunk in chunks:
-        if (
-            _vmem_bytes(tm, k, tn, chunk, lhs_bytes, rhs_pairs) <= budget
-            and _scoped_vmem_bytes(tm, tn, chunk, rhs_pairs, scoped_elem_bytes)
-            <= _SCOPED_VMEM_LIMIT
-        ):
-          return (tm, chunk, tn)
-  smallest = _vmem_bytes(tms[-1], k, tns[-1], chunks[-1], lhs_bytes, rhs_pairs)
-  smallest_scoped = _scoped_vmem_bytes(
-      tms[-1], tns[-1], chunks[-1], rhs_pairs, scoped_elem_bytes
-  )
-  raise ValueError(
-      f'no valid tiling for (m, k, n) = ({m}, {k}, {n}) fits'
-      f' {budget} bytes of VMEM (or {_SCOPED_VMEM_LIMIT} scoped); the'
-      f' smallest candidate needs {smallest} / {smallest_scoped}.'
-  )
+    Raises:
+      ValueError: if even the smallest valid tiling exceeds the budget.
+    """
+    budget = _VMEM_BUDGET if vmem_budget is None else vmem_budget
+    tms = [t for t in (512, 256, 128, 64, 32, 16, 8) if m % t == 0] or [m]
+    tns = [t for t in (512, 256, 128) if n % t == 0] or [n]
+    chunks = [c for c in (512, 256, 128, 64, SCALE_GROUP) if c <= k and k % c == 0] or [
+        k
+    ]
+    if force_chunk is not None and force_chunk in chunks:
+        chunks = [force_chunk]
+    if expected_rows is not None and expected_rows < tms[0]:
+        fitting = [t for t in tms if t >= max(expected_rows, _MIN_EXPECTED_TM)]
+        if fitting:
+            pick = min(fitting)
+            # Keep the smaller candidates as budget fallbacks (they only
+            # ever need LESS VMEM, so in practice the pick wins).
+            tms = [pick] + [t for t in tms if t < pick]
+    for tm in tms:
+        for tn in tns:
+            for chunk in chunks:
+                if (
+                    _vmem_bytes(tm, k, tn, chunk, lhs_bytes, rhs_pairs) <= budget
+                    and _scoped_vmem_bytes(tm, tn, chunk, rhs_pairs, scoped_elem_bytes)
+                    <= _SCOPED_VMEM_LIMIT
+                ):
+                    return (tm, chunk, tn)
+    smallest = _vmem_bytes(tms[-1], k, tns[-1], chunks[-1], lhs_bytes, rhs_pairs)
+    smallest_scoped = _scoped_vmem_bytes(
+        tms[-1], tns[-1], chunks[-1], rhs_pairs, scoped_elem_bytes
+    )
+    raise ValueError(
+        f"no valid tiling for (m, k, n) = ({m}, {k}, {n}) fits"
+        f" {budget} bytes of VMEM (or {_SCOPED_VMEM_LIMIT} scoped); the"
+        f" smallest candidate needs {smallest} / {smallest_scoped}."
+    )
 
 
 #: `_make_group_metadata` builds. Only the loop-free closed form remains:
 #: no while loop, no scatter and no gather, so it is cheap to build once
 #: per layer and share between the gate+up and down kernels.
-METADATA_IMPLS = ('closed_form',)
+METADATA_IMPLS = ("closed_form",)
 
 
 def _closed_form_group_metadata(
@@ -446,81 +446,79 @@ def _closed_form_group_metadata(
     tm: int,
     num_groups: int,
 ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]:
-  """`_make_group_metadata` as compare-and-sum arithmetic, loop free.
+    """`_make_group_metadata` as compare-and-sum arithmetic, loop free.
 
-  The megablox build spends its ops on three ragged primitives:
-  `jnp.histogram` (a `searchsorted` binary search = a 6-iteration
-  `while` loop of ~11 ops per iteration at 56 tiles, its bin edges a
-  runtime f32 linspace) and two `jnp.repeat` chains (roll, scatter-add,
-  cumsum, gather each). On the GF rung-4 decode program that is 184
-  while loops, 460 `scatter_custom_fusion` and 1104 in-loop
-  `gather_fusion` executions per step, ~77 instructions per layer on
-  the recipient path between `mp_broadcast_packed` and the gmm pair
-  (~12 us per layer, ~1.1 ms/step). Every one of those primitives is a
-  prefix count over a vector of at most `num_groups` (7) or `tiles_m`
-  (56) entries, and a prefix count is one compare against an iota plus
-  one reduce, which XLA fuses:
+    The megablox build spends its ops on three ragged primitives:
+    `jnp.histogram` (a `searchsorted` binary search = a 6-iteration
+    `while` loop of ~11 ops per iteration at 56 tiles, its bin edges a
+    runtime f32 linspace) and two `jnp.repeat` chains (roll, scatter-add,
+    cumsum, gather each). On the GF rung-4 decode program that is 184
+    while loops, 460 `scatter_custom_fusion` and 1104 in-loop
+    `gather_fusion` executions per step, ~77 instructions per layer on
+    the recipient path between `mp_broadcast_packed` and the gmm pair
+    (~12 us per layer, ~1.1 ms/step). Every one of those primitives is a
+    prefix count over a vector of at most `num_groups` (7) or `tiles_m`
+    (56) entries, and a prefix count is one compare against an iota plus
+    one reduce, which XLA fuses:
 
-    * `group_ends[g]` = sum of sizes over g' <= g (the cumsum);
-    * `repeat(arange(n), r, total)[j]` = min(#{i : cumsum(r)[i] <= j},
-      n - 1) (`_repeat_arange_searchsorted`'s identity, incl. the pad
-      rule: past sum(r) the entry is the LAST source index);
-    * `histogram(partial_tile_ids)[t] + 1`, accumulated to the visit
-      prefix sum, = (t + 1) + #{g : partial_tile_ids[g] <= t} (the
-      parked value `tiles_m` is above every real tile, so it drops out
-      exactly as the histogram's out-of-range rule drops it).
+      * `group_ends[g]` = sum of sizes over g' <= g (the cumsum);
+      * `repeat(arange(n), r, total)[j]` = min(#{i : cumsum(r)[i] <= j},
+        n - 1) (`_repeat_arange_searchsorted`'s identity, incl. the pad
+        rule: past sum(r) the entry is the LAST source index);
+      * `histogram(partial_tile_ids)[t] + 1`, accumulated to the visit
+        prefix sum, = (t + 1) + #{g : partial_tile_ids[g] <= t} (the
+        parked value `tiles_m` is above every real tile, so it drops out
+        exactly as the histogram's out-of-range rule drops it).
 
-  Integer in, integer out, the same values on every entry including
-  the grid pad (moe_gmm_test pins whole-array equality against both
-  the repeat and the searchsorted spellings over random, empty and
-  full-tray group sizes).
+    Integer in, integer out, the same values on every entry including
+    the grid pad (moe_gmm_test pins whole-array equality against both
+    the repeat and the searchsorted spellings over random, empty and
+    full-tray group sizes).
 
-  Args:
-    group_sizes: `[num_groups]` int32 rows per group.
-    m: total rows in the lhs.
-    tm: m-dimension tile size.
-    num_groups: number of groups.
+    Args:
+      group_sizes: `[num_groups]` int32 rows per group.
+      m: total rows in the lhs.
+      tm: m-dimension tile size.
+      num_groups: number of groups.
 
-  Returns:
-    `((group_offsets, group_ids, m_tile_ids), num_active_tiles)`, the
-    `_make_group_metadata` contract.
-  """
-  sizes = group_sizes.astype(jnp.int32)
-  tiles_m = m // tm
-  grid_len = tiles_m + num_groups - 1
-  gid = jnp.arange(num_groups, dtype=jnp.int32)
-  # [G, G]: column g' belongs to row g's inclusive prefix.
-  in_prefix = gid[None, :] <= gid[:, None]
-  group_ends = jnp.sum(jnp.where(in_prefix, sizes[None, :], 0), axis=1)
-  group_starts = group_ends - sizes
-  group_offsets = jnp.concatenate([jnp.zeros((1,), jnp.int32), group_ends])
-  # Round each group's span out to whole tiles (empty groups own none).
-  rounded_ends = (group_ends + tm - 1) // tm * tm
-  rounded_starts = group_starts // tm * tm
-  group_tiles = jnp.where(sizes == 0, 0, (rounded_ends - rounded_starts) // tm)
-  tiles_through = jnp.sum(jnp.where(in_prefix, group_tiles[None, :], 0), axis=1)
-  grid = jnp.arange(grid_len, dtype=jnp.int32)
-  group_ids = jnp.minimum(
-      jnp.sum((tiles_through[None, :] <= grid[:, None]).astype(jnp.int32), 1),
-      num_groups - 1,
-  )
-  # A tile is visited once by its owner plus once per group STARTING
-  # inside it; tile-aligned (or empty) starts park at tiles_m.
-  parked = jnp.logical_or(group_starts % tm == 0, sizes == 0)
-  partial_tile_ids = jnp.where(parked, tiles_m, group_starts // tm)
-  tiles = jnp.arange(tiles_m, dtype=jnp.int32)
-  visits_through = (
-      tiles
-      + 1
-      + jnp.sum(
-          (partial_tile_ids[None, :] <= tiles[:, None]).astype(jnp.int32), 1
-      )
-  )
-  m_tile_ids = jnp.minimum(
-      jnp.sum((visits_through[None, :] <= grid[:, None]).astype(jnp.int32), 1),
-      tiles_m - 1,
-  )
-  return (group_offsets, group_ids, m_tile_ids), tiles_through[-1]
+    Returns:
+      `((group_offsets, group_ids, m_tile_ids), num_active_tiles)`, the
+      `_make_group_metadata` contract.
+    """
+    sizes = group_sizes.astype(jnp.int32)
+    tiles_m = m // tm
+    grid_len = tiles_m + num_groups - 1
+    gid = jnp.arange(num_groups, dtype=jnp.int32)
+    # [G, G]: column g' belongs to row g's inclusive prefix.
+    in_prefix = gid[None, :] <= gid[:, None]
+    group_ends = jnp.sum(jnp.where(in_prefix, sizes[None, :], 0), axis=1)
+    group_starts = group_ends - sizes
+    group_offsets = jnp.concatenate([jnp.zeros((1,), jnp.int32), group_ends])
+    # Round each group's span out to whole tiles (empty groups own none).
+    rounded_ends = (group_ends + tm - 1) // tm * tm
+    rounded_starts = group_starts // tm * tm
+    group_tiles = jnp.where(sizes == 0, 0, (rounded_ends - rounded_starts) // tm)
+    tiles_through = jnp.sum(jnp.where(in_prefix, group_tiles[None, :], 0), axis=1)
+    grid = jnp.arange(grid_len, dtype=jnp.int32)
+    group_ids = jnp.minimum(
+        jnp.sum((tiles_through[None, :] <= grid[:, None]).astype(jnp.int32), 1),
+        num_groups - 1,
+    )
+    # A tile is visited once by its owner plus once per group STARTING
+    # inside it; tile-aligned (or empty) starts park at tiles_m.
+    parked = jnp.logical_or(group_starts % tm == 0, sizes == 0)
+    partial_tile_ids = jnp.where(parked, tiles_m, group_starts // tm)
+    tiles = jnp.arange(tiles_m, dtype=jnp.int32)
+    visits_through = (
+        tiles
+        + 1
+        + jnp.sum((partial_tile_ids[None, :] <= tiles[:, None]).astype(jnp.int32), 1)
+    )
+    m_tile_ids = jnp.minimum(
+        jnp.sum((visits_through[None, :] <= grid[:, None]).astype(jnp.int32), 1),
+        tiles_m - 1,
+    )
+    return (group_offsets, group_ids, m_tile_ids), tiles_through[-1]
 
 
 def _make_group_metadata(
@@ -528,34 +526,32 @@ def _make_group_metadata(
     m: int,
     tm: int,
     num_groups: int,
-    impl: str = 'closed_form',
+    impl: str = "closed_form",
 ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]:
-  """Grid metadata for the grouped matmul.
+    """Grid metadata for the grouped matmul.
 
-  Adapted from `make_group_metadata` in
-  `jax.experimental.pallas.ops.tpu.megablox.gmm` (JAX, Apache-2.0),
-  specialized to a single unsharded group range and
-  `visit_empty_groups=False`, which is all this caller needs.
+    Adapted from `make_group_metadata` in
+    `jax.experimental.pallas.ops.tpu.megablox.gmm` (JAX, Apache-2.0),
+    specialized to a single unsharded group range and
+    `visit_empty_groups=False`, which is all this caller needs.
 
-  Args:
-    group_sizes: `[num_groups]` int32 rows per group.
-    m: total rows in the lhs.
-    tm: m-dimension tile size.
-    num_groups: number of groups.
-    impl: one of `METADATA_IMPLS`.
+    Args:
+      group_sizes: `[num_groups]` int32 rows per group.
+      m: total rows in the lhs.
+      tm: m-dimension tile size.
+      num_groups: number of groups.
+      impl: one of `METADATA_IMPLS`.
 
-  Returns:
-    `((group_offsets, group_ids, m_tile_ids), num_active_tiles)` where
-    `group_offsets[i]` is the first row of group i, and `group_ids[j]` /
-    `m_tile_ids[j]` say which group and which m tile grid step j works
-    on. A tile straddling a group boundary appears once per group it
-    touches, which is why the grid is `tiles_m + num_groups - 1` long.
-  """
-  if impl not in METADATA_IMPLS:
-    raise ValueError(f'unknown metadata impl {impl!r} (want {METADATA_IMPLS}).')
-  return _closed_form_group_metadata(
-      group_sizes, m=m, tm=tm, num_groups=num_groups
-  )
+    Returns:
+      `((group_offsets, group_ids, m_tile_ids), num_active_tiles)` where
+      `group_offsets[i]` is the first row of group i, and `group_ids[j]` /
+      `m_tile_ids[j]` say which group and which m tile grid step j works
+      on. A tile straddling a group boundary appears once per group it
+      touches, which is why the grid is `tiles_m + num_groups - 1` long.
+    """
+    if impl not in METADATA_IMPLS:
+        raise ValueError(f"unknown metadata impl {impl!r} (want {METADATA_IMPLS}).")
+    return _closed_form_group_metadata(group_sizes, m=m, tm=tm, num_groups=num_groups)
 
 
 #: A precomputed `_make_group_metadata` result, as the kernels take it.
@@ -565,208 +561,208 @@ GroupMetadata = tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]
 def _check_group_metadata(
     group_metadata: GroupMetadata, *, m: int, tm: int, num_groups: int
 ) -> GroupMetadata:
-  """Refuses a precomputed build made for a different `(m, tm, num_groups)`.
+    """Refuses a precomputed build made for a different `(m, tm, num_groups)`.
 
-  The grid length `m // tm + num_groups - 1` identifies the row tile
-  (distinct dividing tiles give distinct lengths), so a triple built
-  for another tiling cannot pass.
-  """
-  (group_offsets, group_ids, m_tile_ids), num_active_tiles = group_metadata
-  grid_len = m // tm + num_groups - 1
-  want = ((num_groups + 1,), (grid_len,), (grid_len,), ())
-  got = (
-      tuple(group_offsets.shape),
-      tuple(group_ids.shape),
-      tuple(m_tile_ids.shape),
-      tuple(jnp.shape(num_active_tiles)),
-  )
-  if got != want:
-    raise ValueError(
-        'group_metadata was built for a different tiling: shapes'
-        f' {got}, this kernel (m={m}, tm={tm}, num_groups={num_groups})'
-        f' wants {want}. Build it with shared_group_metadata over the'
-        ' tilings of every consuming kernel.'
+    The grid length `m // tm + num_groups - 1` identifies the row tile
+    (distinct dividing tiles give distinct lengths), so a triple built
+    for another tiling cannot pass.
+    """
+    (group_offsets, group_ids, m_tile_ids), num_active_tiles = group_metadata
+    grid_len = m // tm + num_groups - 1
+    want = ((num_groups + 1,), (grid_len,), (grid_len,), ())
+    got = (
+        tuple(group_offsets.shape),
+        tuple(group_ids.shape),
+        tuple(m_tile_ids.shape),
+        tuple(jnp.shape(num_active_tiles)),
     )
-  for name, arr in (
-      ('group_offsets', group_offsets),
-      ('group_ids', group_ids),
-      ('m_tile_ids', m_tile_ids),
-      ('num_active_tiles', num_active_tiles),
-  ):
-    if jnp.asarray(arr).dtype != jnp.int32:
-      raise ValueError(
-          f'group_metadata.{name} must be int32, got {jnp.asarray(arr).dtype}.'
-      )
-  return group_metadata
+    if got != want:
+        raise ValueError(
+            "group_metadata was built for a different tiling: shapes"
+            f" {got}, this kernel (m={m}, tm={tm}, num_groups={num_groups})"
+            f" wants {want}. Build it with shared_group_metadata over the"
+            " tilings of every consuming kernel."
+        )
+    for name, arr in (
+        ("group_offsets", group_offsets),
+        ("group_ids", group_ids),
+        ("m_tile_ids", m_tile_ids),
+        ("num_active_tiles", num_active_tiles),
+    ):
+        if jnp.asarray(arr).dtype != jnp.int32:
+            raise ValueError(
+                f"group_metadata.{name} must be int32, got {jnp.asarray(arr).dtype}."
+            )
+    return group_metadata
 
 
 def _planar_repack_windows(packed, window: int):
-  """`[..., K/2]` interleaved nibble pairs -> planar window bytes.
+    """`[..., K/2]` interleaved nibble pairs -> planar window bytes.
 
-  Shared by `repack_planar_stack` (whole array or one slab). Works on
-  numpy arrays, jax arrays, AND tracers alike (only `& >> | reshape
-  stack` are used, all trace-safe on the jnp side).
-  """
-  xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
-  half_k = packed.shape[-1]
-  k = 2 * half_k
-  hw = window // 2
-  lead = packed.shape[:-1]
-  pairs = packed.reshape(lead + (k // window, hw))
-  # Nibbles back into original contraction order, per window.
-  codes = xp.stack([pairs & 0x0F, pairs >> 4], axis=-1).reshape(
-      lead + (k // window, window)
-  )
-  lo = codes[..., :hw]
-  hi = codes[..., hw:]
-  return (lo | (hi << 4)).astype(packed.dtype).reshape(lead + (half_k,))
+    Shared by `repack_planar_stack` (whole array or one slab). Works on
+    numpy arrays, jax arrays, AND tracers alike (only `& >> | reshape
+    stack` are used, all trace-safe on the jnp side).
+    """
+    xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
+    half_k = packed.shape[-1]
+    k = 2 * half_k
+    hw = window // 2
+    lead = packed.shape[:-1]
+    pairs = packed.reshape(lead + (k // window, hw))
+    # Nibbles back into original contraction order, per window.
+    codes = xp.stack([pairs & 0x0F, pairs >> 4], axis=-1).reshape(
+        lead + (k // window, window)
+    )
+    lo = codes[..., :hw]
+    hi = codes[..., hw:]
+    return (lo | (hi << 4)).astype(packed.dtype).reshape(lead + (half_k,))
 
 
 def repack_planar_stack(packed, window: int = PLANAR_WINDOW):
-  """Reorders MXFP4 nibble pairs into the PLANAR window layout.
+    """Reorders MXFP4 nibble pairs into the PLANAR window layout.
 
-  The split idea (`_dequantize_tile_split`) moved OFFLINE. Interleaved
-  storage puts contraction elements (2j, 2j+1) in byte j, so a decode
-  that reads the two nibble planes whole emits even-then-odd order and
-  the ACTIVATION must be permuted to match (`split_k_order`), which the
-  kiloblox while body pays as an XLA gather + two layout copies per
-  chunk per expert visit (profiled at ~14 ms of an 89 ms decode step at
-  ~225 GiB/s on the kb4 v2 trace; ~78 ms/step on gf). Planar storage
-  puts elements (w*window + j, w*window + window/2 + j) in window w's
-  byte j instead: the same two whole-plane nibble decodes then emit
-  each window's columns in ORIGINAL contraction order, so no operand is
-  ever permuted at runtime, on either side.
+    The split idea (`_dequantize_tile_split`) moved OFFLINE. Interleaved
+    storage puts contraction elements (2j, 2j+1) in byte j, so a decode
+    that reads the two nibble planes whole emits even-then-odd order and
+    the ACTIVATION must be permuted to match (`split_k_order`), which the
+    kiloblox while body pays as an XLA gather + two layout copies per
+    chunk per expert visit (profiled at ~14 ms of an 89 ms decode step at
+    ~225 GiB/s on the kb4 v2 trace; ~78 ms/step on gf). Planar storage
+    puts elements (w*window + j, w*window + window/2 + j) in window w's
+    byte j instead: the same two whole-plane nibble decodes then emit
+    each window's columns in ORIGINAL contraction order, so no operand is
+    ever permuted at runtime, on either side.
 
-  Scales are NOT repacked: group g still owns contraction elements
-  [32g, 32g + 32), which planar decode consumes as the first half of a
-  window's groups against the low plane and the second half against
-  the high plane (32-wide broadcasts either way).
+    Scales are NOT repacked: group g still owns contraction elements
+    [32g, 32g + 32), which planar decode consumes as the first half of a
+    window's groups against the low plane and the second half against
+    the high plane (32-wide broadcasts either way).
 
-  TRACE SAFETY (the P44 export outage, xid/277673658): the serving
-  exporter applies the checkpoint projection UNDER A JIT TRACE (roc
-  loading.py `transformation_returning_parts`), so this function must
-  never force a numpy conversion on its input. jax values and TRACERS
-  take the pure-jnp path (a deterministic byte permutation: reshape /
-  slice / shift / or, all traceable); only genuinely host-resident
-  arrays take the bounded numpy slab walk. Shape/dtype branching only,
-  never value branching.
+    TRACE SAFETY (the P44 export outage, xid/277673658): the serving
+    exporter applies the checkpoint projection UNDER A JIT TRACE (roc
+    loading.py `transformation_returning_parts`), so this function must
+    never force a numpy conversion on its input. jax values and TRACERS
+    take the pure-jnp path (a deterministic byte permutation: reshape /
+    slice / shift / or, all traceable); only genuinely host-resident
+    arrays take the bounded numpy slab walk. Shape/dtype branching only,
+    never value branching.
 
-  Args:
-    packed: `[..., K/2]` uint8 nibble pairs, checkpoint (interleaved) order. K
-      must divide by `window`. jax array or tracer in -> jnp out (trace-safe);
-      numpy (or lazy host array-like) in -> numpy out (slab-wise, bounded
-      transients for the host-side tools).
-    window: The planar window in contraction elements; must equal the kernel k
-      chunk (`PLANAR_WINDOW`).
+    Args:
+      packed: `[..., K/2]` uint8 nibble pairs, checkpoint (interleaved) order. K
+        must divide by `window`. jax array or tracer in -> jnp out (trace-safe);
+        numpy (or lazy host array-like) in -> numpy out (slab-wise, bounded
+        transients for the host-side tools).
+      window: The planar window in contraction elements; must equal the kernel k
+        chunk (`PLANAR_WINDOW`).
 
-  Returns:
-    The repacked array, same shape and dtype.
-  """
-  half_k = packed.shape[-1]
-  k = 2 * half_k
-  if window % (2 * SCALE_GROUP):
-    raise ValueError(
-        f'planar window {window} must be a multiple of {2 * SCALE_GROUP} so'
-        ' each nibble plane covers whole scale groups.'
-    )
-  if k % window:
-    raise ValueError(
-        f'contraction {k} must be a multiple of the planar window {window}.'
-    )
-  if isinstance(packed, (jax.Array, jax.core.Tracer)):
-    # jit/trace path: pure jnp. numpy anywhere here is the
-    # TracerArrayConversionError that killed every export since P44.
-    return _planar_repack_windows(packed, window)
-  if not isinstance(packed, np.ndarray):
-    # Lazy host array-likes (tensorstore / memmap views): materialize
-    # once, then the bounded slab walk below.
-    packed = np.asarray(packed)
-  if packed.ndim < 2:
-    return _planar_repack_windows(packed, window)
-  # Host arrays are checkpoint-scale ([E, N, K/2] is ~5 GiB per real
-  # leaf and the repack holds ~4x that in transients); walk a flat row
-  # view in bounded slabs so the load projection's peak stays small.
-  flat = packed.reshape(-1, half_k)
-  out = np.empty_like(flat)
-  step = max(1, (256 * 1024 * 1024) // max(half_k, 1))
-  for s in range(0, flat.shape[0], step):
-    out[s : s + step] = _planar_repack_windows(flat[s : s + step], window)
-  return out.reshape(packed.shape)
+    Returns:
+      The repacked array, same shape and dtype.
+    """
+    half_k = packed.shape[-1]
+    k = 2 * half_k
+    if window % (2 * SCALE_GROUP):
+        raise ValueError(
+            f"planar window {window} must be a multiple of {2 * SCALE_GROUP} so"
+            " each nibble plane covers whole scale groups."
+        )
+    if k % window:
+        raise ValueError(
+            f"contraction {k} must be a multiple of the planar window {window}."
+        )
+    if isinstance(packed, (jax.Array, jax.core.Tracer)):
+        # jit/trace path: pure jnp. numpy anywhere here is the
+        # TracerArrayConversionError that killed every export since P44.
+        return _planar_repack_windows(packed, window)
+    if not isinstance(packed, np.ndarray):
+        # Lazy host array-likes (tensorstore / memmap views): materialize
+        # once, then the bounded slab walk below.
+        packed = np.asarray(packed)
+    if packed.ndim < 2:
+        return _planar_repack_windows(packed, window)
+    # Host arrays are checkpoint-scale ([E, N, K/2] is ~5 GiB per real
+    # leaf and the repack holds ~4x that in transients); walk a flat row
+    # view in bounded slabs so the load projection's peak stays small.
+    flat = packed.reshape(-1, half_k)
+    out = np.empty_like(flat)
+    step = max(1, (256 * 1024 * 1024) // max(half_k, 1))
+    for s in range(0, flat.shape[0], step):
+        out[s : s + step] = _planar_repack_windows(flat[s : s + step], window)
+    return out.reshape(packed.shape)
 
 
 def unpack_planar_stack(packed, window: int = PLANAR_WINDOW):
-  """The inverse of `repack_planar_stack` (back to interleaved pairs).
+    """The inverse of `repack_planar_stack` (back to interleaved pairs).
 
-  Used by the reference fallback (shapes the kernel cannot serve), the
-  dense-path stack dequant, and tests; round trips bitwise by
-  construction. Same trace-safety dispatch as the repack: jax values
-  and tracers stay on jnp (this already runs inside jit on the dense
-  dequant path), everything host-side stays on numpy.
-  """
-  xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
-  half_k = packed.shape[-1]
-  k = 2 * half_k
-  hw = window // 2
-  if k % window:
-    raise ValueError(
-        f'contraction {k} must be a multiple of the planar window {window}.'
-    )
-  lead = packed.shape[:-1]
-  planar = packed.reshape(lead + (k // window, hw))
-  # Original contraction order per window, then re-pair (even, odd).
-  codes = xp.concatenate([planar & 0x0F, planar >> 4], axis=-1)
-  even = codes[..., 0::2]
-  odd = codes[..., 1::2]
-  return (even | (odd << 4)).astype(packed.dtype).reshape(lead + (half_k,))
+    Used by the reference fallback (shapes the kernel cannot serve), the
+    dense-path stack dequant, and tests; round trips bitwise by
+    construction. Same trace-safety dispatch as the repack: jax values
+    and tracers stay on jnp (this already runs inside jit on the dense
+    dequant path), everything host-side stays on numpy.
+    """
+    xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
+    half_k = packed.shape[-1]
+    k = 2 * half_k
+    hw = window // 2
+    if k % window:
+        raise ValueError(
+            f"contraction {k} must be a multiple of the planar window {window}."
+        )
+    lead = packed.shape[:-1]
+    planar = packed.reshape(lead + (k // window, hw))
+    # Original contraction order per window, then re-pair (even, odd).
+    codes = xp.concatenate([planar & 0x0F, planar >> 4], axis=-1)
+    even = codes[..., 0::2]
+    odd = codes[..., 1::2]
+    return (even | (odd << 4)).astype(packed.dtype).reshape(lead + (half_k,))
 
 
 def repack_planar_t_stack(packed, window: int = PLANAR_WINDOW):
-  """Planar window bytes, TRANSPOSED: `[..., N, K/2]` -> `[..., K/2, N]`.
+    """Planar window bytes, TRANSPOSED: `[..., N, K/2]` -> `[..., K/2, N]`.
 
-  The planar_t layout is `repack_planar_stack` followed by a swap of
-  the last two dims, so byte `[..., w*window/2 + j, n]` holds the
-  nibbles of contraction elements `w*window + j` (low) and
-  `w*window + window/2 + j` (high) of weight row `n`. Same weight
-  VALUES bit for bit; only placement changes. What the transpose buys:
-  the dequantized tile comes out `[chunk, tn]` with the weight ROW on
-  the lane dim, which is the axis the vperm.slane gather table varies
-  over, so the per-group e8m0 scale can be multiplied into the 16-entry
-  table instead of into every weight element
-  (`_dequantize_chunk_planar_t_gather`).
+    The planar_t layout is `repack_planar_stack` followed by a swap of
+    the last two dims, so byte `[..., w*window/2 + j, n]` holds the
+    nibbles of contraction elements `w*window + j` (low) and
+    `w*window + window/2 + j` (high) of weight row `n`. Same weight
+    VALUES bit for bit; only placement changes. What the transpose buys:
+    the dequantized tile comes out `[chunk, tn]` with the weight ROW on
+    the lane dim, which is the axis the vperm.slane gather table varies
+    over, so the per-group e8m0 scale can be multiplied into the 16-entry
+    table instead of into every weight element
+    (`_dequantize_chunk_planar_t_gather`).
 
-  Trace-safe exactly like `repack_planar_stack` (jax values and tracers
-  stay on jnp; host arrays take the bounded slab walk, then a numpy
-  transpose materialized once).
-  """
-  planar = repack_planar_stack(packed, window)
-  if isinstance(planar, (jax.Array, jax.core.Tracer)):
-    return jnp.swapaxes(planar, -1, -2)
-  return np.ascontiguousarray(np.swapaxes(planar, -1, -2))
+    Trace-safe exactly like `repack_planar_stack` (jax values and tracers
+    stay on jnp; host arrays take the bounded slab walk, then a numpy
+    transpose materialized once).
+    """
+    planar = repack_planar_stack(packed, window)
+    if isinstance(planar, (jax.Array, jax.core.Tracer)):
+        return jnp.swapaxes(planar, -1, -2)
+    return np.ascontiguousarray(np.swapaxes(planar, -1, -2))
 
 
 def unpack_planar_t_stack(packed, window: int = PLANAR_WINDOW):
-  """The inverse of `repack_planar_t_stack` (back to interleaved pairs).
+    """The inverse of `repack_planar_t_stack` (back to interleaved pairs).
 
-  Used by the reference fallback and tests; round trips bitwise by
-  construction (a transpose then the planar unpack).
-  """
-  xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
-  return unpack_planar_stack(xp.swapaxes(packed, -1, -2), window)
+    Used by the reference fallback and tests; round trips bitwise by
+    construction (a transpose then the planar unpack).
+    """
+    xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
+    return unpack_planar_stack(xp.swapaxes(packed, -1, -2), window)
 
 
 def transpose_scales_planar_t(scales):
-  """`[..., N, K/32]` e8m0 codes -> `[..., K/32, N]`, the planar_t order.
+    """`[..., N, K/32]` e8m0 codes -> `[..., K/32, N]`, the planar_t order.
 
-  Scales carry no nibble structure, so their planar_t form is a plain
-  transpose of the last two dims (group g still owns contraction
-  elements [32g, 32g + 32)). Self-inverse modulo the axis swap: apply
-  it again to get back. Trace-safe like the packed repack.
-  """
-  if isinstance(scales, (jax.Array, jax.core.Tracer)):
-    return jnp.swapaxes(scales, -1, -2)
-  if not isinstance(scales, np.ndarray):
-    scales = np.asarray(scales)
-  return np.ascontiguousarray(np.swapaxes(scales, -1, -2))
+    Scales carry no nibble structure, so their planar_t form is a plain
+    transpose of the last two dims (group g still owns contraction
+    elements [32g, 32g + 32)). Self-inverse modulo the axis swap: apply
+    it again to get back. Trace-safe like the packed repack.
+    """
+    if isinstance(scales, (jax.Array, jax.core.Tracer)):
+        return jnp.swapaxes(scales, -1, -2)
+    if not isinstance(scales, np.ndarray):
+        scales = np.asarray(scales)
+    return np.ascontiguousarray(np.swapaxes(scales, -1, -2))
 
 
 # The e2m1 nibble -> f8e4m3b11fnuz byte relabel, as the (sign, magnitude)
@@ -782,11 +778,11 @@ _B11_MAG_BASE = 80
 
 
 def _b11_relabel_table(tn: int) -> jax.Array:
-  """`[16, tn]` uint8: each e2m1 nibble's exactly-equal e4m3b11fnuz byte."""
-  c = lax.broadcasted_iota(jnp.int32, (16, tn), 0)
-  mag = c & 7
-  body = jnp.where(mag == 1, _B11_MAG1_BYTE, 4 * mag + _B11_MAG_BASE)
-  return jnp.where(mag == 0, 0, ((c >> 3) << 7) | body).astype(jnp.uint8)
+    """`[16, tn]` uint8: each e2m1 nibble's exactly-equal e4m3b11fnuz byte."""
+    c = lax.broadcasted_iota(jnp.int32, (16, tn), 0)
+    mag = c & 7
+    body = jnp.where(mag == 1, _B11_MAG1_BYTE, 4 * mag + _B11_MAG_BASE)
+    return jnp.where(mag == 0, 0, ((c >> 3) << 7) | body).astype(jnp.uint8)
 
 
 # The exact fold window for `planar_t_b11`: within one repack window the
@@ -800,207 +796,207 @@ B11_FOLD_WINDOW = 9
 
 
 def planar_t_scale_spread(scales, chunk: int = PLANAR_WINDOW) -> int:
-  """Widest per-window e8m0 octave spread in `scales` (the fold demand).
+    """Widest per-window e8m0 octave spread in `scales` (the fold demand).
 
-  Shared by every folded-f8 planar_t arm: the fold rewrites a group's
-  code as `w * 2^-delta` with `delta = s_max - s` taken over the window,
-  so the largest `delta` any window asks for is exactly this spread. A
-  mode is exact iff its own fold bound covers it.
+    Shared by every folded-f8 planar_t arm: the fold rewrites a group's
+    code as `w * 2^-delta` with `delta = s_max - s` taken over the window,
+    so the largest `delta` any window asks for is exactly this spread. A
+    mode is exact iff its own fold bound covers it.
 
-  Args:
-    scales: e8m0 codes in ANY of the layouts this module uses; only the
-      contraction axis grouping matters, so `[..., N, K/32]` (checkpoint or
-      planar order) and `[..., K/32, N]` (planar_t) are both accepted.
-    chunk: the repack window in contraction elements.
+    Args:
+      scales: e8m0 codes in ANY of the layouts this module uses; only the
+        contraction axis grouping matters, so `[..., N, K/32]` (checkpoint or
+        planar order) and `[..., K/32, N]` (planar_t) are both accepted.
+      chunk: the repack window in contraction elements.
 
-  Returns:
-    The maximum spread over every (column, window) pair.
-  """
-  arr = np.asarray(scales)
-  groups = chunk // SCALE_GROUP
-  # Find the axis that counts scale groups: the planar_t layouts put it
-  # second-minor, the checkpoint layouts minor.
-  axis = -1 if arr.shape[-1] % groups == 0 else -2
-  moved = np.moveaxis(arr, axis, -1)
-  windows = moved.reshape(*moved.shape[:-1], moved.shape[-1] // groups, groups)
-  spread = windows.max(axis=-1).astype(np.int32) - windows.min(axis=-1).astype(
-      np.int32
-  )
-  return int(spread.max())
+    Returns:
+      The maximum spread over every (column, window) pair.
+    """
+    arr = np.asarray(scales)
+    groups = chunk // SCALE_GROUP
+    # Find the axis that counts scale groups: the planar_t layouts put it
+    # second-minor, the checkpoint layouts minor.
+    axis = -1 if arr.shape[-1] % groups == 0 else -2
+    moved = np.moveaxis(arr, axis, -1)
+    windows = moved.reshape(*moved.shape[:-1], moved.shape[-1] // groups, groups)
+    spread = windows.max(axis=-1).astype(np.int32) - windows.min(axis=-1).astype(
+        np.int32
+    )
+    return int(spread.max())
 
 
 def planar_t_b11_window_ok(scales, chunk: int = PLANAR_WINDOW) -> bool:
-  """True when every window column's e8m0 spread fits `B11_FOLD_WINDOW`.
+    """True when every window column's e8m0 spread fits `B11_FOLD_WINDOW`.
 
-  Args:
-    scales: e8m0 codes, any layout `planar_t_scale_spread` accepts.
-    chunk: the repack window in contraction elements.
+    Args:
+      scales: e8m0 codes, any layout `planar_t_scale_spread` accepts.
+      chunk: the repack window in contraction elements.
 
-  Returns:
-    Whether `planar_t_b11` decodes these weights exactly. A False here
-    means the arm would silently mis-decode the wide columns, so callers
-    gate on it before selecting the mode.
-  """
-  return planar_t_scale_spread(scales, chunk) <= B11_FOLD_WINDOW
+    Returns:
+      Whether `planar_t_b11` decodes these weights exactly. A False here
+      means the arm would silently mis-decode the wide columns, so callers
+      gate on it before selecting the mode.
+    """
+    return planar_t_scale_spread(scales, chunk) <= B11_FOLD_WINDOW
 
 
 def _dequantize_chunk_planar_t_b11(
     packed: jax.Array,
     scales: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-  """Transposed-planar chunk -> f8e4m3b11 codes + one post-dot column scale.
+    """Transposed-planar chunk -> f8e4m3b11 codes + one post-dot column scale.
 
-  SILICON STATUS: bitwise planar_t_gather on real ghostlite (the perf
-  A/B pins it per covered row at decode sizes 1, 2, 4 and on the full
-  buffer) PROVIDED the fold window holds - `planar_t_b11_window_ok`,
-  enforced at conversion. A violated window is not a graceful
-  degradation: the wide columns mis-decode entirely, which is exactly
-  how it first showed up here (a bench fixture drawing 14 octaves of
-  e8m0 against a 9 octave window looked like a compiler bug until the
-  unit bisects came back exact). MEASURED VALUE: the loop body drops
-  38.6% but the prefill wall only 4.4%, i.e. after the round-2 arm this
-  kernel is no longer VPU-issue-bound; the decode-shape win cannot be
-  resolved by the bench (dispatch floor) and needs a live A/B.
+    SILICON STATUS: bitwise planar_t_gather on real ghostlite (the perf
+    A/B pins it per covered row at decode sizes 1, 2, 4 and on the full
+    buffer) PROVIDED the fold window holds - `planar_t_b11_window_ok`,
+    enforced at conversion. A violated window is not a graceful
+    degradation: the wide columns mis-decode entirely, which is exactly
+    how it first showed up here (a bench fixture drawing 14 octaves of
+    e8m0 against a 9 octave window looked like a compiler bug until the
+    unit bisects came back exact). MEASURED VALUE: the loop body drops
+    38.6% but the prefill wall only 4.4%, i.e. after the round-2 arm this
+    kernel is no longer VPU-issue-bound; the decode-shape win cannot be
+    resolved by the bench (dispatch floor) and needs a live A/B.
 
-  The dequant-DELETION arm. planar_t_gather still materializes bf16
-  weights with the VPU (its remaining 43 us/slab wall is per-element
-  work at the VALU issue bound); this variant never materializes them
-  at all: it relabels each e2m1 nibble into its EXACTLY EQUAL
-  f8e4m3b11fnuz byte and hands the codes to the MXU, whose GLC gain
-  latch expands f8e4m3b11 -> bf16 in HARDWARE
-  (`vmatprep.subr.f8e4m3b11.bf16`, the format prod's GLP serving uses on
-  its own weight path).
+    The dequant-DELETION arm. planar_t_gather still materializes bf16
+    weights with the VPU (its remaining 43 us/slab wall is per-element
+    work at the VALU issue bound); this variant never materializes them
+    at all: it relabels each e2m1 nibble into its EXACTLY EQUAL
+    f8e4m3b11fnuz byte and hands the codes to the MXU, whose GLC gain
+    latch expands f8e4m3b11 -> bf16 in HARDWARE
+    (`vmatprep.subr.f8e4m3b11.bf16`, the format prod's GLP serving uses on
+    its own weight path).
 
-  CHIP SCOPE - THE HARDWARE EXPANSION ABOVE IS A GHOSTLITE FACT, NOT A
-  PORTABLE ONE. The two serving chips take OPPOSITE fp8 formats.
-  GhostLite's native spelling is b11 and it has no e4m3fn support;
-  GHOSTFISH IS THE MIRROR and has NO GAIN LATCH FOR b11 AT ALL
-  (`SupportsGainLatchMode` returns FALSE for every
-  `k*XposeF8E4M3B11ToBf16` case in target_ghostfish.h, read by RETURN
-  ARM rather than by case label, which is where this reads wrong;
-  target_ghostfish.h also carries the e4m3fn VpackFormats that
-  target_ghostlite.h has zero of). So on gf the widen is SOFTWARE and
-  the whole "dequant-DELETION" argument above does not apply: this
-  variant's value proposition is GLP-only as written.
-  Measured on GF at batch 1, same dot spelling: b11 loses 672
-  convolutions against a GF bf16 control that loses NONE, and loses
-  MORE than e4m3fn does (-465), so on gf at that batch the dtype is
-  genuinely the cause and b11 is the worst of the three. GF at batch
-  >= 2 is UNVERIFIED - nobody has run it - so this is deliberately NOT
-  a claim that b11 loses the MXU on gf generally.
-  A gf lane wanting this mechanism should spell the planes e4m3fn
-  instead; `_codes_to_f8` (:1911) already does exactly that relabel in
-  this file. No
-  chip guard is asserted here on purpose: a deliberate b11-on-GF
-  reproduction arm exists and a refusal would break it.
+    CHIP SCOPE - THE HARDWARE EXPANSION ABOVE IS A GHOSTLITE FACT, NOT A
+    PORTABLE ONE. The two serving chips take OPPOSITE fp8 formats.
+    GhostLite's native spelling is b11 and it has no e4m3fn support;
+    GHOSTFISH IS THE MIRROR and has NO GAIN LATCH FOR b11 AT ALL
+    (`SupportsGainLatchMode` returns FALSE for every
+    `k*XposeF8E4M3B11ToBf16` case in target_ghostfish.h, read by RETURN
+    ARM rather than by case label, which is where this reads wrong;
+    target_ghostfish.h also carries the e4m3fn VpackFormats that
+    target_ghostlite.h has zero of). So on gf the widen is SOFTWARE and
+    the whole "dequant-DELETION" argument above does not apply: this
+    variant's value proposition is GLP-only as written.
+    Measured on GF at batch 1, same dot spelling: b11 loses 672
+    convolutions against a GF bf16 control that loses NONE, and loses
+    MORE than e4m3fn does (-465), so on gf at that batch the dtype is
+    genuinely the cause and b11 is the worst of the three. GF at batch
+    >= 2 is UNVERIFIED - nobody has run it - so this is deliberately NOT
+    a claim that b11 loses the MXU on gf generally.
+    A gf lane wanting this mechanism should spell the planes e4m3fn
+    instead; `_codes_to_f8` (:1911) already does exactly that relabel in
+    this file. No
+    chip guard is asserted here on purpose: a deliberate b11-on-GF
+    reproduction arm exists and a refusal would break it.
 
-  What that buys per chunk step: the gather output
-  halves (u8, not bf16), the index path becomes the NATIVE byte gather
-  (8-bit indices need none of the 16-bit emulation arithmetic), the
-  f32->bf16 cast tail disappears, and the scale multiply leaves the
-  per-element path entirely.
+    What that buys per chunk step: the gather output
+    halves (u8, not bf16), the index path becomes the NATIVE byte gather
+    (8-bit indices need none of the 16-bit emulation arithmetic), the
+    f32->bf16 cast tail disappears, and the scale multiply leaves the
+    per-element path entirely.
 
-  EXACTNESS (why this is a bitwise-class arm, not a quality arm). All 16
-  e2m1 values embed exactly in e4m3b11fnuz (bias 11 covers 2^-1..2^2, and
-  a 3-bit mantissa covers e2m1's 1 bit; verified over the whole grid in
-  moe_gmm_test). The per-group e8m0 scale splits into a per-window
-  maximum and a per-group DELTA: `w * 2^(s - 127) = (w * 2^-delta) *
-  2^(s_max - 127)` with `delta = s_max - s`. The folded code `w *
-  2^-delta` stays exactly representable in e4m3b11fnuz while the folded
-  code stays NORMAL, the expansion to bf16 is exact (3-bit mantissa
-  into 7, by the latch on GLP or in software on gf - the EXACTNESS
-  argument is arithmetic and holds either way; only the COST differs by
-  chip), and the residual `2^(s_max - 127)` is a power of two applied
-  ONCE to the f32 accumulator, where it is exact. So every
-  product, every partial sum and the result are bit-identical to
-  planar_t_gather's, on any window inside the fold bound.
+    EXACTNESS (why this is a bitwise-class arm, not a quality arm). All 16
+    e2m1 values embed exactly in e4m3b11fnuz (bias 11 covers 2^-1..2^2, and
+    a 3-bit mantissa covers e2m1's 1 bit; verified over the whole grid in
+    moe_gmm_test). The per-group e8m0 scale splits into a per-window
+    maximum and a per-group DELTA: `w * 2^(s - 127) = (w * 2^-delta) *
+    2^(s_max - 127)` with `delta = s_max - s`. The folded code `w *
+    2^-delta` stays exactly representable in e4m3b11fnuz while the folded
+    code stays NORMAL, the expansion to bf16 is exact (3-bit mantissa
+    into 7, by the latch on GLP or in software on gf - the EXACTNESS
+    argument is arithmetic and holds either way; only the COST differs by
+    chip), and the residual `2^(s_max - 127)` is a power of two applied
+    ONCE to the f32 accumulator, where it is exact. So every
+    product, every partial sum and the result are bit-identical to
+    planar_t_gather's, on any window inside the fold bound.
 
-  THAT BOUND IS `B11_FOLD_WINDOW` = 9, AND IT IS PER-MAGNITUDE-MINIMUM,
-  not per-magnitude-maximum. The fold is an integer subtraction on the
-  exponent FIELD, so it is exact exactly while `E - delta >= 1`. e2m1's
-  LARGEST magnitude (6 = 1.5 x 2^2) sits at E = 13 and tolerates delta
-  <= 12; its SMALLEST (0.5 = 2^-1) sits at E = 10 and tolerates only
-  delta <= 9, and a window is decoded correctly only if EVERY code in
-  it is, so 9 binds. (An earlier revision of this docstring quoted the
-  12: that is the loosest per-magnitude bound, and taking it as the
-  window criterion would silently mis-decode every window with spread
-  10..12 - the field underflows into the sign bit rather than rolling
-  into the subnormal encoding that would represent those values.)
-  `moe_gmm_test` pins both sides of the boundary. The property is
-  checkable on the loaded weights (the checkpoint's p99 spread is 2),
-  and `planar_t_b11_window_ok` is how a caller proves it.
+    THAT BOUND IS `B11_FOLD_WINDOW` = 9, AND IT IS PER-MAGNITUDE-MINIMUM,
+    not per-magnitude-maximum. The fold is an integer subtraction on the
+    exponent FIELD, so it is exact exactly while `E - delta >= 1`. e2m1's
+    LARGEST magnitude (6 = 1.5 x 2^2) sits at E = 13 and tolerates delta
+    <= 12; its SMALLEST (0.5 = 2^-1) sits at E = 10 and tolerates only
+    delta <= 9, and a window is decoded correctly only if EVERY code in
+    it is, so 9 binds. (An earlier revision of this docstring quoted the
+    12: that is the loosest per-magnitude bound, and taking it as the
+    window criterion would silently mis-decode every window with spread
+    10..12 - the field underflows into the sign bit rather than rolling
+    into the subnormal encoding that would represent those values.)
+    `moe_gmm_test` pins both sides of the boundary. The property is
+    checkable on the loaded weights (the checkpoint's p99 spread is 2),
+    and `planar_t_b11_window_ok` is how a caller proves it.
 
-  Args:
-    packed: `[chunk/2, tn]` uint8 planar_t window bytes.
-    scales: `[chunk/32, tn]` uint8 e8m0 exponents (group g = row g).
+    Args:
+      packed: `[chunk/2, tn]` uint8 planar_t window bytes.
+      scales: `[chunk/32, tn]` uint8 e8m0 exponents (group g = row g).
 
-  Returns:
-    `(codes, wscale)`: `[chunk, tn]` f8e4m3b11fnuz weights folded by the
-    per-column window delta, and the `[1, tn]` float32 window scale the
-    caller multiplies into the f32 accumulator after the dot.
-  """
-  half_k, tn = packed.shape
-  groups = scales.shape[0]
-  if groups % 2:
-    raise ValueError(
-        f'planar_t windows split {groups} scale groups across two nibble'
-        ' planes; the count must be even.'
+    Returns:
+      `(codes, wscale)`: `[chunk, tn]` f8e4m3b11fnuz weights folded by the
+      per-column window delta, and the `[1, tn]` float32 window scale the
+      caller multiplies into the f32 accumulator after the dot.
+    """
+    half_k, tn = packed.shape
+    groups = scales.shape[0]
+    if groups % 2:
+        raise ValueError(
+            f"planar_t windows split {groups} scale groups across two nibble"
+            " planes; the count must be even."
+        )
+    codes32 = scales.astype(jnp.int32)
+    s_max = jnp.max(codes32, axis=0, keepdims=True)  # [1, tn]
+    delta = s_max - codes32  # [groups, tn], 0 at the window max
+    wscale = jnp.where(
+        s_max == 0,
+        jnp.float32(2.0**-127),
+        lax.bitcast_convert_type(s_max.astype(jnp.uint32) << 23, jnp.float32),
     )
-  codes32 = scales.astype(jnp.int32)
-  s_max = jnp.max(codes32, axis=0, keepdims=True)  # [1, tn]
-  delta = s_max - codes32  # [groups, tn], 0 at the window max
-  wscale = jnp.where(
-      s_max == 0,
-      jnp.float32(2.0**-127),
-      lax.bitcast_convert_type(s_max.astype(jnp.uint32) << 23, jnp.float32),
-  )
-  # The folded table, built with INTEGER arithmetic on the e4m3b11 byte.
-  # GLC has no f8 convert instruction (its only f8 hardware is the MXU
-  # expand latch), so spelling this as `.astype(f8e4m3b11fnuz)` lowers
-  # to a ~20-op software conversion per vreg: measured at +900 bundles
-  # of vsel/vcmp on this very loop, which ate the whole arm. Scaling by
-  # 2^-delta is instead EXACTLY an exponent-field subtraction - the
-  # field sits at bits 3..6, so the folded byte is `base - (delta << 3)`
-  # - with the zero entries pinned at the all-zero byte. That is exact
-  # while the result stays normal, i.e. for delta <= 9 (e2m1's smallest
-  # magnitude 0.5 encodes at E = 10), the window precondition the caller
-  # pins.
-  base = _b11_relabel_table(tn).astype(jnp.int32)  # [16, tn]
-  folded = base[None, :, :] - (delta[:, None, :] << 3)
-  table_u8 = jnp.where(base[None, :, :] == 0, 0, folded).astype(jnp.uint8)
+    # The folded table, built with INTEGER arithmetic on the e4m3b11 byte.
+    # GLC has no f8 convert instruction (its only f8 hardware is the MXU
+    # expand latch), so spelling this as `.astype(f8e4m3b11fnuz)` lowers
+    # to a ~20-op software conversion per vreg: measured at +900 bundles
+    # of vsel/vcmp on this very loop, which ate the whole arm. Scaling by
+    # 2^-delta is instead EXACTLY an exponent-field subtraction - the
+    # field sits at bits 3..6, so the folded byte is `base - (delta << 3)`
+    # - with the zero entries pinned at the all-zero byte. That is exact
+    # while the result stays normal, i.e. for delta <= 9 (e2m1's smallest
+    # magnitude 0.5 encodes at E = 10), the window precondition the caller
+    # pins.
+    base = _b11_relabel_table(tn).astype(jnp.int32)  # [16, tn]
+    folded = base[None, :, :] - (delta[:, None, :] << 3)
+    table_u8 = jnp.where(base[None, :, :] == 0, 0, folded).astype(jnp.uint8)
 
-  # Raw-nibble u8 indices: the NATIVE byte gather path (no 16-bit index
-  # emulation), one lookup per output byte.
-  nib = packed
-  gh = groups // 2
-  rows = half_k // gh
-  idx = jnp.concatenate(
-      [
-          (nib & 0x0F).reshape(gh, rows, tn),
-          (nib >> 4).reshape(gh, rows, tn),
-      ],
-      axis=0,
-  ).astype(jnp.uint8)
-  out = jnp.take_along_axis(
-      table_u8,
-      idx,
-      axis=1,
-      mode='promise_in_bounds',
-      wrap_negative_indices=False,
-  )
-  codes = lax.bitcast_convert_type(
-      out.reshape(groups * rows, tn), jnp.float8_e4m3b11fnuz
-  )
-  return codes, wscale
+    # Raw-nibble u8 indices: the NATIVE byte gather path (no 16-bit index
+    # emulation), one lookup per output byte.
+    nib = packed
+    gh = groups // 2
+    rows = half_k // gh
+    idx = jnp.concatenate(
+        [
+            (nib & 0x0F).reshape(gh, rows, tn),
+            (nib >> 4).reshape(gh, rows, tn),
+        ],
+        axis=0,
+    ).astype(jnp.uint8)
+    out = jnp.take_along_axis(
+        table_u8,
+        idx,
+        axis=1,
+        mode="promise_in_bounds",
+        wrap_negative_indices=False,
+    )
+    codes = lax.bitcast_convert_type(
+        out.reshape(groups * rows, tn), jnp.float8_e4m3b11fnuz
+    )
+    return codes, wscale
 
 
 # Rolled schedule: one BlockSpec-pipelined grid step per (column tile,
 # row-tile visit), the k walk a rolled loop over PLANAR_WINDOW chunks.
-DEQUANT_PLANAR_T_B11 = 'planar_t_b11'
+DEQUANT_PLANAR_T_B11 = "planar_t_b11"
 # Deep schedule: the same chunk math inside a hand-rolled weight
 # pipeline (see `_deep_planar_t_b11_call`). Shapes the deep kernel cannot
 # take fall back to the rolled kernel; the two are bitwise identical.
-DEQUANT_PLANAR_T_B11_DEEP = 'planar_t_b11_deep'
+DEQUANT_PLANAR_T_B11_DEEP = "planar_t_b11_deep"
 # Both modes read the transposed planar layout (`[E, K/2, N]` nibbles
 # plus `[E, K/32, N]` scales from `repack_planar_t_stack` /
 # `transpose_scales_planar_t`) with the kernel k chunk pinned to
@@ -1009,10 +1005,10 @@ DEQUANT_MODES = (DEQUANT_PLANAR_T_B11, DEQUANT_PLANAR_T_B11_DEEP)
 
 
 def _planar_t_fold_chunk(dequant: str):
-  """The `(packed, scales) -> (codes, wscale)` step for a fold mode."""
-  if dequant == DEQUANT_PLANAR_T_B11:
-    return _dequantize_chunk_planar_t_b11
-  raise ValueError(f'{dequant!r} is not a planar_t fold mode.')
+    """The `(packed, scales) -> (codes, wscale)` step for a fold mode."""
+    if dequant == DEQUANT_PLANAR_T_B11:
+        return _dequantize_chunk_planar_t_b11
+    raise ValueError(f"{dequant!r} is not a planar_t fold mode.")
 
 
 # Deep mode -> the rolled mode whose chunk step it wraps (and falls back
@@ -1033,33 +1029,33 @@ DEEP_ROW_TILE_SLOTS = 2
 
 
 def _e8m0_to_f32(scales: jax.Array) -> jax.Array:
-  """2^(u8-127) by exponent-bit construction, exact for all 256 codes.
+    """2^(u8-127) by exponent-bit construction, exact for all 256 codes.
 
-  Not a libm exp2: code 0 is the f32 SUBNORMAL 2^-127 (whose bit
-  pattern is not e<<23) and 255 is inf, so building the exponent field
-  directly matches np.exp2 bit for bit. (The dequant variants above
-  carry the same two lines inline; this helper serves the fp8-native
-  path below and the tests that pin the mapping.)
-  """
-  exps = lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
-  return jnp.where(scales == 0, jnp.float32(2.0**-127), exps)
+    Not a libm exp2: code 0 is the f32 SUBNORMAL 2^-127 (whose bit
+    pattern is not e<<23) and 255 is inf, so building the exponent field
+    directly matches np.exp2 bit for bit. (The dequant variants above
+    carry the same two lines inline; this helper serves the fp8-native
+    path below and the tests that pin the mapping.)
+    """
+    exps = lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
+    return jnp.where(scales == 0, jnp.float32(2.0**-127), exps)
 
 
 def _use_k_loop(k: int, chunk: int) -> bool:
-  """Whether the k walk runs as a real (rolled) loop for this tiling.
+    """Whether the k walk runs as a real (rolled) loop for this tiling.
 
-  The rolled walk needs every per-iteration ref slice lane-aligned: the
-  packed nibble plane advances `chunk/2` u8 lanes per step, so `chunk`
-  must be a multiple of 256 (the scales side is handled separately, see
-  `_stage_scale_codes`). Below that (toy shapes, tiny contractions) the
-  walk stays a static python unroll, whose text is small at those sizes
-  anyway. Rolling the real serving shapes (chunk 256/512) is what keeps
-  one kernel's ISA under the single-overlay HLO-function ceiling, so
-  the 92 identical per-layer calls of the unrolled serving program
-  share ONE copy of program text instead of duplicating ~28 MiB per
-  layer (and it cuts Mosaic compile time with it).
-  """
-  return chunk % 256 == 0 and k > chunk
+    The rolled walk needs every per-iteration ref slice lane-aligned: the
+    packed nibble plane advances `chunk/2` u8 lanes per step, so `chunk`
+    must be a multiple of 256 (the scales side is handled separately, see
+    `_stage_scale_codes`). Below that (toy shapes, tiny contractions) the
+    walk stays a static python unroll, whose text is small at those sizes
+    anyway. Rolling the real serving shapes (chunk 256/512) is what keeps
+    one kernel's ISA under the single-overlay HLO-function ceiling, so
+    the 92 identical per-layer calls of the unrolled serving program
+    share ONE copy of program text instead of duplicating ~28 MiB per
+    layer (and it cuts Mosaic compile time with it).
+    """
+    return chunk % 256 == 0 and k > chunk
 
 
 def _situ_f32(
@@ -1069,25 +1065,25 @@ def _situ_f32(
     beta: float,
     linear_beta: float | None,
 ) -> jax.Array:
-  """SiTU-GLU in f32, the op sequence of `ffw.situ` minus its final cast.
+    """SiTU-GLU in f32, the op sequence of `ffw.situ` minus its final cast.
 
-  `[beta * tanh(gate / beta) * sigmoid(gate)] * [linear_beta * tanh(up /
-  linear_beta)]` (up stays linear when `linear_beta` is None). Duplicated
-  here rather than imported because ffw.py imports this module (the
-  same one-way-dependency reason the e2m1 LUT is duplicated);
-  `moe_gmm_test` pins the fused reference bitwise equal to composing
-  `ffw.situ` over the unfused references, so the two copies cannot
-  drift silently. Shared by the fused kernel body and the fused
-  reference so on-TPU and off-TPU paths run the same arithmetic.
-  """
-  g = gate.astype(jnp.float32)
-  u = up.astype(jnp.float32)
-  if beta == 0.0:
-    return jax.nn.silu(g) * u
-  a = beta * jnp.tanh(g / beta) * jax.nn.sigmoid(g)
-  if linear_beta is not None:
-    u = linear_beta * jnp.tanh(u / linear_beta)
-  return a * u
+    `[beta * tanh(gate / beta) * sigmoid(gate)] * [linear_beta * tanh(up /
+    linear_beta)]` (up stays linear when `linear_beta` is None). Duplicated
+    here rather than imported because ffw.py imports this module (the
+    same one-way-dependency reason the e2m1 LUT is duplicated);
+    `moe_gmm_test` pins the fused reference bitwise equal to composing
+    `ffw.situ` over the unfused references, so the two copies cannot
+    drift silently. Shared by the fused kernel body and the fused
+    reference so on-TPU and off-TPU paths run the same arithmetic.
+    """
+    g = gate.astype(jnp.float32)
+    u = up.astype(jnp.float32)
+    if beta == 0.0:
+        return jax.nn.silu(g) * u
+    a = beta * jnp.tanh(g / beta) * jax.nn.sigmoid(g)
+    if linear_beta is not None:
+        u = linear_beta * jnp.tanh(u / linear_beta)
+    return a * u
 
 
 def _validate(
@@ -1097,80 +1093,78 @@ def _validate(
     group_sizes: jax.Array,
     tiling: tuple[int, int, int],
 ) -> None:
-  """Rejects shapes the kernel cannot serve.
+    """Rejects shapes the kernel cannot serve.
 
-  The weights are in the planar_t orientation: `[E, K/2, N]` packed
-  nibbles and `[E, K/32, N]` e8m0 scales.
-  """
-  if lhs.ndim != 2:
-    raise ValueError(f'lhs must be 2-D, got {lhs.ndim}-D.')
-  if packed.ndim != 3 or scales.ndim != 3:
-    raise ValueError(
-        'packed and scales must be 3-D [E, K/2, N] and [E, K/32, N], got'
-        f' {packed.shape} and {scales.shape}.'
-    )
-  if packed.dtype != jnp.uint8 or scales.dtype != jnp.uint8:
-    raise ValueError(
-        f'packed/scales must be uint8, got {packed.dtype}/{scales.dtype}.'
-    )
-  if group_sizes.dtype != jnp.int32:
-    raise ValueError(f'group_sizes must be int32, got {group_sizes.dtype}.')
-  k = lhs.shape[1]
-  if packed.shape[1] * 2 != k:
-    raise ValueError(
-        f'packed contraction {packed.shape[1] * 2} != lhs contraction {k}.'
-    )
-  if scales.shape[1] * SCALE_GROUP != k:
-    raise ValueError(
-        f'scales cover {scales.shape[1] * SCALE_GROUP} elements, expected {k}.'
-    )
-  if packed.shape[0] != scales.shape[0] or packed.shape[2] != scales.shape[2]:
-    raise ValueError(
-        f'packed {packed.shape} and scales {scales.shape} disagree on'
-        ' (experts, out).'
-    )
-  tm, chunk, tn = tiling
-  # A scale group must never straddle a dequant chunk, or the chunk
-  # would need a neighbouring chunk's exponent.
-  if chunk % SCALE_GROUP:
-    raise ValueError(f'k chunk {chunk} must be a multiple of {SCALE_GROUP}.')
-  if k % chunk:
-    raise ValueError(f'contraction {k} must be a multiple of k chunk {chunk}.')
-  if lhs.shape[0] % tm:
-    raise ValueError(f'rows {lhs.shape[0]} must be a multiple of m tile {tm}.')
-  # Pallas TPU wants a block's second-minor dim 8-divisible and its
-  # minor dim 128-divisible, unless the block covers the whole array
-  # dim. Every block here spans the whole contraction, so only the row
-  # and column tiles need checking. Interpret mode does NOT enforce
-  # this, so it is checked here or it only shows up at TPU lowering.
-  n = packed.shape[2]
-  if tm % 8 and tm != lhs.shape[0]:
-    raise ValueError(
-        f'm tile {tm} must be a multiple of 8 or all {lhs.shape[0]} rows.'
-    )
-  if tn % _LANES and tn != n:
-    raise ValueError(
-        f'n tile {tn} must be a multiple of {_LANES} or all {n} columns.'
-    )
+    The weights are in the planar_t orientation: `[E, K/2, N]` packed
+    nibbles and `[E, K/32, N]` e8m0 scales.
+    """
+    if lhs.ndim != 2:
+        raise ValueError(f"lhs must be 2-D, got {lhs.ndim}-D.")
+    if packed.ndim != 3 or scales.ndim != 3:
+        raise ValueError(
+            "packed and scales must be 3-D [E, K/2, N] and [E, K/32, N], got"
+            f" {packed.shape} and {scales.shape}."
+        )
+    if packed.dtype != jnp.uint8 or scales.dtype != jnp.uint8:
+        raise ValueError(
+            f"packed/scales must be uint8, got {packed.dtype}/{scales.dtype}."
+        )
+    if group_sizes.dtype != jnp.int32:
+        raise ValueError(f"group_sizes must be int32, got {group_sizes.dtype}.")
+    k = lhs.shape[1]
+    if packed.shape[1] * 2 != k:
+        raise ValueError(
+            f"packed contraction {packed.shape[1] * 2} != lhs contraction {k}."
+        )
+    if scales.shape[1] * SCALE_GROUP != k:
+        raise ValueError(
+            f"scales cover {scales.shape[1] * SCALE_GROUP} elements, expected {k}."
+        )
+    if packed.shape[0] != scales.shape[0] or packed.shape[2] != scales.shape[2]:
+        raise ValueError(
+            f"packed {packed.shape} and scales {scales.shape} disagree on"
+            " (experts, out)."
+        )
+    tm, chunk, tn = tiling
+    # A scale group must never straddle a dequant chunk, or the chunk
+    # would need a neighbouring chunk's exponent.
+    if chunk % SCALE_GROUP:
+        raise ValueError(f"k chunk {chunk} must be a multiple of {SCALE_GROUP}.")
+    if k % chunk:
+        raise ValueError(f"contraction {k} must be a multiple of k chunk {chunk}.")
+    if lhs.shape[0] % tm:
+        raise ValueError(f"rows {lhs.shape[0]} must be a multiple of m tile {tm}.")
+    # Pallas TPU wants a block's second-minor dim 8-divisible and its
+    # minor dim 128-divisible, unless the block covers the whole array
+    # dim. Every block here spans the whole contraction, so only the row
+    # and column tiles need checking. Interpret mode does NOT enforce
+    # this, so it is checked here or it only shows up at TPU lowering.
+    n = packed.shape[2]
+    if tm % 8 and tm != lhs.shape[0]:
+        raise ValueError(
+            f"m tile {tm} must be a multiple of 8 or all {lhs.shape[0]} rows."
+        )
+    if tn % _LANES and tn != n:
+        raise ValueError(
+            f"n tile {tn} must be a multiple of {_LANES} or all {n} columns."
+        )
 
 
-def _deep_eligible(
-    m: int, k: int, n: int, tm: int, chunk: int, tn: int
-) -> bool:
-  """Whether the deep-stream kernel serves these static shapes.
+def _deep_eligible(m: int, k: int, n: int, tm: int, chunk: int, tn: int) -> bool:
+    """Whether the deep-stream kernel serves these static shapes.
 
-  Divisibility plus the per-tile f32 accumulator bound
-  (DEEP_MAX_ACC_BYTES per stack). There is deliberately no bound on `m`:
-  choosing the deep schedule for decode-sized batches is the caller's
-  job. Ineligible shapes fall back to the bitwise-identical rolled
-  `planar_t_b11` kernel; only the schedule differs.
-  """
-  return (
-      m % tm == 0
-      and k % chunk == 0
-      and n % tn == 0
-      and tm * tn * 4 <= DEEP_MAX_ACC_BYTES
-  )
+    Divisibility plus the per-tile f32 accumulator bound
+    (DEEP_MAX_ACC_BYTES per stack). There is deliberately no bound on `m`:
+    choosing the deep schedule for decode-sized batches is the caller's
+    job. Ineligible shapes fall back to the bitwise-identical rolled
+    `planar_t_b11` kernel; only the schedule differs.
+    """
+    return (
+        m % tm == 0
+        and k % chunk == 0
+        and n % tn == 0
+        and tm * tn * 4 <= DEEP_MAX_ACC_BYTES
+    )
 
 
 def _deep_fit_tn(
@@ -1185,33 +1179,33 @@ def _deep_fit_tn(
     lhs_bytes: int,
     out_bytes: int,
 ) -> int | None:
-  """Largest column tile whose deep-kernel VMEM footprint fits `budget`.
+    """Largest column tile whose deep-kernel VMEM footprint fits `budget`.
 
-  The deep kernel's VMEM working set is not the rolled kernel's: each
-  stack keeps DEEP_STREAM_DEPTH outstanding `[k, tn']` slab copies of
-  nibbles plus scale codes, and the operands stream through
-  DEEP_ROW_TILE_SLOTS `[tm, k]` lhs tiles and one `[tm, n]` out tile.
-  `default_tiling` models the rolled kernel, so a tiling it admits can
-  overflow the deep kernel. Shrinking only the deep kernel's column tile
-  is value-exact: tn' regroups the output columns and the DMA slabs, and
-  every element's chunk-ordered accumulation and per-column window scale
-  are unchanged. Returns the largest lane-divisible tn' <= tn that
-  divides n and fits, or None (the caller falls back to the rolled
-  kernel).
-  """
-  steps = max(k // chunk, 1)
-  slab_bytes = steps * (chunk // 2 + chunk // SCALE_GROUP)
-  operands = DEEP_ROW_TILE_SLOTS * tm * k * lhs_bytes + tm * n * out_bytes
-  cand = tn
-  while cand >= _LANES:
-    if n % cand == 0:
-      scratch = num_stacks * DEEP_STREAM_DEPTH * slab_bytes * cand
-      accs = num_stacks * tm * cand * 4
-      total = operands + scratch + accs
-      if total <= budget:
-        return cand
-    cand //= 2
-  return None
+    The deep kernel's VMEM working set is not the rolled kernel's: each
+    stack keeps DEEP_STREAM_DEPTH outstanding `[k, tn']` slab copies of
+    nibbles plus scale codes, and the operands stream through
+    DEEP_ROW_TILE_SLOTS `[tm, k]` lhs tiles and one `[tm, n]` out tile.
+    `default_tiling` models the rolled kernel, so a tiling it admits can
+    overflow the deep kernel. Shrinking only the deep kernel's column tile
+    is value-exact: tn' regroups the output columns and the DMA slabs, and
+    every element's chunk-ordered accumulation and per-column window scale
+    are unchanged. Returns the largest lane-divisible tn' <= tn that
+    divides n and fits, or None (the caller falls back to the rolled
+    kernel).
+    """
+    steps = max(k // chunk, 1)
+    slab_bytes = steps * (chunk // 2 + chunk // SCALE_GROUP)
+    operands = DEEP_ROW_TILE_SLOTS * tm * k * lhs_bytes + tm * n * out_bytes
+    cand = tn
+    while cand >= _LANES:
+        if n % cand == 0:
+            scratch = num_stacks * DEEP_STREAM_DEPTH * slab_bytes * cand
+            accs = num_stacks * tm * cand * 4
+            total = operands + scratch + accs
+            if total <= budget:
+                return cand
+        cand //= 2
+    return None
 
 
 def _deep_planar_t_b11_call(
@@ -1227,275 +1221,275 @@ def _deep_planar_t_b11_call(
     preferred_element_type: jax.typing.DTypeLike,
     interpret: bool,
 ) -> jax.Array:
-  """Deep-stream grouped matmul shared by the plain and fused entry points.
+    """Deep-stream grouped matmul shared by the plain and fused entry points.
 
-  Runs `planar_t_b11`'s chunk math (same codes, same window scale, same
-  accumulation order, so bitwise the same outputs) inside a hand-rolled
-  weight pipeline:
+    Runs `planar_t_b11`'s chunk math (same codes, same window scale, same
+    accumulation order, so bitwise the same outputs) inside a hand-rolled
+    weight pipeline:
 
-    * Weights: per active (row tile, group) visit, the expert's `[k, tn]`
-      slab tiles stream HBM->VMEM through DEEP_STREAM_DEPTH outstanding
-      copies per stack while the unrolled k walk decodes and multiplies
-      the previously landed tile. The (visit, column tile) sequence is
-      one flat stream: the copy for global tile q + depth is issued after
-      tile q computes, so the last `depth` tiles of visit j already pull
-      visit j + 1's first tiles and the pipeline is primed once per call.
-    * Rows: the visit's `[tm, k]` lhs tile is copied from HBM into one of
-      DEEP_ROW_TILE_SLOTS VMEM slots (visit j + 1's tile lands while visit
-      j computes). The visit's `[tm, n]` out tile is assembled in one VMEM
-      buffer across its column tiles and copied out when the next visit
-      moves to another row tile (or at the last visit), so a tile
-      straddling two groups is merged in VMEM. Rows the kernel never
-      visits, and rows of a visited tile outside every group, are
-      unspecified (the callers' contract).
+      * Weights: per active (row tile, group) visit, the expert's `[k, tn]`
+        slab tiles stream HBM->VMEM through DEEP_STREAM_DEPTH outstanding
+        copies per stack while the unrolled k walk decodes and multiplies
+        the previously landed tile. The (visit, column tile) sequence is
+        one flat stream: the copy for global tile q + depth is issued after
+        tile q computes, so the last `depth` tiles of visit j already pull
+        visit j + 1's first tiles and the pipeline is primed once per call.
+      * Rows: the visit's `[tm, k]` lhs tile is copied from HBM into one of
+        DEEP_ROW_TILE_SLOTS VMEM slots (visit j + 1's tile lands while visit
+        j computes). The visit's `[tm, n]` out tile is assembled in one VMEM
+        buffer across its column tiles and copied out when the next visit
+        moves to another row tile (or at the last visit), so a tile
+        straddling two groups is merged in VMEM. Rows the kernel never
+        visits, and rows of a visited tile outside every group, are
+        unspecified (the callers' contract).
 
-  Args:
-    lhs: `[m, k]` activations, rows grouped by expert.
-    stacks: the chunk-major planar_t weights: one `(packed, scales)` pair of
-      `[E, steps, chunk/2, n]` / `[E, steps, chunk/32, n]` arrays for the plain
-      matmul, or the fused gate+up form where both pairs are the same
-      `[E, 2, steps, chunk/2, n]` / `[E, 2, steps, chunk/32, n]` arrays and
-      stack `s` reads index `s` of axis 1.
-    group_metadata: `(group_offsets, group_ids, m_tile_ids)` from
-      `_make_group_metadata`.
-    num_active_tiles: number of valid entries of the metadata grid.
-    tm: row tile.
-    chunk: k chunk (PLANAR_WINDOW).
-    tn: column tile.
-    situ: `(beta, linear_beta)` for the fused gate+up epilogue (`_situ_f32` on
-      the two accumulators), or None for the plain matmul.
-    preferred_element_type: output dtype.
-    interpret: run the Pallas kernel in interpret mode.
+    Args:
+      lhs: `[m, k]` activations, rows grouped by expert.
+      stacks: the chunk-major planar_t weights: one `(packed, scales)` pair of
+        `[E, steps, chunk/2, n]` / `[E, steps, chunk/32, n]` arrays for the plain
+        matmul, or the fused gate+up form where both pairs are the same
+        `[E, 2, steps, chunk/2, n]` / `[E, 2, steps, chunk/32, n]` arrays and
+        stack `s` reads index `s` of axis 1.
+      group_metadata: `(group_offsets, group_ids, m_tile_ids)` from
+        `_make_group_metadata`.
+      num_active_tiles: number of valid entries of the metadata grid.
+      tm: row tile.
+      chunk: k chunk (PLANAR_WINDOW).
+      tn: column tile.
+      situ: `(beta, linear_beta)` for the fused gate+up epilogue (`_situ_f32` on
+        the two accumulators), or None for the plain matmul.
+      preferred_element_type: output dtype.
+      interpret: run the Pallas kernel in interpret mode.
 
-  Returns:
-    `[m, n]` products (SiTU-gated when `situ` is set).
-  """
-  m, k = lhs.shape
-  num_stacks = len(stacks)
-  if stacks[0][0].ndim == 5:
-    _, _, steps, plane_rows, n = stacks[0][0].shape
-    scale_rows = stacks[0][1].shape[3]
-  else:
-    _, steps, plane_rows, n = stacks[0][0].shape
-    scale_rows = stacks[0][1].shape[2]
-  tiles_n = n // tn
-  depth = min(DEEP_STREAM_DEPTH, tiles_n)
-  group_offsets, group_ids, m_tile_ids = group_metadata
-  grid_len = m_tile_ids.shape[0]
-  fold_chunk = _dequantize_chunk_planar_t_b11
+    Returns:
+      `[m, n]` products (SiTU-gated when `situ` is set).
+    """
+    m, k = lhs.shape
+    num_stacks = len(stacks)
+    if stacks[0][0].ndim == 5:
+        _, _, steps, plane_rows, n = stacks[0][0].shape
+        scale_rows = stacks[0][1].shape[3]
+    else:
+        _, steps, plane_rows, n = stacks[0][0].shape
+        scale_rows = stacks[0][1].shape[2]
+    tiles_n = n // tn
+    depth = min(DEEP_STREAM_DEPTH, tiles_n)
+    group_offsets, group_ids, m_tile_ids = group_metadata
+    grid_len = m_tile_ids.shape[0]
+    fold_chunk = _dequantize_chunk_planar_t_b11
 
-  def kernel(off_ref, ids_ref, mtid_ref, nat_ref, lhs_ref, *rest):
-    stack_refs = rest[: 2 * num_stacks]
-    out_ref = rest[2 * num_stacks]
-    scratch = rest[2 * num_stacks + 1 :]
-    bufs = scratch[: 2 * num_stacks]
-    acc_refs = scratch[2 * num_stacks : 3 * num_stacks]
-    sems = scratch[3 * num_stacks : 5 * num_stacks]
-    lhs_slots, out_buf, lhs_sems, out_sem = scratch[5 * num_stacks :]
+    def kernel(off_ref, ids_ref, mtid_ref, nat_ref, lhs_ref, *rest):
+        stack_refs = rest[: 2 * num_stacks]
+        out_ref = rest[2 * num_stacks]
+        scratch = rest[2 * num_stacks + 1 :]
+        bufs = scratch[: 2 * num_stacks]
+        acc_refs = scratch[2 * num_stacks : 3 * num_stacks]
+        sems = scratch[3 * num_stacks : 5 * num_stacks]
+        lhs_slots, out_buf, lhs_sems, out_sem = scratch[5 * num_stacks :]
 
-    def lhs_copy(row0, slot):
-      return pltpu.make_async_copy(
-          lhs_ref.at[pl.ds(row0, tm), :],
-          lhs_slots.at[slot],
-          lhs_sems.at[slot],
-      )
-
-    def copies(g, t, slot):
-      out = []
-      for s in range(num_stacks):
-        packed_ref, scales_ref = stack_refs[2 * s], stack_refs[2 * s + 1]
-        pbuf, sbuf = bufs[2 * s], bufs[2 * s + 1]
-        psem, ssem = sems[2 * s], sems[2 * s + 1]
-        if packed_ref.ndim == 5:
-          packed_src = packed_ref.at[g, s, :, :, pl.ds(t * tn, tn)]
-          scales_src = scales_ref.at[g, s, :, :, pl.ds(t * tn, tn)]
-        else:
-          packed_src = packed_ref.at[g, :, :, pl.ds(t * tn, tn)]
-          scales_src = scales_ref.at[g, :, :, pl.ds(t * tn, tn)]
-        out.append(
-            pltpu.make_async_copy(
-                packed_src,
-                pbuf.at[slot],
-                psem.at[slot],
+        def lhs_copy(row0, slot):
+            return pltpu.make_async_copy(
+                lhs_ref.at[pl.ds(row0, tm), :],
+                lhs_slots.at[slot],
+                lhs_sems.at[slot],
             )
-        )
-        out.append(
-            pltpu.make_async_copy(scales_src, sbuf.at[slot], ssem.at[slot])
-        )
-      return out
 
-    def visit(j, carry):
-      g = ids_ref[j]
-      mt = mtid_ref[j]
-      row0 = mt * tm
-      start = off_ref[g]
-      end = off_ref[g + 1]
-      lslot = lax.rem(j, DEEP_ROW_TILE_SLOTS)
-      # This visit's rows were issued by the previous visit (or the
-      # prime below for visit 0); the other slot's reader, visit
-      # j - 1, is done, so visit j + 1's rows can land in it now.
-      lhs_copy(row0, lslot).wait()
-
-      @pl.when(j + 1 < nat_ref[0])
-      def _():
-        lhs_copy(
-            mtid_ref[j + 1] * tm, lax.rem(j + 1, DEEP_ROW_TILE_SLOTS)
-        ).start()
-
-      # The out tile is flushed by the last visit of its row tile;
-      # visits of one row tile are consecutive (m_tile_ids is
-      # nondecreasing), so "last" is "the next visit is on another
-      # tile, or there is none". The clamp keeps the lookahead read in
-      # bounds at the padded tail.
-      next_mt = mtid_ref[jnp.minimum(j + 1, grid_len - 1)]
-      last_of_tile = jnp.logical_or(j + 1 >= nat_ref[0], next_mt != mt)
-      # Slot of tile t in the flattened (visit, tile) stream; the
-      # copies for this visit's first `depth` tiles were issued by
-      # the previous visit (or the prime below for visit 0).
-      base = lax.rem(j * tiles_n, depth)
-      for t in range(tiles_n):
-        slot = lax.rem(base + t, depth)
-        for c in copies(g, t, slot):
-          c.wait()
-        # Accumulate through a scratch ref, not a carried value: each
-        # `+=` then materializes exactly like the rolled kernel's, so
-        # no backend can fuse the window-scale multiply into the add
-        # (an FMA there is a 1-ulp reassociation and breaks bitwise
-        # equality with the rolled kernel).
-        accs = []
-        for s in range(num_stacks):
-          pbuf, sbuf = bufs[2 * s], bufs[2 * s + 1]
-          acc_ref = acc_refs[s]
-          acc_ref[...] = jnp.zeros_like(acc_ref)
-          for cs in range(steps):
-            lhs_chunk = lhs_slots[lslot, :, cs * chunk : (cs + 1) * chunk]
-            dims = (((1,), (0,)), ((), ()))
-            codes, wscale = fold_chunk(pbuf[slot, cs], sbuf[slot, cs])
-            acc_ref[...] += (
-                lax.dot_general(
-                    lhs_chunk,
-                    codes,
-                    dimension_numbers=dims,
-                    preferred_element_type=jnp.float32,
+        def copies(g, t, slot):
+            out = []
+            for s in range(num_stacks):
+                packed_ref, scales_ref = stack_refs[2 * s], stack_refs[2 * s + 1]
+                pbuf, sbuf = bufs[2 * s], bufs[2 * s + 1]
+                psem, ssem = sems[2 * s], sems[2 * s + 1]
+                if packed_ref.ndim == 5:
+                    packed_src = packed_ref.at[g, s, :, :, pl.ds(t * tn, tn)]
+                    scales_src = scales_ref.at[g, s, :, :, pl.ds(t * tn, tn)]
+                else:
+                    packed_src = packed_ref.at[g, :, :, pl.ds(t * tn, tn)]
+                    scales_src = scales_ref.at[g, :, :, pl.ds(t * tn, tn)]
+                out.append(
+                    pltpu.make_async_copy(
+                        packed_src,
+                        pbuf.at[slot],
+                        psem.at[slot],
+                    )
                 )
-                * wscale
-            )
-          accs.append(acc_ref[...])
-        if situ is not None:
-          value = _situ_f32(
-              accs[0].astype(preferred_element_type),
-              accs[1].astype(preferred_element_type),
-              beta=situ[0],
-              linear_beta=situ[1],
-          )
-        else:
-          value = accs[0]
-        row = lax.broadcasted_iota(jnp.int32, (tm, tn), 0) + row0
-        mask = jnp.logical_and(row >= start, row < end)
-        first_of_tile = start <= row0
-        old = jnp.where(
-            first_of_tile, 0.0, out_buf[:, pl.ds(t * tn, tn)].astype(jnp.float32)
-        )
-        out_buf[:, pl.ds(t * tn, tn)] = jnp.where(
-            mask, value, old
-        ).astype(preferred_element_type)
-        nxt = t + depth
-        if nxt < tiles_n:
-          for c in copies(g, nxt, slot):
-            c.start()
-        else:
-          # This slot is free and, in the flattened stream, next holds
-          # tile nxt - tiles_n of the NEXT visit: pull it now so the
-          # visit boundary never drains the pipeline. Every copy issued
-          # here is waited by visit j + 1, which exists by the guard.
-          @pl.when(j + 1 < nat_ref[0])
-          def _(nxt=nxt, slot=slot):
-            g_next = ids_ref[j + 1]
-            for c in copies(g_next, nxt - tiles_n, slot):
-              c.start()
+                out.append(
+                    pltpu.make_async_copy(scales_src, sbuf.at[slot], ssem.at[slot])
+                )
+            return out
 
-      @pl.when(last_of_tile)
-      def _():
-        flush = pltpu.make_async_copy(
-            out_buf, out_ref.at[pl.ds(row0, tm), :], out_sem
-        )
-        flush.start()
-        flush.wait()
+        def visit(j, carry):
+            g = ids_ref[j]
+            mt = mtid_ref[j]
+            row0 = mt * tm
+            start = off_ref[g]
+            end = off_ref[g + 1]
+            lslot = lax.rem(j, DEEP_ROW_TILE_SLOTS)
+            # This visit's rows were issued by the previous visit (or the
+            # prime below for visit 0); the other slot's reader, visit
+            # j - 1, is done, so visit j + 1's rows can land in it now.
+            lhs_copy(row0, lslot).wait()
 
-      return carry
+            @pl.when(j + 1 < nat_ref[0])
+            def _():
+                lhs_copy(
+                    mtid_ref[j + 1] * tm, lax.rem(j + 1, DEEP_ROW_TILE_SLOTS)
+                ).start()
 
-    @pl.when(nat_ref[0] > 0)
-    def _():
-      lhs_copy(mtid_ref[0] * tm, 0).start()
+            # The out tile is flushed by the last visit of its row tile;
+            # visits of one row tile are consecutive (m_tile_ids is
+            # nondecreasing), so "last" is "the next visit is on another
+            # tile, or there is none". The clamp keeps the lookahead read in
+            # bounds at the padded tail.
+            next_mt = mtid_ref[jnp.minimum(j + 1, grid_len - 1)]
+            last_of_tile = jnp.logical_or(j + 1 >= nat_ref[0], next_mt != mt)
+            # Slot of tile t in the flattened (visit, tile) stream; the
+            # copies for this visit's first `depth` tiles were issued by
+            # the previous visit (or the prime below for visit 0).
+            base = lax.rem(j * tiles_n, depth)
+            for t in range(tiles_n):
+                slot = lax.rem(base + t, depth)
+                for c in copies(g, t, slot):
+                    c.wait()
+                # Accumulate through a scratch ref, not a carried value: each
+                # `+=` then materializes exactly like the rolled kernel's, so
+                # no backend can fuse the window-scale multiply into the add
+                # (an FMA there is a 1-ulp reassociation and breaks bitwise
+                # equality with the rolled kernel).
+                accs = []
+                for s in range(num_stacks):
+                    pbuf, sbuf = bufs[2 * s], bufs[2 * s + 1]
+                    acc_ref = acc_refs[s]
+                    acc_ref[...] = jnp.zeros_like(acc_ref)
+                    for cs in range(steps):
+                        lhs_chunk = lhs_slots[lslot, :, cs * chunk : (cs + 1) * chunk]
+                        dims = (((1,), (0,)), ((), ()))
+                        codes, wscale = fold_chunk(pbuf[slot, cs], sbuf[slot, cs])
+                        acc_ref[...] += (
+                            lax.dot_general(
+                                lhs_chunk,
+                                codes,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * wscale
+                        )
+                    accs.append(acc_ref[...])
+                if situ is not None:
+                    value = _situ_f32(
+                        accs[0].astype(preferred_element_type),
+                        accs[1].astype(preferred_element_type),
+                        beta=situ[0],
+                        linear_beta=situ[1],
+                    )
+                else:
+                    value = accs[0]
+                row = lax.broadcasted_iota(jnp.int32, (tm, tn), 0) + row0
+                mask = jnp.logical_and(row >= start, row < end)
+                first_of_tile = start <= row0
+                old = jnp.where(
+                    first_of_tile,
+                    0.0,
+                    out_buf[:, pl.ds(t * tn, tn)].astype(jnp.float32),
+                )
+                out_buf[:, pl.ds(t * tn, tn)] = jnp.where(mask, value, old).astype(
+                    preferred_element_type
+                )
+                nxt = t + depth
+                if nxt < tiles_n:
+                    for c in copies(g, nxt, slot):
+                        c.start()
+                else:
+                    # This slot is free and, in the flattened stream, next holds
+                    # tile nxt - tiles_n of the NEXT visit: pull it now so the
+                    # visit boundary never drains the pipeline. Every copy issued
+                    # here is waited by visit j + 1, which exists by the guard.
+                    @pl.when(j + 1 < nat_ref[0])
+                    def _(nxt=nxt, slot=slot):
+                        g_next = ids_ref[j + 1]
+                        for c in copies(g_next, nxt - tiles_n, slot):
+                            c.start()
 
-    @pl.when(nat_ref[0] > 0)
-    def _():
-      g_first = ids_ref[0]
-      for s in range(depth):
-        for c in copies(g_first, s, s):
-          c.start()
+            @pl.when(last_of_tile)
+            def _():
+                flush = pltpu.make_async_copy(
+                    out_buf, out_ref.at[pl.ds(row0, tm), :], out_sem
+                )
+                flush.start()
+                flush.wait()
 
-    lax.fori_loop(0, nat_ref[0], visit, 0)
+            return carry
 
-  flops = 2 * m * k * n * num_stacks
-  bytes_accessed = (
-      lhs.size * lhs.itemsize
-      + sum(p.size + s.size for p, s in stacks)
-      + m * n * jnp.dtype(preferred_element_type).itemsize
-  )
-  scratch_shapes = []
-  for _ in range(num_stacks):
-    scratch_shapes.append(pltpu.VMEM((depth, steps, plane_rows, tn), jnp.uint8))
-    scratch_shapes.append(
-        pltpu.VMEM((depth, steps, scale_rows, tn), jnp.uint8)
+        @pl.when(nat_ref[0] > 0)
+        def _():
+            lhs_copy(mtid_ref[0] * tm, 0).start()
+
+        @pl.when(nat_ref[0] > 0)
+        def _():
+            g_first = ids_ref[0]
+            for s in range(depth):
+                for c in copies(g_first, s, s):
+                    c.start()
+
+        lax.fori_loop(0, nat_ref[0], visit, 0)
+
+    flops = 2 * m * k * n * num_stacks
+    bytes_accessed = (
+        lhs.size * lhs.itemsize
+        + sum(p.size + s.size for p, s in stacks)
+        + m * n * jnp.dtype(preferred_element_type).itemsize
     )
-  for _ in range(num_stacks):
-    scratch_shapes.append(pltpu.VMEM((tm, tn), jnp.float32))
-  for _ in range(num_stacks):
-    scratch_shapes.append(pltpu.SemaphoreType.DMA((depth,)))
-    scratch_shapes.append(pltpu.SemaphoreType.DMA((depth,)))
-  scratch_shapes.append(pltpu.VMEM((DEEP_ROW_TILE_SLOTS, tm, k), lhs.dtype))
-  scratch_shapes.append(pltpu.VMEM((tm, n), preferred_element_type))
-  scratch_shapes.append(pltpu.SemaphoreType.DMA((DEEP_ROW_TILE_SLOTS,)))
-  scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-  # The operands stay wherever XLA puts them; the kernel moves row tiles
-  # itself. No `vmem_limit_bytes`: the kernel fits the default scoped
-  # VMEM limit.
-  call = pl.pallas_call(
-      kernel,
-      grid=(),
-      in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] * 4
-      + [pl.BlockSpec(memory_space=pl.ANY)]
-      + [pl.BlockSpec(memory_space=pl.ANY)] * (2 * num_stacks),
-      out_specs=pl.BlockSpec(memory_space=pl.ANY),
-      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
-      scratch_shapes=scratch_shapes,
-      interpret=interpret,
-      cost_estimate=pl.CostEstimate(
-          flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
-      ),
-  )
-  stack_args = []
-  for p, s in stacks:
-    stack_args.extend((p, s))
-  return call(
-      group_offsets.astype(jnp.int32),
-      group_ids.astype(jnp.int32),
-      m_tile_ids.astype(jnp.int32),
-      jnp.reshape(num_active_tiles, (1,)).astype(jnp.int32),
-      lhs,
-      *stack_args,
-  )
+    scratch_shapes = []
+    for _ in range(num_stacks):
+        scratch_shapes.append(pltpu.VMEM((depth, steps, plane_rows, tn), jnp.uint8))
+        scratch_shapes.append(pltpu.VMEM((depth, steps, scale_rows, tn), jnp.uint8))
+    for _ in range(num_stacks):
+        scratch_shapes.append(pltpu.VMEM((tm, tn), jnp.float32))
+    for _ in range(num_stacks):
+        scratch_shapes.append(pltpu.SemaphoreType.DMA((depth,)))
+        scratch_shapes.append(pltpu.SemaphoreType.DMA((depth,)))
+    scratch_shapes.append(pltpu.VMEM((DEEP_ROW_TILE_SLOTS, tm, k), lhs.dtype))
+    scratch_shapes.append(pltpu.VMEM((tm, n), preferred_element_type))
+    scratch_shapes.append(pltpu.SemaphoreType.DMA((DEEP_ROW_TILE_SLOTS,)))
+    scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
+    # The operands stay wherever XLA puts them; the kernel moves row tiles
+    # itself. No `vmem_limit_bytes`: the kernel fits the default scoped
+    # VMEM limit.
+    call = pl.pallas_call(
+        kernel,
+        grid=(),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] * 4
+        + [pl.BlockSpec(memory_space=pl.ANY)]
+        + [pl.BlockSpec(memory_space=pl.ANY)] * (2 * num_stacks),
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+        scratch_shapes=scratch_shapes,
+        interpret=interpret,
+        cost_estimate=pl.CostEstimate(
+            flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
+        ),
+    )
+    stack_args = []
+    for p, s in stacks:
+        stack_args.extend((p, s))
+    return call(
+        group_offsets.astype(jnp.int32),
+        group_ids.astype(jnp.int32),
+        m_tile_ids.astype(jnp.int32),
+        jnp.reshape(num_active_tiles, (1,)).astype(jnp.int32),
+        lhs,
+        *stack_args,
+    )
 
 
 @functools.partial(
     jax.jit,
     static_argnames=[
-        'preferred_element_type',
-        'tiling',
-        'interpret',
-        'dequant',
-        'deep_vmem_budget',
+        "preferred_element_type",
+        "tiling",
+        "interpret",
+        "dequant",
+        "deep_vmem_budget",
     ],
 )
 def mxfp4_gmm(
@@ -1511,229 +1505,227 @@ def mxfp4_gmm(
     deep_vmem_budget: int | None = None,
     group_metadata: GroupMetadata | None = None,
 ) -> jax.Array:
-  """`lhs[rows of group i, :] @ dequant(packed[i], scales[i])` per group.
+    """`lhs[rows of group i, :] @ dequant(packed[i], scales[i])` per group.
 
-  Args:
-    lhs: `[M, K]` activations, rows grouped by expert.
-    packed: `[E, K/2, N]` uint8 MXFP4 nibbles in the planar_t layout
-      (`repack_planar_t_stack`).
-    scales: `[E, K/SCALE_GROUP, N]` uint8 e8m0 exponents
-      (`transpose_scales_planar_t`).
-    group_sizes: `[E]` int32 rows per expert; entries may be 0 and need not sum
-      to M (rows past the total are left unspecified, which is how the
-      expert-parallel caller parks assignments it does not own).
-    preferred_element_type: output dtype.
-    tiling: `(tm, k_chunk, tn)`. Blocks always span the whole contraction;
-      `k_chunk` is how much of it the kernel decodes at a time and must equal
-      PLANAR_WINDOW. `tm` must divide M. None derives them from the problem.
-    interpret: run the Pallas kernel in interpret mode (used off TPU).
-    dequant: `DEQUANT_PLANAR_T_B11` (rolled schedule) or
-      `DEQUANT_PLANAR_T_B11_DEEP` (deep schedule, falling back to the rolled
-      kernel for shapes it cannot take). Both are bitwise identical.
-    deep_vmem_budget: VMEM bound for the deep kernel's column tile search
-      (`_deep_fit_tn`); None keeps the rolled tiling's column tile.
-    group_metadata: optional precomputed grid metadata (`_make_group_metadata`
-      with the same `(m, tm, num_groups)`), so the gate+up and down kernels of
-      one layer share one build. Checked by shape; built here when None.
+    Args:
+      lhs: `[M, K]` activations, rows grouped by expert.
+      packed: `[E, K/2, N]` uint8 MXFP4 nibbles in the planar_t layout
+        (`repack_planar_t_stack`).
+      scales: `[E, K/SCALE_GROUP, N]` uint8 e8m0 exponents
+        (`transpose_scales_planar_t`).
+      group_sizes: `[E]` int32 rows per expert; entries may be 0 and need not sum
+        to M (rows past the total are left unspecified, which is how the
+        expert-parallel caller parks assignments it does not own).
+      preferred_element_type: output dtype.
+      tiling: `(tm, k_chunk, tn)`. Blocks always span the whole contraction;
+        `k_chunk` is how much of it the kernel decodes at a time and must equal
+        PLANAR_WINDOW. `tm` must divide M. None derives them from the problem.
+      interpret: run the Pallas kernel in interpret mode (used off TPU).
+      dequant: `DEQUANT_PLANAR_T_B11` (rolled schedule) or
+        `DEQUANT_PLANAR_T_B11_DEEP` (deep schedule, falling back to the rolled
+        kernel for shapes it cannot take). Both are bitwise identical.
+      deep_vmem_budget: VMEM bound for the deep kernel's column tile search
+        (`_deep_fit_tn`); None keeps the rolled tiling's column tile.
+      group_metadata: optional precomputed grid metadata (`_make_group_metadata`
+        with the same `(m, tm, num_groups)`), so the gate+up and down kernels of
+        one layer share one build. Checked by shape; built here when None.
 
-  Returns:
-    `[M, N]` products.
-  """
-  m, k = lhs.shape
-  if dequant not in DEQUANT_MODES:
-    raise ValueError(f'unknown dequant mode {dequant!r}, want one of {DEQUANT_MODES}')
-  num_groups = packed.shape[0]
-  n = packed.shape[2]
-  # Clamp before validating: a tile larger than the array is just the
-  # whole array, which toy shapes rely on.
-  tm, chunk, tn = tiling or default_tiling(m, k, n, force_chunk=PLANAR_WINDOW)
-  tm, chunk, tn = min(tm, m), min(chunk, k), min(tn, n)
-  if chunk != PLANAR_WINDOW:
-    raise ValueError(
-        f'planar weights are repacked per {PLANAR_WINDOW}-element window,'
-        f' so the kernel k chunk must equal it; got chunk {chunk} for k'
-        f' {k}. Callers gate on can_use_kernel(...) for shapes that cannot'
-        ' serve the window.'
-    )
-  _validate(lhs, packed, scales, group_sizes, (tm, chunk, tn))
-  if jnp.dtype(lhs.dtype).itemsize == 1:
-    raise ValueError(
-        f'{lhs.dtype} activations are not supported: the kernel multiplies'
-        ' the activations against float8_e4m3b11fnuz weight codes and'
-        ' expects bf16 or f32 activations.'
-    )
-  # Chunk-major restage at zero cost: splitting the k-major dim of the
-  # planar_t layout is a row-major-preserving reshape (same bytes, same
-  # order), and it lets the rolled k walk index the LEADING dim of the
-  # in-kernel ref, which needs no lane or sublane alignment.
-  steps = max(k // chunk, 1)
-  packed = packed.reshape(num_groups, steps, chunk // 2, n)
-  scales = scales.reshape(num_groups, steps, chunk // SCALE_GROUP, n)
-  tiles_n = (n + tn - 1) // tn
-
-  if group_metadata is not None:
-    grid_metadata, num_active_tiles = _check_group_metadata(
-        group_metadata, m=m, tm=tm, num_groups=num_groups
-    )
-  else:
-    grid_metadata, num_active_tiles = _make_group_metadata(
-        group_sizes, m=m, tm=tm, num_groups=num_groups
-    )
-
-  if dequant in DEEP_DEQUANT_BODIES:
-    deep_body = DEEP_DEQUANT_BODIES[dequant]
-    deep_tn = (
-        _deep_fit_tn(
-            k=k,
-            n=n,
-            tm=tm,
-            chunk=chunk,
-            tn=tn,
-            num_stacks=1,
-            budget=deep_vmem_budget,
-            lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
-            out_bytes=jnp.dtype(preferred_element_type).itemsize,
+    Returns:
+      `[M, N]` products.
+    """
+    m, k = lhs.shape
+    if dequant not in DEQUANT_MODES:
+        raise ValueError(
+            f"unknown dequant mode {dequant!r}, want one of {DEQUANT_MODES}"
         )
-        if deep_vmem_budget is not None
-        else tn
-    )
-    if deep_tn is not None and _deep_eligible(
-        m=m, k=k, n=n, tm=tm, chunk=chunk, tn=deep_tn
-    ):
-      return _deep_planar_t_b11_call(
-          lhs,
-          ((packed, scales),),
-          grid_metadata,
-          num_active_tiles,
-          tm=tm,
-          chunk=chunk,
-          tn=deep_tn,
-          situ=None,
-          preferred_element_type=preferred_element_type,
-          interpret=interpret,
-      )
-    # Shapes the deep pipeline does not serve (prefill widths) take the
-    # bitwise-identical rolled kernel; only the schedule differs.
-    dequant = deep_body
+    num_groups = packed.shape[0]
+    n = packed.shape[2]
+    # Clamp before validating: a tile larger than the array is just the
+    # whole array, which toy shapes rely on.
+    tm, chunk, tn = tiling or default_tiling(m, k, n, force_chunk=PLANAR_WINDOW)
+    tm, chunk, tn = min(tm, m), min(chunk, k), min(tn, n)
+    if chunk != PLANAR_WINDOW:
+        raise ValueError(
+            f"planar weights are repacked per {PLANAR_WINDOW}-element window,"
+            f" so the kernel k chunk must equal it; got chunk {chunk} for k"
+            f" {k}. Callers gate on can_use_kernel(...) for shapes that cannot"
+            " serve the window."
+        )
+    _validate(lhs, packed, scales, group_sizes, (tm, chunk, tn))
+    if jnp.dtype(lhs.dtype).itemsize == 1:
+        raise ValueError(
+            f"{lhs.dtype} activations are not supported: the kernel multiplies"
+            " the activations against float8_e4m3b11fnuz weight codes and"
+            " expects bf16 or f32 activations."
+        )
+    # Chunk-major restage at zero cost: splitting the k-major dim of the
+    # planar_t layout is a row-major-preserving reshape (same bytes, same
+    # order), and it lets the rolled k walk index the LEADING dim of the
+    # in-kernel ref, which needs no lane or sublane alignment.
+    steps = max(k // chunk, 1)
+    packed = packed.reshape(num_groups, steps, chunk // 2, n)
+    scales = scales.reshape(num_groups, steps, chunk // SCALE_GROUP, n)
+    tiles_n = (n + tn - 1) // tn
 
-  use_k_loop = _use_k_loop(k, chunk)
-  fold_chunk = _planar_t_fold_chunk(dequant)
-
-  def kernel(
-      group_metadata,
-      group_offset,
-      lhs_ref,
-      packed_ref,
-      scales_ref,
-      out_ref,
-      acc,
-      scale_codes_ref,
-  ):
-    del group_offset, scale_codes_ref
-    group_offsets, group_ids, m_tile_ids = group_metadata
-    grid_id = pl.program_id(1)
-
-    acc[...] = jnp.zeros_like(acc)
-    # Walk the contraction in chunks. The block covers the whole of K,
-    # but decoding all of it at once puts a [K, tn] chain in flight and
-    # Mosaic spills. Chunking bounds that working set while keeping every
-    # decoded value in VMEM for exactly one MXU consumption. The walk is
-    # a real loop, not a python unroll, so one kernel's ISA stays small
-    # and every per-layer call site shares one copy of the program text.
-    # The planar_t chunk-major reshape put the chunk index on the refs'
-    # leading dim, so the walk indexes it directly.
-
-    def chunk_body_t(i, carry):
-      lhs_chunk = lhs_ref[:, pl.ds(i * chunk, chunk)]
-      # Hand f8 codes to the MXU and apply the window scale once, on the
-      # f32 accumulator.
-      codes, wscale = fold_chunk(packed_ref[i], scales_ref[i])
-      acc[...] += (
-          lax.dot_general(
-              lhs_chunk,
-              codes,
-              dimension_numbers=(((1,), (0,)), ((), ())),
-              preferred_element_type=jnp.float32,
-          )
-          * wscale
-      )
-      return carry
-
-    if use_k_loop:
-      lax.fori_loop(0, k // chunk, chunk_body_t, 0)
+    if group_metadata is not None:
+        grid_metadata, num_active_tiles = _check_group_metadata(
+            group_metadata, m=m, tm=tm, num_groups=num_groups
+        )
     else:
-      for c in range(0, k, chunk):
-        chunk_body_t(c // chunk, 0)
+        grid_metadata, num_active_tiles = _make_group_metadata(
+            group_sizes, m=m, tm=tm, num_groups=num_groups
+        )
 
-    # Only the rows of the tile that belong to THIS group may be
-    # written; a tile straddling a group boundary is visited once per
-    # group it touches, and rows outside every group are left alone.
-    group_id = group_ids[grid_id]
-    start = group_offsets[group_id]
-    end = group_offsets[group_id + 1]
-    row0 = m_tile_ids[grid_id] * tm
-    row = lax.broadcasted_iota(jnp.int32, acc.shape, 0) + row0
-    mask = jnp.logical_and(row >= start, row < end)
-    old_f32 = jnp.where(start <= row0, 0.0, out_ref[...].astype(jnp.float32))
-    out_ref[...] = jnp.where(
-        mask, acc[...], old_f32
-    ).astype(preferred_element_type)
+    if dequant in DEEP_DEQUANT_BODIES:
+        deep_body = DEEP_DEQUANT_BODIES[dequant]
+        deep_tn = (
+            _deep_fit_tn(
+                k=k,
+                n=n,
+                tm=tm,
+                chunk=chunk,
+                tn=tn,
+                num_stacks=1,
+                budget=deep_vmem_budget,
+                lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
+                out_bytes=jnp.dtype(preferred_element_type).itemsize,
+            )
+            if deep_vmem_budget is not None
+            else tn
+        )
+        if deep_tn is not None and _deep_eligible(
+            m=m, k=k, n=n, tm=tm, chunk=chunk, tn=deep_tn
+        ):
+            return _deep_planar_t_b11_call(
+                lhs,
+                ((packed, scales),),
+                grid_metadata,
+                num_active_tiles,
+                tm=tm,
+                chunk=chunk,
+                tn=deep_tn,
+                situ=None,
+                preferred_element_type=preferred_element_type,
+                interpret=interpret,
+            )
+        # Shapes the deep pipeline does not serve (prefill widths) take the
+        # bitwise-identical rolled kernel; only the schedule differs.
+        dequant = deep_body
 
-  def lhs_indices(n_i, grid_id, group_metadata, group_offset):
-    del n_i, group_offset
-    return group_metadata[2][grid_id], 0
+    use_k_loop = _use_k_loop(k, chunk)
+    fold_chunk = _planar_t_fold_chunk(dequant)
 
-  def rhs_indices_t(n_i, grid_id, group_metadata, group_offset):
-    del group_offset
-    return group_metadata[1][grid_id], 0, 0, n_i
+    def kernel(
+        group_metadata,
+        group_offset,
+        lhs_ref,
+        packed_ref,
+        scales_ref,
+        out_ref,
+        acc,
+        scale_codes_ref,
+    ):
+        del group_offset, scale_codes_ref
+        group_offsets, group_ids, m_tile_ids = group_metadata
+        grid_id = pl.program_id(1)
 
-  def out_indices(n_i, grid_id, group_metadata, group_offset):
-    del group_offset
-    return group_metadata[2][grid_id], n_i
+        acc[...] = jnp.zeros_like(acc)
+        # Walk the contraction in chunks. The block covers the whole of K,
+        # but decoding all of it at once puts a [K, tn] chain in flight and
+        # Mosaic spills. Chunking bounds that working set while keeping every
+        # decoded value in VMEM for exactly one MXU consumption. The walk is
+        # a real loop, not a python unroll, so one kernel's ISA stays small
+        # and every per-layer call site shares one copy of the program text.
+        # The planar_t chunk-major reshape put the chunk index on the refs'
+        # leading dim, so the walk indexes it directly.
 
-  weight_specs = [
-      pl.BlockSpec((None, steps, chunk // 2, tn), rhs_indices_t),
-      pl.BlockSpec((None, steps, chunk // SCALE_GROUP, tn), rhs_indices_t),
-  ]
-  cost = pl.CostEstimate(
-      flops=2 * m * k * n,
-      bytes_accessed=lhs.size * lhs.itemsize
-      + packed.size
-      + scales.size
-      + m * n * jnp.dtype(preferred_element_type).itemsize,
-      transcendentals=0,
-  )
-  return pl.pallas_call(
-      kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=[pl.BlockSpec((tm, k), lhs_indices)] + weight_specs,
-          out_specs=pl.BlockSpec((tm, tn), out_indices),
-          grid=(tiles_n, num_active_tiles),
-          scratch_shapes=[
-              pltpu.VMEM((tm, tn), jnp.float32),
-              # `[k/chunk, tn, chunk/32]` u8 scratch. The planar_t walk
-              # does not read it; it is kept so the compiled kernel and
-              # its VMEM footprint (which `_vmem_bytes` models) stay as
-              # they are.
-              pltpu.VMEM(
-                  (max(k // chunk, 1), tn, chunk // SCALE_GROUP), jnp.uint8
-              ),
-          ],
-      ),
-      compiler_params=pltpu.CompilerParams(
-          dimension_semantics=('parallel', 'arbitrary')
-      ),
-      interpret=interpret,
-      cost_estimate=cost,
-  )(
-      grid_metadata,
-      jnp.array([0], dtype=jnp.int32),
-      lhs,
-      packed,
-      scales,
-  )
+        def chunk_body_t(i, carry):
+            lhs_chunk = lhs_ref[:, pl.ds(i * chunk, chunk)]
+            # Hand f8 codes to the MXU and apply the window scale once, on the
+            # f32 accumulator.
+            codes, wscale = fold_chunk(packed_ref[i], scales_ref[i])
+            acc[...] += (
+                lax.dot_general(
+                    lhs_chunk,
+                    codes,
+                    dimension_numbers=(((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                * wscale
+            )
+            return carry
+
+        if use_k_loop:
+            lax.fori_loop(0, k // chunk, chunk_body_t, 0)
+        else:
+            for c in range(0, k, chunk):
+                chunk_body_t(c // chunk, 0)
+
+        # Only the rows of the tile that belong to THIS group may be
+        # written; a tile straddling a group boundary is visited once per
+        # group it touches, and rows outside every group are left alone.
+        group_id = group_ids[grid_id]
+        start = group_offsets[group_id]
+        end = group_offsets[group_id + 1]
+        row0 = m_tile_ids[grid_id] * tm
+        row = lax.broadcasted_iota(jnp.int32, acc.shape, 0) + row0
+        mask = jnp.logical_and(row >= start, row < end)
+        old_f32 = jnp.where(start <= row0, 0.0, out_ref[...].astype(jnp.float32))
+        out_ref[...] = jnp.where(mask, acc[...], old_f32).astype(preferred_element_type)
+
+    def lhs_indices(n_i, grid_id, group_metadata, group_offset):
+        del n_i, group_offset
+        return group_metadata[2][grid_id], 0
+
+    def rhs_indices_t(n_i, grid_id, group_metadata, group_offset):
+        del group_offset
+        return group_metadata[1][grid_id], 0, 0, n_i
+
+    def out_indices(n_i, grid_id, group_metadata, group_offset):
+        del group_offset
+        return group_metadata[2][grid_id], n_i
+
+    weight_specs = [
+        pl.BlockSpec((None, steps, chunk // 2, tn), rhs_indices_t),
+        pl.BlockSpec((None, steps, chunk // SCALE_GROUP, tn), rhs_indices_t),
+    ]
+    cost = pl.CostEstimate(
+        flops=2 * m * k * n,
+        bytes_accessed=lhs.size * lhs.itemsize
+        + packed.size
+        + scales.size
+        + m * n * jnp.dtype(preferred_element_type).itemsize,
+        transcendentals=0,
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[pl.BlockSpec((tm, k), lhs_indices)] + weight_specs,
+            out_specs=pl.BlockSpec((tm, tn), out_indices),
+            grid=(tiles_n, num_active_tiles),
+            scratch_shapes=[
+                pltpu.VMEM((tm, tn), jnp.float32),
+                # `[k/chunk, tn, chunk/32]` u8 scratch. The planar_t walk
+                # does not read it; it is kept so the compiled kernel and
+                # its VMEM footprint (which `_vmem_bytes` models) stay as
+                # they are.
+                pltpu.VMEM((max(k // chunk, 1), tn, chunk // SCALE_GROUP), jnp.uint8),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary")
+        ),
+        interpret=interpret,
+        cost_estimate=cost,
+    )(
+        grid_metadata,
+        jnp.array([0], dtype=jnp.int32),
+        lhs,
+        packed,
+        scales,
+    )
 
 
 def mxfp4_gmm_reference(
@@ -1744,30 +1736,24 @@ def mxfp4_gmm_reference(
     *,
     preferred_element_type: jax.typing.DTypeLike | None = None,
 ) -> jax.Array:
-  """`mxfp4_gmm` semantics without Pallas, for CPU and equality tests.
+    """`mxfp4_gmm` semantics without Pallas, for CPU and equality tests.
 
-  Dequantizes the whole stack and runs `jax.lax.ragged_dot`, i.e. what
-  the model did before the kernel existed. Arguments as `mxfp4_gmm`;
-  `preferred_element_type=None` keeps the activation dtype.
-  """
-  e, n, half_k = packed.shape
-  k = half_k * 2
-  codes = jnp.stack([packed & 0x0F, packed >> 4], axis=-1).reshape(e, n, k)
-  values = jnp.take(
-      jnp.asarray(_E2M1_LUT, jnp.float32), codes.astype(jnp.int32)
-  )
-  exps = _e8m0_to_f32(scales)
-  groups = scales.shape[-1]
-  values = values.reshape(e, n, groups, k // groups) * exps[..., None]
-  # [E, N, K] -> [E, K, N]: ragged_dot contracts lhs's minor with the
-  # rhs's SECOND-minor, while the kernel contracts both minors.
-  dense = values.reshape(e, n, k).transpose(0, 2, 1).astype(jnp.bfloat16)
-  out = jax.lax.ragged_dot(lhs, dense.astype(lhs.dtype), group_sizes)
-  return (
-      out
-      if preferred_element_type is None
-      else out.astype(preferred_element_type)
-  )
+    Dequantizes the whole stack and runs `jax.lax.ragged_dot`, i.e. what
+    the model did before the kernel existed. Arguments as `mxfp4_gmm`;
+    `preferred_element_type=None` keeps the activation dtype.
+    """
+    e, n, half_k = packed.shape
+    k = half_k * 2
+    codes = jnp.stack([packed & 0x0F, packed >> 4], axis=-1).reshape(e, n, k)
+    values = jnp.take(jnp.asarray(_E2M1_LUT, jnp.float32), codes.astype(jnp.int32))
+    exps = _e8m0_to_f32(scales)
+    groups = scales.shape[-1]
+    values = values.reshape(e, n, groups, k // groups) * exps[..., None]
+    # [E, N, K] -> [E, K, N]: ragged_dot contracts lhs's minor with the
+    # rhs's SECOND-minor, while the kernel contracts both minors.
+    dense = values.reshape(e, n, k).transpose(0, 2, 1).astype(jnp.bfloat16)
+    out = jax.lax.ragged_dot(lhs, dense.astype(lhs.dtype), group_sizes)
+    return out if preferred_element_type is None else out.astype(preferred_element_type)
 
 
 def mxfp4_fused_gate_up_reference(
@@ -1781,20 +1767,20 @@ def mxfp4_fused_gate_up_reference(
     situ_beta: float,
     situ_linear_beta: float | None,
 ) -> jax.Array:
-  """`mxfp4_fused_gate_up_gmm` semantics without Pallas.
+    """`mxfp4_fused_gate_up_gmm` semantics without Pallas.
 
-  Composes the existing pieces: two `mxfp4_gmm_reference` matmuls and
-  the SiTU math, i.e. exactly what `ffw._ragged_expert_combine` did
-  before the fusion (so CPU/interpret parity with the unfused model is
-  by construction, and rows outside every group come back ZERO from
-  `ragged_dot` where the kernel leaves them unspecified). Output keeps
-  the activation dtype, like the unfused intermediates did.
-  """
-  gate = mxfp4_gmm_reference(lhs, gate_packed, gate_scales, group_sizes)
-  up = mxfp4_gmm_reference(lhs, up_packed, up_scales, group_sizes)
-  return _situ_f32(
-      gate, up, beta=situ_beta, linear_beta=situ_linear_beta
-  ).astype(gate.dtype)
+    Composes the existing pieces: two `mxfp4_gmm_reference` matmuls and
+    the SiTU math, i.e. exactly what `ffw._ragged_expert_combine` did
+    before the fusion (so CPU/interpret parity with the unfused model is
+    by construction, and rows outside every group come back ZERO from
+    `ragged_dot` where the kernel leaves them unspecified). Output keeps
+    the activation dtype, like the unfused intermediates did.
+    """
+    gate = mxfp4_gmm_reference(lhs, gate_packed, gate_scales, group_sizes)
+    up = mxfp4_gmm_reference(lhs, up_packed, up_scales, group_sizes)
+    return _situ_f32(gate, up, beta=situ_beta, linear_beta=situ_linear_beta).astype(
+        gate.dtype
+    )
 
 
 def can_use_kernel(
@@ -1806,38 +1792,40 @@ def can_use_kernel(
     scoped_elem_bytes: int = SCOPED_ELEM_BYTES_GHOSTLITE,
     dequant: str = DEQUANT_PLANAR_T_B11,
 ) -> bool:
-  """Whether `mxfp4_gmm`'s tiling constraints hold for these shapes.
+    """Whether `mxfp4_gmm`'s tiling constraints hold for these shapes.
 
-  Toy configs (a 12-wide latent, say) cannot tile a 32-element scale
-  group, so the model falls back to the reference there; the real
-  serving shapes (K = 3584 latent, 3072 ffn) all satisfy this.
-  `rhs_pairs=2` sizes the default tiling for the fused gate+up kernel
-  (same constraint set, doubled rhs working set); `vmem_budget` and
-  `scoped_elem_bytes` as `default_tiling`. Planar and planar_t
-  `dequant` modes additionally require the k chunk to equal the repack
-  window (toy contractions fall back to the reference, which
-  un-repacks first).
-  """
-  if dequant not in DEQUANT_MODES:
-    raise ValueError(f'unknown dequant mode {dequant!r}, want one of {DEQUANT_MODES}')
-  tm, chunk, _ = tiling or default_tiling(
-      lhs_rows,
-      k,
-      1,
-      rhs_pairs=rhs_pairs,
-      vmem_budget=vmem_budget,
-      scoped_elem_bytes=scoped_elem_bytes,
-      force_chunk=PLANAR_WINDOW,
-  )
-  tm, chunk = min(tm, lhs_rows), min(chunk, k)
-  return (
-      k % SCALE_GROUP == 0
-      and chunk % SCALE_GROUP == 0
-      and k % chunk == 0
-      and lhs_rows % tm == 0
-      and (tm % 8 == 0 or tm == lhs_rows)
-      and chunk == PLANAR_WINDOW
-  )
+    Toy configs (a 12-wide latent, say) cannot tile a 32-element scale
+    group, so the model falls back to the reference there; the real
+    serving shapes (K = 3584 latent, 3072 ffn) all satisfy this.
+    `rhs_pairs=2` sizes the default tiling for the fused gate+up kernel
+    (same constraint set, doubled rhs working set); `vmem_budget` and
+    `scoped_elem_bytes` as `default_tiling`. Planar and planar_t
+    `dequant` modes additionally require the k chunk to equal the repack
+    window (toy contractions fall back to the reference, which
+    un-repacks first).
+    """
+    if dequant not in DEQUANT_MODES:
+        raise ValueError(
+            f"unknown dequant mode {dequant!r}, want one of {DEQUANT_MODES}"
+        )
+    tm, chunk, _ = tiling or default_tiling(
+        lhs_rows,
+        k,
+        1,
+        rhs_pairs=rhs_pairs,
+        vmem_budget=vmem_budget,
+        scoped_elem_bytes=scoped_elem_bytes,
+        force_chunk=PLANAR_WINDOW,
+    )
+    tm, chunk = min(tm, lhs_rows), min(chunk, k)
+    return (
+        k % SCALE_GROUP == 0
+        and chunk % SCALE_GROUP == 0
+        and k % chunk == 0
+        and lhs_rows % tm == 0
+        and (tm % 8 == 0 or tm == lhs_rows)
+        and chunk == PLANAR_WINDOW
+    )
 
 
 # ============================================================================
@@ -1861,47 +1849,47 @@ _MOE_GMM_EP_SHARDS = 8
 def repack_w13_planar_t(
     w13_packed: jax.Array, w13_scale: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-  """Repacks checkpoint `w13` (`[E, 2*N, K/2]` u8) and `w13_scale` (`[E, 2*N, K/32]` u8)
-  into a single zero-copy 3D/4D `planar_t` stack pair:
-    - `w13_pt`: `[E, K, N]` uint8 (equivalent to `[E, 2, K/2, N]` flattened on axes 1..2)
-    - `w13_sc`: `[E, 2*(K/32), 1, N]` uint8 (equivalent to `[E, 2, K/32, 1, N]`)
-  """
-  n = w13_packed.shape[1] // 2
-  gate_pt = repack_planar_t_stack(w13_packed[:, :n, :])
-  up_pt = repack_planar_t_stack(w13_packed[:, n:, :])
-  w13_pt = jnp.concatenate([gate_pt, up_pt], axis=1)
+    """Repacks checkpoint `w13` (`[E, 2*N, K/2]` u8) and `w13_scale` (`[E, 2*N, K/32]` u8)
+    into a single zero-copy 3D/4D `planar_t` stack pair:
+      - `w13_pt`: `[E, K, N]` uint8 (equivalent to `[E, 2, K/2, N]` flattened on axes 1..2)
+      - `w13_sc`: `[E, 2*(K/32), 1, N]` uint8 (equivalent to `[E, 2, K/32, 1, N]`)
+    """
+    n = w13_packed.shape[1] // 2
+    gate_pt = repack_planar_t_stack(w13_packed[:, :n, :])
+    up_pt = repack_planar_t_stack(w13_packed[:, n:, :])
+    w13_pt = jnp.concatenate([gate_pt, up_pt], axis=1)
 
-  gate_sc = transpose_scales_planar_t(w13_scale[:, :n, :])
-  up_sc = transpose_scales_planar_t(w13_scale[:, n:, :])
-  w13_sc = jnp.expand_dims(jnp.concatenate([gate_sc, up_sc], axis=1), axis=2)
-  return w13_pt, w13_sc
+    gate_sc = transpose_scales_planar_t(w13_scale[:, :n, :])
+    up_sc = transpose_scales_planar_t(w13_scale[:, n:, :])
+    w13_sc = jnp.expand_dims(jnp.concatenate([gate_sc, up_sc], axis=1), axis=2)
+    return w13_pt, w13_sc
 
 
 def repack_w2_planar_t(
     w2_packed: jax.Array, w2_scale: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-  """Repacks checkpoint `w2` (`[E, L, N/2]` u8) and `w2_scale` (`[E, L, N/32]` u8)
-  into `planar_t` layout:
-    - `w2_pt`: `[E, N/2, L]` uint8
-    - `w2_sc`: `[E, N/32, 1, L]` uint8
-  """
-  w2_pt = repack_planar_t_stack(w2_packed)
-  w2_sc = jnp.expand_dims(transpose_scales_planar_t(w2_scale), axis=2)
-  return w2_pt, w2_sc
+    """Repacks checkpoint `w2` (`[E, L, N/2]` u8) and `w2_scale` (`[E, L, N/32]` u8)
+    into `planar_t` layout:
+      - `w2_pt`: `[E, N/2, L]` uint8
+      - `w2_sc`: `[E, N/32, 1, L]` uint8
+    """
+    w2_pt = repack_planar_t_stack(w2_packed)
+    w2_sc = jnp.expand_dims(transpose_scales_planar_t(w2_scale), axis=2)
+    return w2_pt, w2_sc
 
 
 def parse_situ_activation(activation: str) -> tuple[float, float | None]:
-  """Parses vLLM activation string ('situ:4.0:25.0' or 'silu') into (beta, linear_beta)."""
-  if activation.startswith("situ:"):
-    _, beta_str, lin_str = activation.split(":")
-    beta = float(beta_str)
-    linear_beta = None if lin_str == "none" else float(lin_str)
-    return beta, linear_beta
-  if activation == "silu":
-    return 0.0, None
-  raise NotImplementedError(
-      f"Unsupported activation {activation!r} for v6e planar_t_b11 MoE kernel."
-  )
+    """Parses vLLM activation string ('situ:4.0:25.0' or 'silu') into (beta, linear_beta)."""
+    if activation.startswith("situ:"):
+        _, beta_str, lin_str = activation.split(":")
+        beta = float(beta_str)
+        linear_beta = None if lin_str == "none" else float(lin_str)
+        return beta, linear_beta
+    if activation == "silu":
+        return 0.0, None
+    raise NotImplementedError(
+        f"Unsupported activation {activation!r} for v6e planar_t_b11 MoE kernel."
+    )
 
 
 def _run_fused_gate_up_5d(
@@ -1916,178 +1904,178 @@ def _run_fused_gate_up_5d(
     group_metadata: GroupMetadata,
     deep_vmem_budget: int = V6E_DEEP_VMEM_BUDGET,
 ) -> jax.Array:
-  """Runs fused gate+up GMM directly on combined `w13_pt` `[E, K, N]` (`[E, 2, steps, chunk/2, N]`)
-  and `w13_sc_3d` `[E, 2*(K/32), N]` (`[E, 2, steps, chunk/32, N]`) with zero HBM copy.
-  """
-  m, k = lhs.shape
-  num_groups, _, n = w13_pt.shape
-  tm, chunk, tn = tiling
-  tm, chunk, tn = min(tm, m), min(chunk, k), min(tn, n)
-  steps = max(k // chunk, 1)
-  plane_rows = chunk // 2
-  scale_rows = chunk // SCALE_GROUP
+    """Runs fused gate+up GMM directly on combined `w13_pt` `[E, K, N]` (`[E, 2, steps, chunk/2, N]`)
+    and `w13_sc_3d` `[E, 2*(K/32), N]` (`[E, 2, steps, chunk/32, N]`) with zero HBM copy.
+    """
+    m, k = lhs.shape
+    num_groups, _, n = w13_pt.shape
+    tm, chunk, tn = tiling
+    tm, chunk, tn = min(tm, m), min(chunk, k), min(tn, n)
+    steps = max(k // chunk, 1)
+    plane_rows = chunk // 2
+    scale_rows = chunk // SCALE_GROUP
 
-  w13_packed_5d = w13_pt.reshape(num_groups, 2, steps, plane_rows, n)
-  w13_scales_5d = w13_sc_3d.reshape(num_groups, 2, steps, scale_rows, n)
+    w13_packed_5d = w13_pt.reshape(num_groups, 2, steps, plane_rows, n)
+    w13_scales_5d = w13_sc_3d.reshape(num_groups, 2, steps, scale_rows, n)
 
-  grid_metadata, num_active_tiles = _check_group_metadata(
-      group_metadata, m=m, tm=tm, num_groups=num_groups
-  )
-  preferred_element_type = lhs.dtype
-  interpret = jax.default_backend() != "tpu"
-
-  if dequant in DEEP_DEQUANT_BODIES:
-    deep_body = DEEP_DEQUANT_BODIES[dequant]
-    deep_tn = _deep_fit_tn(
-        k=k,
-        n=n,
-        tm=tm,
-        chunk=chunk,
-        tn=tn,
-        num_stacks=2,
-        budget=deep_vmem_budget,
-        lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
-        out_bytes=jnp.dtype(preferred_element_type).itemsize,
+    grid_metadata, num_active_tiles = _check_group_metadata(
+        group_metadata, m=m, tm=tm, num_groups=num_groups
     )
-    if deep_tn is not None and _deep_eligible(
-        m=m, k=k, n=n, tm=tm, chunk=chunk, tn=deep_tn
-    ):
-      return _deep_planar_t_b11_call(
-          lhs,
-          ((w13_packed_5d, w13_scales_5d), (w13_packed_5d, w13_scales_5d)),
-          grid_metadata,
-          num_active_tiles,
-          tm=tm,
-          chunk=chunk,
-          tn=deep_tn,
-          situ=(situ_beta, situ_linear_beta),
-          preferred_element_type=preferred_element_type,
-          interpret=interpret,
-      )
-    dequant = deep_body
+    preferred_element_type = lhs.dtype
+    interpret = jax.default_backend() != "tpu"
 
-  # Rolled planar_t_b11 kernel with 5D BlockSpec indexing (0 for gate, 1 for up)
-  tiles_n = (n + tn - 1) // tn
-  use_k_loop = _use_k_loop(k, chunk)
-  fold_chunk = _planar_t_fold_chunk(dequant)
-  dims_t = (((1,), (0,)), ((), ()))
-
-  def kernel(
-      group_metadata_ref,
-      group_offset,
-      lhs_ref,
-      gate_packed_ref,
-      gate_scales_ref,
-      up_packed_ref,
-      up_scales_ref,
-      out_ref,
-      gate_acc,
-      up_acc,
-  ):
-    del group_offset
-    group_offsets, group_ids, m_tile_ids = group_metadata_ref
-    grid_id = pl.program_id(1)
-    gate_acc[...] = jnp.zeros_like(gate_acc)
-    up_acc[...] = jnp.zeros_like(up_acc)
-
-    def chunk_body_t(i, carry):
-      lhs_chunk = lhs_ref[:, pl.ds(i * chunk, chunk)]
-      for packed_c, scales_c, target in (
-          (gate_packed_ref[i], gate_scales_ref[i], gate_acc),
-          (up_packed_ref[i], up_scales_ref[i], up_acc),
-      ):
-        codes, wscale = fold_chunk(packed_c, scales_c)
-        target[...] += (
-            lax.dot_general(
-                lhs_chunk,
-                codes,
-                dimension_numbers=dims_t,
-                preferred_element_type=jnp.float32,
-            )
-            * wscale
+    if dequant in DEEP_DEQUANT_BODIES:
+        deep_body = DEEP_DEQUANT_BODIES[dequant]
+        deep_tn = _deep_fit_tn(
+            k=k,
+            n=n,
+            tm=tm,
+            chunk=chunk,
+            tn=tn,
+            num_stacks=2,
+            budget=deep_vmem_budget,
+            lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
+            out_bytes=jnp.dtype(preferred_element_type).itemsize,
         )
-      return carry
+        if deep_tn is not None and _deep_eligible(
+            m=m, k=k, n=n, tm=tm, chunk=chunk, tn=deep_tn
+        ):
+            return _deep_planar_t_b11_call(
+                lhs,
+                ((w13_packed_5d, w13_scales_5d), (w13_packed_5d, w13_scales_5d)),
+                grid_metadata,
+                num_active_tiles,
+                tm=tm,
+                chunk=chunk,
+                tn=deep_tn,
+                situ=(situ_beta, situ_linear_beta),
+                preferred_element_type=preferred_element_type,
+                interpret=interpret,
+            )
+        dequant = deep_body
 
-    if use_k_loop:
-      lax.fori_loop(0, k // chunk, chunk_body_t, 0)
-    else:
-      for c in range(0, k, chunk):
-        chunk_body_t(c // chunk, 0)
+    # Rolled planar_t_b11 kernel with 5D BlockSpec indexing (0 for gate, 1 for up)
+    tiles_n = (n + tn - 1) // tn
+    use_k_loop = _use_k_loop(k, chunk)
+    fold_chunk = _planar_t_fold_chunk(dequant)
+    dims_t = (((1,), (0,)), ((), ()))
 
-    h = _situ_f32(
-        gate_acc[...].astype(preferred_element_type),
-        up_acc[...].astype(preferred_element_type),
-        beta=situ_beta,
-        linear_beta=situ_linear_beta,
+    def kernel(
+        group_metadata_ref,
+        group_offset,
+        lhs_ref,
+        gate_packed_ref,
+        gate_scales_ref,
+        up_packed_ref,
+        up_scales_ref,
+        out_ref,
+        gate_acc,
+        up_acc,
+    ):
+        del group_offset
+        group_offsets, group_ids, m_tile_ids = group_metadata_ref
+        grid_id = pl.program_id(1)
+        gate_acc[...] = jnp.zeros_like(gate_acc)
+        up_acc[...] = jnp.zeros_like(up_acc)
+
+        def chunk_body_t(i, carry):
+            lhs_chunk = lhs_ref[:, pl.ds(i * chunk, chunk)]
+            for packed_c, scales_c, target in (
+                (gate_packed_ref[i], gate_scales_ref[i], gate_acc),
+                (up_packed_ref[i], up_scales_ref[i], up_acc),
+            ):
+                codes, wscale = fold_chunk(packed_c, scales_c)
+                target[...] += (
+                    lax.dot_general(
+                        lhs_chunk,
+                        codes,
+                        dimension_numbers=dims_t,
+                        preferred_element_type=jnp.float32,
+                    )
+                    * wscale
+                )
+            return carry
+
+        if use_k_loop:
+            lax.fori_loop(0, k // chunk, chunk_body_t, 0)
+        else:
+            for c in range(0, k, chunk):
+                chunk_body_t(c // chunk, 0)
+
+        h = _situ_f32(
+            gate_acc[...].astype(preferred_element_type),
+            up_acc[...].astype(preferred_element_type),
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
+        )
+        group_id = group_ids[grid_id]
+        start = group_offsets[group_id]
+        end = group_offsets[group_id + 1]
+        row0 = m_tile_ids[grid_id] * tm
+        row = lax.broadcasted_iota(jnp.int32, h.shape, 0) + row0
+        mask = jnp.logical_and(row >= start, row < end)
+        old_f32 = jnp.where(start <= row0, 0.0, out_ref[...].astype(jnp.float32))
+        out_ref[...] = jnp.where(mask, h, old_f32).astype(preferred_element_type)
+
+    def lhs_indices(n_i, grid_id, gm, go):
+        del n_i, go
+        return gm[2][grid_id], 0
+
+    def gate_indices_t5(n_i, grid_id, gm, go):
+        del go
+        return gm[1][grid_id], 0, 0, 0, n_i
+
+    def up_indices_t5(n_i, grid_id, gm, go):
+        del go
+        return gm[1][grid_id], 1, 0, 0, n_i
+
+    def out_indices(n_i, grid_id, gm, go):
+        del go
+        return gm[2][grid_id], n_i
+
+    gate_specs = [
+        pl.BlockSpec((None, None, steps, plane_rows, tn), gate_indices_t5),
+        pl.BlockSpec((None, None, steps, scale_rows, tn), gate_indices_t5),
+    ]
+    up_specs = [
+        pl.BlockSpec((None, None, steps, plane_rows, tn), up_indices_t5),
+        pl.BlockSpec((None, None, steps, scale_rows, tn), up_indices_t5),
+    ]
+    cost = pl.CostEstimate(
+        flops=2 * 2 * m * k * n,
+        bytes_accessed=lhs.size * lhs.itemsize
+        + w13_pt.size
+        + w13_sc_3d.size
+        + m * n * jnp.dtype(preferred_element_type).itemsize,
+        transcendentals=3 * m * n,
     )
-    group_id = group_ids[grid_id]
-    start = group_offsets[group_id]
-    end = group_offsets[group_id + 1]
-    row0 = m_tile_ids[grid_id] * tm
-    row = lax.broadcasted_iota(jnp.int32, h.shape, 0) + row0
-    mask = jnp.logical_and(row >= start, row < end)
-    old_f32 = jnp.where(start <= row0, 0.0, out_ref[...].astype(jnp.float32))
-    out_ref[...] = jnp.where(mask, h, old_f32).astype(preferred_element_type)
-
-  def lhs_indices(n_i, grid_id, gm, go):
-    del n_i, go
-    return gm[2][grid_id], 0
-
-  def gate_indices_t5(n_i, grid_id, gm, go):
-    del go
-    return gm[1][grid_id], 0, 0, 0, n_i
-
-  def up_indices_t5(n_i, grid_id, gm, go):
-    del go
-    return gm[1][grid_id], 1, 0, 0, n_i
-
-  def out_indices(n_i, grid_id, gm, go):
-    del go
-    return gm[2][grid_id], n_i
-
-  gate_specs = [
-      pl.BlockSpec((None, None, steps, plane_rows, tn), gate_indices_t5),
-      pl.BlockSpec((None, None, steps, scale_rows, tn), gate_indices_t5),
-  ]
-  up_specs = [
-      pl.BlockSpec((None, None, steps, plane_rows, tn), up_indices_t5),
-      pl.BlockSpec((None, None, steps, scale_rows, tn), up_indices_t5),
-  ]
-  cost = pl.CostEstimate(
-      flops=2 * 2 * m * k * n,
-      bytes_accessed=lhs.size * lhs.itemsize
-      + w13_pt.size
-      + w13_sc_3d.size
-      + m * n * jnp.dtype(preferred_element_type).itemsize,
-      transcendentals=3 * m * n,
-  )
-  return pl.pallas_call(
-      kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=[pl.BlockSpec((tm, k), lhs_indices)] + gate_specs + up_specs,
-          out_specs=pl.BlockSpec((tm, tn), out_indices),
-          grid=(tiles_n, num_active_tiles),
-          scratch_shapes=[
-              pltpu.VMEM((tm, tn), jnp.float32),
-              pltpu.VMEM((tm, tn), jnp.float32),
-          ],
-      ),
-      compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel", "arbitrary")
-      ),
-      interpret=interpret,
-      cost_estimate=cost,
-  )(
-      grid_metadata,
-      jnp.array([0], dtype=jnp.int32),
-      lhs,
-      w13_packed_5d,
-      w13_scales_5d,
-      w13_packed_5d,
-      w13_scales_5d,
-  )
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[pl.BlockSpec((tm, k), lhs_indices)] + gate_specs + up_specs,
+            out_specs=pl.BlockSpec((tm, tn), out_indices),
+            grid=(tiles_n, num_active_tiles),
+            scratch_shapes=[
+                pltpu.VMEM((tm, tn), jnp.float32),
+                pltpu.VMEM((tm, tn), jnp.float32),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary")
+        ),
+        interpret=interpret,
+        cost_estimate=cost,
+    )(
+        grid_metadata,
+        jnp.array([0], dtype=jnp.int32),
+        lhs,
+        w13_packed_5d,
+        w13_scales_5d,
+        w13_packed_5d,
+        w13_scales_5d,
+    )
 
 
 def moe_gmm_v6e_planar_t_b11(
@@ -2101,110 +2089,114 @@ def moe_gmm_v6e_planar_t_b11(
     activation: str,
     preferred_element_type: jax.typing.DTypeLike | None = None,
 ) -> jax.Array:
-  """Executes fused `w13` (gate+up+SiTU) + `w2` (down) grouped matmul on TPU v6e
-  using `planar_t` MXFP4 weights unpacked in VMEM to `float8_e4m3b11fnuz` (`b11`).
+    """Executes fused `w13` (gate+up+SiTU) + `w2` (down) grouped matmul on TPU v6e
+    using `planar_t` MXFP4 weights unpacked in VMEM to `float8_e4m3b11fnuz` (`b11`).
 
-  Args:
-    lhs: `[M, K]` bfloat16 sorted routed activations (`K = 3584`).
-    w13_pt: `[E, K, N]` uint8 (`[7, 3584, 3072]`) from `repack_w13_planar_t`.
-    w13_scale_pt: `[E, 2*(K/32), 1, N]` or `[E, 2*(K/32), N]` uint8.
-    w2_pt: `[E, N/2, K]` uint8 (`[7, 1536, 3584]`) from `repack_w2_planar_t`.
-    w2_scale_pt: `[E, N/32, 1, K]` or `[E, N/32, K]` uint8.
-    group_sizes: `[E]` int32 local expert token counts.
-    activation: vLLM activation string (e.g. `'situ:4.0:25.0'` or `'silu'`).
-    preferred_element_type: Output dtype (defaults to `lhs.dtype`).
+    Args:
+      lhs: `[M, K]` bfloat16 sorted routed activations (`K = 3584`).
+      w13_pt: `[E, K, N]` uint8 (`[7, 3584, 3072]`) from `repack_w13_planar_t`.
+      w13_scale_pt: `[E, 2*(K/32), 1, N]` or `[E, 2*(K/32), N]` uint8.
+      w2_pt: `[E, N/2, K]` uint8 (`[7, 1536, 3584]`) from `repack_w2_planar_t`.
+      w2_scale_pt: `[E, N/32, 1, K]` or `[E, N/32, K]` uint8.
+      group_sizes: `[E]` int32 local expert token counts.
+      activation: vLLM activation string (e.g. `'situ:4.0:25.0'` or `'silu'`).
+      preferred_element_type: Output dtype (defaults to `lhs.dtype`).
 
-  Returns:
-    `[M, K]` output activations in `preferred_element_type`.
-  """
-  orig_m, k = lhs.shape
-  num_groups, _, n = w13_pt.shape
-  out_dtype = lhs.dtype if preferred_element_type is None else jnp.dtype(preferred_element_type)
+    Returns:
+      `[M, K]` output activations in `preferred_element_type`.
+    """
+    orig_m, k = lhs.shape
+    num_groups, _, n = w13_pt.shape
+    out_dtype = (
+        lhs.dtype
+        if preferred_element_type is None
+        else jnp.dtype(preferred_element_type)
+    )
 
-  if w13_scale_pt.ndim == 4:
-    w13_sc_3d = jnp.squeeze(w13_scale_pt, axis=2)
-  else:
-    w13_sc_3d = w13_scale_pt
-  if w2_scale_pt.ndim == 4:
-    w2_sc_3d = jnp.squeeze(w2_scale_pt, axis=2)
-  else:
-    w2_sc_3d = w2_scale_pt
+    if w13_scale_pt.ndim == 4:
+        w13_sc_3d = jnp.squeeze(w13_scale_pt, axis=2)
+    else:
+        w13_sc_3d = w13_scale_pt
+    if w2_scale_pt.ndim == 4:
+        w2_sc_3d = jnp.squeeze(w2_scale_pt, axis=2)
+    else:
+        w2_sc_3d = w2_scale_pt
 
-  situ_beta, situ_linear_beta = parse_situ_activation(activation)
+    situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
-  # Pad M to a multiple of 32 (or 128 for large prefill) so tm always divides m cleanly.
-  align_m = 32 if orig_m <= _MOE_GMM_DEEP_MAX_ROWS else 128
-  padded_m = ((orig_m + align_m - 1) // align_m) * align_m
-  if padded_m != orig_m:
-    lhs = jnp.pad(lhs, ((0, padded_m - orig_m), (0, 0)))
+    # Pad M to a multiple of 32 (or 128 for large prefill) so tm always divides m cleanly.
+    align_m = 32 if orig_m <= _MOE_GMM_DEEP_MAX_ROWS else 128
+    padded_m = ((orig_m + align_m - 1) // align_m) * align_m
+    if padded_m != orig_m:
+        lhs = jnp.pad(lhs, ((0, padded_m - orig_m), (0, 0)))
 
-  expected_rows = max(32, -(-padded_m // _MOE_GMM_EP_SHARDS))
-  dequant = (
-      DEQUANT_PLANAR_T_B11_DEEP
-      if padded_m <= _MOE_GMM_DEEP_MAX_ROWS
-      else DEQUANT_PLANAR_T_B11
-  )
+    expected_rows = max(32, -(-padded_m // _MOE_GMM_EP_SHARDS))
+    dequant = (
+        DEQUANT_PLANAR_T_B11_DEEP
+        if padded_m <= _MOE_GMM_DEEP_MAX_ROWS
+        else DEQUANT_PLANAR_T_B11
+    )
 
-  tiling_13 = default_tiling(
-      padded_m,
-      k,
-      n,
-      lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
-      rhs_pairs=2,
-      expected_rows=expected_rows,
-      vmem_budget=V6E_ROLLED_VMEM_BUDGET,
-      scoped_elem_bytes=SCOPED_ELEM_BYTES_GHOSTFISH,
-      force_chunk=PLANAR_WINDOW,
-  )
-  tiling_2 = default_tiling(
-      padded_m,
-      n,
-      k,
-      lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
-      rhs_pairs=1,
-      expected_rows=expected_rows,
-      vmem_budget=V6E_ROLLED_VMEM_BUDGET,
-      scoped_elem_bytes=SCOPED_ELEM_BYTES_GHOSTFISH,
-      force_chunk=PLANAR_WINDOW,
-  )
-  # Ensure both kernels share the same row tile tm so group_metadata is built once.
-  tm_common = min(tiling_13[0], tiling_2[0], padded_m)
-  tiling_13 = (tm_common, tiling_13[1], tiling_13[2])
-  tiling_2 = (tm_common, tiling_2[1], tiling_2[2])
+    tiling_13 = default_tiling(
+        padded_m,
+        k,
+        n,
+        lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
+        rhs_pairs=2,
+        expected_rows=expected_rows,
+        vmem_budget=V6E_ROLLED_VMEM_BUDGET,
+        scoped_elem_bytes=SCOPED_ELEM_BYTES_GHOSTFISH,
+        force_chunk=PLANAR_WINDOW,
+    )
+    tiling_2 = default_tiling(
+        padded_m,
+        n,
+        k,
+        lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
+        rhs_pairs=1,
+        expected_rows=expected_rows,
+        vmem_budget=V6E_ROLLED_VMEM_BUDGET,
+        scoped_elem_bytes=SCOPED_ELEM_BYTES_GHOSTFISH,
+        force_chunk=PLANAR_WINDOW,
+    )
+    # Ensure both kernels share the same row tile tm so group_metadata is built once.
+    tm_common = min(tiling_13[0], tiling_2[0], padded_m)
+    tiling_13 = (tm_common, tiling_13[1], tiling_13[2])
+    tiling_2 = (tm_common, tiling_2[1], tiling_2[2])
 
-  group_metadata = _make_group_metadata(
-      group_sizes,
-      m=padded_m,
-      tm=tm_common,
-      num_groups=num_groups,
-      impl="closed_form",
-  )
+    group_metadata = _make_group_metadata(
+        group_sizes,
+        m=padded_m,
+        tm=tm_common,
+        num_groups=num_groups,
+        impl="closed_form",
+    )
 
-  h = _run_fused_gate_up_5d(
-      lhs,
-      w13_pt,
-      w13_sc_3d,
-      situ_beta=situ_beta,
-      situ_linear_beta=situ_linear_beta,
-      tiling=tiling_13,
-      dequant=dequant,
-      group_metadata=group_metadata,
-      deep_vmem_budget=V6E_DEEP_VMEM_BUDGET,
-  )
+    h = _run_fused_gate_up_5d(
+        lhs,
+        w13_pt,
+        w13_sc_3d,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        tiling=tiling_13,
+        dequant=dequant,
+        group_metadata=group_metadata,
+        deep_vmem_budget=V6E_DEEP_VMEM_BUDGET,
+    )
 
-  out = mxfp4_gmm(
-      h,
-      w2_pt,
-      w2_sc_3d,
-      group_sizes,
-      preferred_element_type=out_dtype,
-      tiling=tiling_2,
-      interpret=jax.default_backend() != "tpu",
-      dequant=dequant,
-      deep_vmem_budget=V6E_DEEP_VMEM_BUDGET,
-      group_metadata=group_metadata,
-  )
-  return out[:orig_m]
+    out = mxfp4_gmm(
+        h,
+        w2_pt,
+        w2_sc_3d,
+        group_sizes,
+        preferred_element_type=out_dtype,
+        tiling=tiling_2,
+        interpret=jax.default_backend() != "tpu",
+        dequant=dequant,
+        deep_vmem_budget=V6E_DEEP_VMEM_BUDGET,
+        group_metadata=group_metadata,
+    )
+    return out[:orig_m]
 
 
 FUSED_DECODE_MOE_MAX_TOKENS = 64
@@ -2225,15 +2217,15 @@ _FUSED_DECODE_MOE_VMEM_LIMIT = 48 * 1024 * 1024
 
 
 def _fused_verify_moe_vmem_bytes(m: int, k: int, n: int, num_groups: int) -> int:
-  """Upper-bound VMEM estimate of the multi-tray kernel at `m` padded rows."""
-  depth_w2 = 1 if n >= 3072 else 2
-  weights = (
-      2 * (k * n + 2 * (k // SCALE_GROUP) * n)
-      + depth_w2 * (n // 2 + n // SCALE_GROUP) * k
-  )
-  accs = 3 * m * PLANAR_WINDOW * 4 + m * n * 2 + m * k * 4
-  io = m * k * 2 + num_groups * m * _LANES * 4 + m * k * 2
-  return weights + accs + io
+    """Upper-bound VMEM estimate of the multi-tray kernel at `m` padded rows."""
+    depth_w2 = 1 if n >= 3072 else 2
+    weights = (
+        2 * (k * n + 2 * (k // SCALE_GROUP) * n)
+        + depth_w2 * (n // 2 + n // SCALE_GROUP) * k
+    )
+    accs = 3 * m * PLANAR_WINDOW * 4 + m * n * 2 + m * k * 4
+    io = m * k * 2 + num_groups * m * _LANES * 4 + m * k * 2
+    return weights + accs + io
 
 
 def can_use_fused_decode_moe_v6e_planar_t_b11(
@@ -2248,48 +2240,46 @@ def can_use_fused_decode_moe_v6e_planar_t_b11(
     rhs_quant_dtype: jnp.dtype | None = None,
     max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
 ) -> bool:
-  """Returns whether `fused_decode_moe_v6e_planar_t_b11` is eligible.
+    """Returns whether `fused_decode_moe_v6e_planar_t_b11` is eligible.
 
-  `max_tokens` above `FUSED_DECODE_MOE_MAX_TOKENS` (O6b verify, at most
-  `FUSED_VERIFY_MOE_MAX_TOKENS`) admits the multi-tray variant, subject to a
-  VMEM estimate at the padded row count.
-  """
-  max_tokens = min(int(max_tokens), FUSED_VERIFY_MOE_MAX_TOKENS)
-  if not (0 < hidden_states.shape[0] <= max_tokens):
-    return False
-  if (
-      w1.dtype != jnp.uint8
-      or w1_scale is None
-      or w1_scale.dtype != jnp.uint8
-      or w2.dtype != jnp.uint8
-      or w2_scale is None
-      or w2_scale.dtype != jnp.uint8
-      or rhs_quant_dtype is not None
-      or w1_bias is not None
-      or w2_bias is not None
-  ):
-    return False
-  if w1.ndim != 3 or w2.ndim != 3:
-    return False
-  num_groups, k, n = w1.shape
-  if hidden_states.shape[1] != k or k % PLANAR_WINDOW != 0 or n % PLANAR_WINDOW != 0:
-    return False
-  if w2.shape != (num_groups, n // 2, k):
-    return False
-  slab_bytes = (
-      2 * (k + 2 * (k // SCALE_GROUP)) * n + (n // 2 + n // SCALE_GROUP) * k
-  )
-  if slab_bytes > 30 * 1024 * 1024:
-    return False
-  m = hidden_states.shape[0]
-  if m > FUSED_DECODE_MOE_MAX_TOKENS:
-    tray_m = FUSED_VERIFY_MOE_TRAY_M
-    padded_m = ((m + tray_m - 1) // tray_m) * tray_m
-    return (
-        _fused_verify_moe_vmem_bytes(padded_m, k, n, num_groups)
-        <= _FUSED_VERIFY_MOE_VMEM_BUDGET
-    )
-  return True
+    `max_tokens` above `FUSED_DECODE_MOE_MAX_TOKENS` (O6b verify, at most
+    `FUSED_VERIFY_MOE_MAX_TOKENS`) admits the multi-tray variant, subject to a
+    VMEM estimate at the padded row count.
+    """
+    max_tokens = min(int(max_tokens), FUSED_VERIFY_MOE_MAX_TOKENS)
+    if not (0 < hidden_states.shape[0] <= max_tokens):
+        return False
+    if (
+        w1.dtype != jnp.uint8
+        or w1_scale is None
+        or w1_scale.dtype != jnp.uint8
+        or w2.dtype != jnp.uint8
+        or w2_scale is None
+        or w2_scale.dtype != jnp.uint8
+        or rhs_quant_dtype is not None
+        or w1_bias is not None
+        or w2_bias is not None
+    ):
+        return False
+    if w1.ndim != 3 or w2.ndim != 3:
+        return False
+    num_groups, k, n = w1.shape
+    if hidden_states.shape[1] != k or k % PLANAR_WINDOW != 0 or n % PLANAR_WINDOW != 0:
+        return False
+    if w2.shape != (num_groups, n // 2, k):
+        return False
+    slab_bytes = 2 * (k + 2 * (k // SCALE_GROUP)) * n + (n // 2 + n // SCALE_GROUP) * k
+    if slab_bytes > 30 * 1024 * 1024:
+        return False
+    m = hidden_states.shape[0]
+    if m > FUSED_DECODE_MOE_MAX_TOKENS:
+        tray_m = FUSED_VERIFY_MOE_TRAY_M
+        padded_m = ((m + tray_m - 1) // tray_m) * tray_m
+        return (
+            _fused_verify_moe_vmem_bytes(padded_m, k, n, num_groups)
+            <= _FUSED_VERIFY_MOE_VMEM_BUDGET
+        )
+    return True
 
 
 def fused_decode_moe_v6e_planar_t_b11(
@@ -2306,470 +2296,470 @@ def fused_decode_moe_v6e_planar_t_b11(
     token_trays_mode: str = "off",
     rank3_scales: bool = False,
 ) -> jax.Array:
-  """Single-kernel fused decode MoE on TPU v6e for small token batches (M <= 64).
+    """Single-kernel fused decode MoE on TPU v6e for small token batches (M <= 64).
 
-  Eliminates SparseCore `ragged_gather_v2`, `ragged_gather_reduce_v2`, token
-  sorting, and intermediate `[M*topk, N]` HBM round-trips by streaming whole
-  contiguous expert slabs (`w13[g]` double-buffered, `w2[g]` streamed during
-  `w13[g]` compute) into VMEM and computing `w13 + SiTU + w2 + weighted_combine`
-  in one Pallas kernel.
+    Eliminates SparseCore `ragged_gather_v2`, `ragged_gather_reduce_v2`, token
+    sorting, and intermediate `[M*topk, N]` HBM round-trips by streaming whole
+    contiguous expert slabs (`w13[g]` double-buffered, `w2[g]` streamed during
+    `w13[g]` compute) into VMEM and computing `w13 + SiTU + w2 + weighted_combine`
+    in one Pallas kernel.
 
-  For O6b speculative verify (`64 < M <= FUSED_VERIFY_MOE_MAX_TOKENS`) the row
-  loop is always multi-tray (`verify_tray_m` rows per tray, default
-  `FUSED_VERIFY_MOE_TRAY_M`) and `token_trays_mode` is ignored; `M <= 64` is
-  unaffected by `verify_tray_m`.
-  """
-  orig_m, k = hidden_states.shape
-  num_groups, _, n = w13_pt.shape
-  out_dtype = (
-      hidden_states.dtype
-      if preferred_element_type is None
-      else jnp.dtype(preferred_element_type)
-  )
-
-  if w13_scale_pt.ndim == 4:
-    w13_sc_3d = jnp.squeeze(w13_scale_pt, axis=2)
-  else:
-    w13_sc_3d = w13_scale_pt
-  if w2_scale_pt.ndim == 4:
-    w2_sc_3d = jnp.squeeze(w2_scale_pt, axis=2)
-  else:
-    w2_sc_3d = w2_scale_pt
-
-  situ_beta, situ_linear_beta = parse_situ_activation(activation)
-
-  trays_norm = (token_trays_mode or "off").strip().lower()
-  if orig_m > FUSED_DECODE_MOE_MAX_TOKENS:
-    if orig_m > FUSED_VERIFY_MOE_MAX_TOKENS:
-      raise ValueError(
-          f"fused_decode_moe_v6e_planar_t_b11 supports at most "
-          f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {orig_m}."
-      )
-    tray_m = FUSED_VERIFY_MOE_TRAY_M
-    use_trays = True
-    padded_m = ((orig_m + tray_m - 1) // tray_m) * tray_m
-    num_trays = padded_m // tray_m
-  elif trays_norm == "off":
-    use_trays = False
-    padded_m = max(16, ((orig_m + 7) // 8) * 8)
-    tray_m = padded_m
-    num_trays = 1
-  elif trays_norm == "trays":
-    use_trays = True
-    padded_m = max(16, ((orig_m + 15) // 16) * 16)
-    tray_m = 16
-    num_trays = padded_m // tray_m
-  elif trays_norm == "trays2":
-    use_trays = True
-    padded_m = max(16, ((orig_m + 15) // 16) * 16)
-    tray_m = 32 if padded_m >= 64 else 16
-    num_trays = padded_m // tray_m
-  elif trays_norm == "trays32":
-    if orig_m <= 16:
-      use_trays = False
-      padded_m = 16
-      tray_m = 16
-      num_trays = 1
-    else:
-      use_trays = True
-      padded_m = ((orig_m + 15) // 16) * 16
-      tray_m = 16
-      num_trays = padded_m // tray_m
-  else:
-    raise ValueError(
-        f"Invalid token_trays_mode={token_trays_mode!r}; expected 'off', "
-        "'trays', 'trays2', or 'trays32'."
+    For O6b speculative verify (`64 < M <= FUSED_VERIFY_MOE_MAX_TOKENS`) the row
+    loop is always multi-tray (`verify_tray_m` rows per tray, default
+    `FUSED_VERIFY_MOE_TRAY_M`) and `token_trays_mode` is ignored; `M <= 64` is
+    unaffected by `verify_tray_m`.
+    """
+    orig_m, k = hidden_states.shape
+    num_groups, _, n = w13_pt.shape
+    out_dtype = (
+        hidden_states.dtype
+        if preferred_element_type is None
+        else jnp.dtype(preferred_element_type)
     )
-  if padded_m != orig_m:
-    lhs = jnp.pad(hidden_states, ((0, padded_m - orig_m), (0, 0)))
-    topk_w = jnp.pad(topk_weights, ((0, padded_m - orig_m), (0, 0)))
-    topk_i = jnp.pad(
-        topk_ids, ((0, padded_m - orig_m), (0, 0)), constant_values=-1
+
+    if w13_scale_pt.ndim == 4:
+        w13_sc_3d = jnp.squeeze(w13_scale_pt, axis=2)
+    else:
+        w13_sc_3d = w13_scale_pt
+    if w2_scale_pt.ndim == 4:
+        w2_sc_3d = jnp.squeeze(w2_scale_pt, axis=2)
+    else:
+        w2_sc_3d = w2_scale_pt
+
+    situ_beta, situ_linear_beta = parse_situ_activation(activation)
+
+    trays_norm = (token_trays_mode or "off").strip().lower()
+    if orig_m > FUSED_DECODE_MOE_MAX_TOKENS:
+        if orig_m > FUSED_VERIFY_MOE_MAX_TOKENS:
+            raise ValueError(
+                f"fused_decode_moe_v6e_planar_t_b11 supports at most "
+                f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {orig_m}."
+            )
+        tray_m = FUSED_VERIFY_MOE_TRAY_M
+        use_trays = True
+        padded_m = ((orig_m + tray_m - 1) // tray_m) * tray_m
+        num_trays = padded_m // tray_m
+    elif trays_norm == "off":
+        use_trays = False
+        padded_m = max(16, ((orig_m + 7) // 8) * 8)
+        tray_m = padded_m
+        num_trays = 1
+    elif trays_norm == "trays":
+        use_trays = True
+        padded_m = max(16, ((orig_m + 15) // 16) * 16)
+        tray_m = 16
+        num_trays = padded_m // tray_m
+    elif trays_norm == "trays2":
+        use_trays = True
+        padded_m = max(16, ((orig_m + 15) // 16) * 16)
+        tray_m = 32 if padded_m >= 64 else 16
+        num_trays = padded_m // tray_m
+    elif trays_norm == "trays32":
+        if orig_m <= 16:
+            use_trays = False
+            padded_m = 16
+            tray_m = 16
+            num_trays = 1
+        else:
+            use_trays = True
+            padded_m = ((orig_m + 15) // 16) * 16
+            tray_m = 16
+            num_trays = padded_m // tray_m
+    else:
+        raise ValueError(
+            f"Invalid token_trays_mode={token_trays_mode!r}; expected 'off', "
+            "'trays', 'trays2', or 'trays32'."
+        )
+    if padded_m != orig_m:
+        lhs = jnp.pad(hidden_states, ((0, padded_m - orig_m), (0, 0)))
+        topk_w = jnp.pad(topk_weights, ((0, padded_m - orig_m), (0, 0)))
+        topk_i = jnp.pad(topk_ids, ((0, padded_m - orig_m), (0, 0)), constant_values=-1)
+    else:
+        lhs = hidden_states
+        topk_w = topk_weights
+        topk_i = topk_ids
+
+    topk_w_f32 = jnp.where(
+        jnp.isfinite(topk_w), topk_w.astype(lhs.dtype).astype(jnp.float32), 0.0
     )
-  else:
-    lhs = hidden_states
-    topk_w = topk_weights
-    topk_i = topk_ids
+    row_valid = jnp.any(
+        (topk_i >= 0) & (topk_i < num_groups) & (topk_w_f32 != 0.0),
+        axis=-1,
+        keepdims=True,
+    )
+    lhs = jnp.where(row_valid & jnp.isfinite(lhs), lhs, 0)
 
-  topk_w_f32 = jnp.where(
-      jnp.isfinite(topk_w), topk_w.astype(lhs.dtype).astype(jnp.float32), 0.0
-  )
-  row_valid = jnp.any(
-      (topk_i >= 0) & (topk_i < num_groups) & (topk_w_f32 != 0.0),
-      axis=-1,
-      keepdims=True,
-  )
-  lhs = jnp.where(row_valid & jnp.isfinite(lhs), lhs, 0)
+    e_ids = jnp.arange(num_groups, dtype=jnp.int32)[:, None, None]
+    match = (topk_i[None, :, :] == e_ids) & (topk_w_f32[None, :, :] != 0.0)
+    w_em = jnp.sum(jnp.where(match, topk_w_f32[None, :, :], 0.0), axis=2)
+    active_mask = jnp.any(w_em != 0.0, axis=1)
+    num_active = jnp.sum(active_mask.astype(jnp.int32))[None]
+    active_ids = jnp.argsort(~active_mask).astype(jnp.int32)
+    w_expert = jnp.broadcast_to(w_em[:, :, None], (num_groups, padded_m, _LANES))
 
-  e_ids = jnp.arange(num_groups, dtype=jnp.int32)[:, None, None]
-  match = (topk_i[None, :, :] == e_ids) & (topk_w_f32[None, :, :] != 0.0)
-  w_em = jnp.sum(jnp.where(match, topk_w_f32[None, :, :], 0.0), axis=2)
-  active_mask = jnp.any(w_em != 0.0, axis=1)
-  num_active = jnp.sum(active_mask.astype(jnp.int32))[None]
-  active_ids = jnp.argsort(~active_mask).astype(jnp.int32)
-  w_expert = jnp.broadcast_to(w_em[:, :, None], (num_groups, padded_m, _LANES))
+    chunk = PLANAR_WINDOW
+    tn13 = PLANAR_WINDOW
+    tn2 = PLANAR_WINDOW
+    steps_13 = k // chunk
+    steps_2 = n // chunk
+    tiles_n13 = n // tn13
+    tiles_n2 = k // tn2
+    plane_rows = chunk // 2
+    scale_rows = chunk // SCALE_GROUP
+    depth_w13 = 2
+    depth_w2 = 1 if n >= 3072 else 2
 
-  chunk = PLANAR_WINDOW
-  tn13 = PLANAR_WINDOW
-  tn2 = PLANAR_WINDOW
-  steps_13 = k // chunk
-  steps_2 = n // chunk
-  tiles_n13 = n // tn13
-  tiles_n2 = k // tn2
-  plane_rows = chunk // 2
-  scale_rows = chunk // SCALE_GROUP
-  depth_w13 = 2
-  depth_w2 = 1 if n >= 3072 else 2
+    use_rank3_w13 = bool(rank3_scales and (w13_sc_3d.shape[1] % 32 == 0))
+    use_rank3_w2 = bool(rank3_scales and (w2_sc_3d.shape[1] % 32 == 0))
 
-  use_rank3_w13 = bool(rank3_scales and (w13_sc_3d.shape[1] % 32 == 0))
-  use_rank3_w2 = bool(rank3_scales and (w2_sc_3d.shape[1] % 32 == 0))
+    w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
+    w13_scales_in = (
+        w13_sc_3d
+        if use_rank3_w13
+        else w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
+    )
+    w2_packed_4d = w2_pt.reshape(num_groups, steps_2, plane_rows, k)
+    w2_scales_in = (
+        w2_sc_3d
+        if use_rank3_w2
+        else w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
+    )
+    w13_sbuf_shape = (
+        (depth_w13, w13_sc_3d.shape[1], n)
+        if use_rank3_w13
+        else (depth_w13, 2, steps_13, scale_rows, n)
+    )
+    w2_sbuf_shape = (
+        (depth_w2, w2_sc_3d.shape[1], k)
+        if use_rank3_w2
+        else (depth_w2, steps_2, scale_rows, k)
+    )
 
-  w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
-  w13_scales_in = (
-      w13_sc_3d
-      if use_rank3_w13
-      else w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
-  )
-  w2_packed_4d = w2_pt.reshape(num_groups, steps_2, plane_rows, k)
-  w2_scales_in = (
-      w2_sc_3d
-      if use_rank3_w2
-      else w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
-  )
-  w13_sbuf_shape = (
-      (depth_w13, w13_sc_3d.shape[1], n)
-      if use_rank3_w13
-      else (depth_w13, 2, steps_13, scale_rows, n)
-  )
-  w2_sbuf_shape = (
-      (depth_w2, w2_sc_3d.shape[1], k)
-      if use_rank3_w2
-      else (depth_w2, steps_2, scale_rows, k)
-  )
+    fold_chunk = _planar_t_fold_chunk(DEQUANT_PLANAR_T_B11)
+    dims = (((1,), (0,)), ((), ()))
 
-  fold_chunk = _planar_t_fold_chunk(DEQUANT_PLANAR_T_B11)
-  dims = (((1,), (0,)), ((), ()))
+    def kernel(
+        active_ids_ref,
+        nat_ref,
+        lhs_ref,
+        w_expert_ref,
+        w13_p_ref,
+        w13_s_ref,
+        w2_p_ref,
+        w2_s_ref,
+        out_ref,
+        w13_pbuf,
+        w13_sbuf,
+        w2_pbuf,
+        w2_sbuf,
+        gate_acc,
+        up_acc,
+        w2_acc,
+        h_buf,
+        out_acc,
+        w13_psem,
+        w13_ssem,
+        w2_psem,
+        w2_ssem,
+    ):
+        if use_trays:
+            for tr in range(num_trays):
+                r_sl = pl.ds(tr * tray_m, tray_m)
+                for t2_init in range(tiles_n2):
+                    out_acc[r_sl, pl.ds(t2_init * tn2, tn2)] = jnp.zeros(
+                        (tray_m, tn2), jnp.float32
+                    )
+            lhs_tile = None
+        else:
+            out_acc[...] = jnp.zeros_like(out_acc)
+            lhs_tile = lhs_ref[...]
 
-  def kernel(
-      active_ids_ref,
-      nat_ref,
-      lhs_ref,
-      w_expert_ref,
-      w13_p_ref,
-      w13_s_ref,
-      w2_p_ref,
-      w2_s_ref,
-      out_ref,
-      w13_pbuf,
-      w13_sbuf,
-      w2_pbuf,
-      w2_sbuf,
-      gate_acc,
-      up_acc,
-      w2_acc,
-      h_buf,
-      out_acc,
-      w13_psem,
-      w13_ssem,
-      w2_psem,
-      w2_ssem,
-  ):
+        def get_w13_scale(slot, gate_or_up, cs, sl):
+            if use_rank3_w13:
+                r0 = (gate_or_up * steps_13 + cs) * scale_rows
+                tile_r0 = (r0 // 32) * 32
+                sub_r0 = r0 - tile_r0
+                tile32 = w13_sbuf[slot, pl.ds(tile_r0, 32), sl]
+                return tile32[sub_r0 : sub_r0 + scale_rows, :]
+            return w13_sbuf[slot, gate_or_up, cs, :, sl]
+
+        def get_w2_scale(slot2, cs, sl2):
+            if use_rank3_w2:
+                r0 = cs * scale_rows
+                tile_r0 = (r0 // 32) * 32
+                sub_r0 = r0 - tile_r0
+                tile32 = w2_sbuf[slot2, pl.ds(tile_r0, 32), sl2]
+                return tile32[sub_r0 : sub_r0 + scale_rows, :]
+            return w2_sbuf[slot2, cs, :, sl2]
+
+        def copy_w13_expert(g, slot):
+            return (
+                pltpu.make_async_copy(
+                    w13_p_ref.at[g], w13_pbuf.at[slot], w13_psem.at[slot]
+                ),
+                pltpu.make_async_copy(
+                    w13_s_ref.at[g], w13_sbuf.at[slot], w13_ssem.at[slot]
+                ),
+            )
+
+        def copy_w2_expert(g, slot=0):
+            return (
+                pltpu.make_async_copy(
+                    w2_p_ref.at[g], w2_pbuf.at[slot], w2_psem.at[slot]
+                ),
+                pltpu.make_async_copy(
+                    w2_s_ref.at[g], w2_sbuf.at[slot], w2_ssem.at[slot]
+                ),
+            )
+
+        @pl.when(nat_ref[0] > 0)
+        def _prime_first():
+            g0 = active_ids_ref[0]
+            for c in copy_w13_expert(g0, 0):
+                c.start()
+            if depth_w2 >= 2:
+                for c2 in copy_w2_expert(g0, 0):
+                    c2.start()
+
+        def visit_expert(j, carry):
+            g = active_ids_ref[j]
+            slot = lax.rem(j, depth_w13)
+            next_slot = lax.rem(j + 1, depth_w13)
+            slot2 = lax.rem(j, depth_w2)
+            next_slot2 = lax.rem(j + 1, depth_w2)
+
+            if depth_w2 == 1:
+                for c2 in copy_w2_expert(g, 0):
+                    c2.start()
+            else:
+
+                @pl.when(j + 1 < nat_ref[0])
+                def _prefetch_next_w2():
+                    g_next = active_ids_ref[j + 1]
+                    for c2 in copy_w2_expert(g_next, next_slot2):
+                        c2.start()
+
+            @pl.when(j + 1 < nat_ref[0])
+            def _prefetch_next():
+                g_next = active_ids_ref[j + 1]
+                for c in copy_w13_expert(g_next, next_slot):
+                    c.start()
+
+            for c in copy_w13_expert(g, slot):
+                c.wait()
+
+            if use_trays:
+                for t in range(tiles_n13):
+                    sl = pl.ds(t * tn13, tn13)
+                    for tr in range(num_trays):
+                        r_sl = pl.ds(tr * tray_m, tray_m)
+                        gate_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
+                        up_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
+                    for cs in range(steps_13):
+                        k_sl = pl.ds(cs * chunk, chunk)
+                        # Hoist b11 weight unpack outside token_trays loop (1 unpack/chunk):
+                        g_codes, g_wscale = fold_chunk(
+                            w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
+                        )
+                        for tr in range(num_trays):
+                            r_sl = pl.ds(tr * tray_m, tray_m)
+                            lhs_tr = lhs_ref[r_sl, k_sl]
+                            gate_acc[r_sl, :] += (
+                                lax.dot_general(
+                                    lhs_tr,
+                                    g_codes,
+                                    dimension_numbers=dims,
+                                    preferred_element_type=jnp.float32,
+                                )
+                                * g_wscale
+                            )
+                        u_codes, u_wscale = fold_chunk(
+                            w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
+                        )
+                        for tr in range(num_trays):
+                            r_sl = pl.ds(tr * tray_m, tray_m)
+                            lhs_tr = lhs_ref[r_sl, k_sl]
+                            up_acc[r_sl, :] += (
+                                lax.dot_general(
+                                    lhs_tr,
+                                    u_codes,
+                                    dimension_numbers=dims,
+                                    preferred_element_type=jnp.float32,
+                                )
+                                * u_wscale
+                            )
+                    for tr in range(num_trays):
+                        r_sl = pl.ds(tr * tray_m, tray_m)
+                        h_buf[r_sl, sl] = _situ_f32(
+                            gate_acc[r_sl, :],
+                            up_acc[r_sl, :],
+                            beta=situ_beta,
+                            linear_beta=situ_linear_beta,
+                        ).astype(out_dtype)
+
+                for c2 in copy_w2_expert(g, slot2):
+                    c2.wait()
+
+                for t2 in range(tiles_n2):
+                    sl2 = pl.ds(t2 * tn2, tn2)
+                    for tr in range(num_trays):
+                        w2_acc[pl.ds(tr * tray_m, tray_m), :] = jnp.zeros(
+                            (tray_m, tn2), jnp.float32
+                        )
+                    for cs in range(steps_2):
+                        n_sl = pl.ds(cs * chunk, chunk)
+                        # Hoist w2 b11 weight unpack outside token_trays loop (1 unpack/chunk):
+                        codes2, wscale2 = fold_chunk(
+                            w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
+                        )
+                        for tr in range(num_trays):
+                            r_sl = pl.ds(tr * tray_m, tray_m)
+                            h_tr = h_buf[r_sl, n_sl]
+                            w2_acc[r_sl, :] += (
+                                lax.dot_general(
+                                    h_tr,
+                                    codes2,
+                                    dimension_numbers=dims,
+                                    preferred_element_type=jnp.float32,
+                                )
+                                * wscale2
+                            )
+                    for tr in range(num_trays):
+                        r_sl = pl.ds(tr * tray_m, tray_m)
+                        down_bf16 = (
+                            w2_acc[r_sl, :].astype(out_dtype).astype(jnp.float32)
+                        )
+                        w_g_tr = jnp.tile(w_expert_ref[g, r_sl, :], (1, tn2 // _LANES))
+                        out_acc[r_sl, sl2] += down_bf16 * w_g_tr
+            else:
+                w_g = w_expert_ref[g]
+                for t in range(tiles_n13):
+                    sl = pl.ds(t * tn13, tn13)
+                    gate_acc[...] = jnp.zeros_like(gate_acc)
+                    up_acc[...] = jnp.zeros_like(up_acc)
+                    for cs in range(steps_13):
+                        lhs_chunk = lhs_tile[:, cs * chunk : (cs + 1) * chunk]
+                        g_codes, g_wscale = fold_chunk(
+                            w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
+                        )
+                        gate_acc[...] += (
+                            lax.dot_general(
+                                lhs_chunk,
+                                g_codes,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * g_wscale
+                        )
+                        u_codes, u_wscale = fold_chunk(
+                            w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
+                        )
+                        up_acc[...] += (
+                            lax.dot_general(
+                                lhs_chunk,
+                                u_codes,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * u_wscale
+                        )
+                    h_tile = _situ_f32(
+                        gate_acc[...],
+                        up_acc[...],
+                        beta=situ_beta,
+                        linear_beta=situ_linear_beta,
+                    ).astype(out_dtype)
+                    h_buf[:, sl] = h_tile
+
+                for c2 in copy_w2_expert(g, slot2):
+                    c2.wait()
+
+                h_full = h_buf[...]
+                w_g_tile = jnp.tile(w_g, (1, tn2 // _LANES))
+                for t2 in range(tiles_n2):
+                    sl2 = pl.ds(t2 * tn2, tn2)
+                    w2_acc[...] = jnp.zeros_like(w2_acc)
+                    for cs in range(steps_2):
+                        h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
+                        codes2, wscale2 = fold_chunk(
+                            w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
+                        )
+                        w2_acc[...] += (
+                            lax.dot_general(
+                                h_chunk,
+                                codes2,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * wscale2
+                        )
+                    down_bf16 = w2_acc[...].astype(out_dtype).astype(jnp.float32)
+                    out_acc[:, sl2] += down_bf16 * w_g_tile
+
+            return carry
+
+        lax.fori_loop(0, nat_ref[0], visit_expert, 0)
+        if use_trays:
+            for tr in range(num_trays):
+                r_sl = pl.ds(tr * tray_m, tray_m)
+                for t2_ep in range(tiles_n2):
+                    sl2_ep = pl.ds(t2_ep * tn2, tn2)
+                    out_ref[r_sl, sl2_ep] = out_acc[r_sl, sl2_ep].astype(out_dtype)
+        else:
+            out_ref[...] = out_acc[...].astype(out_dtype)
+
+    scratch_shapes = [
+        pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
+        pltpu.VMEM(w13_sbuf_shape, jnp.uint8),
+        pltpu.VMEM((depth_w2, steps_2, plane_rows, k), jnp.uint8),
+        pltpu.VMEM(w2_sbuf_shape, jnp.uint8),
+        pltpu.VMEM((padded_m, tn13), jnp.float32),
+        pltpu.VMEM((padded_m, tn13), jnp.float32),
+        pltpu.VMEM((padded_m, tn2), jnp.float32),
+        pltpu.VMEM((padded_m, n), out_dtype),
+        pltpu.VMEM((padded_m, k), jnp.float32),
+        pltpu.SemaphoreType.DMA((depth_w13,)),
+        pltpu.SemaphoreType.DMA((depth_w13,)),
+        pltpu.SemaphoreType.DMA((depth_w2,)),
+        pltpu.SemaphoreType.DMA((depth_w2,)),
+    ]
+
+    compiler_params = pltpu.CompilerParams(
+        vmem_limit_bytes=_FUSED_DECODE_MOE_VMEM_LIMIT
+    )
+
+    kname = f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}"
     if use_trays:
-      for tr in range(num_trays):
-        r_sl = pl.ds(tr * tray_m, tray_m)
-        for t2_init in range(tiles_n2):
-          out_acc[r_sl, pl.ds(t2_init * tn2, tn2)] = jnp.zeros(
-              (tray_m, tn2), jnp.float32
-          )
-      lhs_tile = None
-    else:
-      out_acc[...] = jnp.zeros_like(out_acc)
-      lhs_tile = lhs_ref[...]
+        kname += f"_trays{num_trays}x{tray_m}"
+    if use_rank3_w13 or use_rank3_w2:
+        kname += "_s3d"
 
-    def get_w13_scale(slot, gate_or_up, cs, sl):
-      if use_rank3_w13:
-        r0 = (gate_or_up * steps_13 + cs) * scale_rows
-        tile_r0 = (r0 // 32) * 32
-        sub_r0 = r0 - tile_r0
-        tile32 = w13_sbuf[slot, pl.ds(tile_r0, 32), sl]
-        return tile32[sub_r0 : sub_r0 + scale_rows, :]
-      return w13_sbuf[slot, gate_or_up, cs, :, sl]
-
-    def get_w2_scale(slot2, cs, sl2):
-      if use_rank3_w2:
-        r0 = cs * scale_rows
-        tile_r0 = (r0 // 32) * 32
-        sub_r0 = r0 - tile_r0
-        tile32 = w2_sbuf[slot2, pl.ds(tile_r0, 32), sl2]
-        return tile32[sub_r0 : sub_r0 + scale_rows, :]
-      return w2_sbuf[slot2, cs, :, sl2]
-
-    def copy_w13_expert(g, slot):
-      return (
-          pltpu.make_async_copy(
-              w13_p_ref.at[g], w13_pbuf.at[slot], w13_psem.at[slot]
-          ),
-          pltpu.make_async_copy(
-              w13_s_ref.at[g], w13_sbuf.at[slot], w13_ssem.at[slot]
-          ),
-      )
-
-    def copy_w2_expert(g, slot=0):
-      return (
-          pltpu.make_async_copy(
-              w2_p_ref.at[g], w2_pbuf.at[slot], w2_psem.at[slot]
-          ),
-          pltpu.make_async_copy(
-              w2_s_ref.at[g], w2_sbuf.at[slot], w2_ssem.at[slot]
-          ),
-      )
-
-    @pl.when(nat_ref[0] > 0)
-    def _prime_first():
-      g0 = active_ids_ref[0]
-      for c in copy_w13_expert(g0, 0):
-        c.start()
-      if depth_w2 >= 2:
-        for c2 in copy_w2_expert(g0, 0):
-          c2.start()
-
-    def visit_expert(j, carry):
-      g = active_ids_ref[j]
-      slot = lax.rem(j, depth_w13)
-      next_slot = lax.rem(j + 1, depth_w13)
-      slot2 = lax.rem(j, depth_w2)
-      next_slot2 = lax.rem(j + 1, depth_w2)
-
-      if depth_w2 == 1:
-        for c2 in copy_w2_expert(g, 0):
-          c2.start()
-      else:
-        @pl.when(j + 1 < nat_ref[0])
-        def _prefetch_next_w2():
-          g_next = active_ids_ref[j + 1]
-          for c2 in copy_w2_expert(g_next, next_slot2):
-            c2.start()
-
-      @pl.when(j + 1 < nat_ref[0])
-      def _prefetch_next():
-        g_next = active_ids_ref[j + 1]
-        for c in copy_w13_expert(g_next, next_slot):
-          c.start()
-
-      for c in copy_w13_expert(g, slot):
-        c.wait()
-
-      if use_trays:
-        for t in range(tiles_n13):
-          sl = pl.ds(t * tn13, tn13)
-          for tr in range(num_trays):
-            r_sl = pl.ds(tr * tray_m, tray_m)
-            gate_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
-            up_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
-          for cs in range(steps_13):
-            k_sl = pl.ds(cs * chunk, chunk)
-            # Hoist b11 weight unpack outside token_trays loop (1 unpack/chunk):
-            g_codes, g_wscale = fold_chunk(
-                w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
-            )
-            for tr in range(num_trays):
-              r_sl = pl.ds(tr * tray_m, tray_m)
-              lhs_tr = lhs_ref[r_sl, k_sl]
-              gate_acc[r_sl, :] += (
-                  lax.dot_general(
-                      lhs_tr,
-                      g_codes,
-                      dimension_numbers=dims,
-                      preferred_element_type=jnp.float32,
-                  )
-                  * g_wscale
-              )
-            u_codes, u_wscale = fold_chunk(
-                w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
-            )
-            for tr in range(num_trays):
-              r_sl = pl.ds(tr * tray_m, tray_m)
-              lhs_tr = lhs_ref[r_sl, k_sl]
-              up_acc[r_sl, :] += (
-                  lax.dot_general(
-                      lhs_tr,
-                      u_codes,
-                      dimension_numbers=dims,
-                      preferred_element_type=jnp.float32,
-                  )
-                  * u_wscale
-              )
-          for tr in range(num_trays):
-            r_sl = pl.ds(tr * tray_m, tray_m)
-            h_buf[r_sl, sl] = _situ_f32(
-                gate_acc[r_sl, :],
-                up_acc[r_sl, :],
-                beta=situ_beta,
-                linear_beta=situ_linear_beta,
-            ).astype(out_dtype)
-
-        for c2 in copy_w2_expert(g, slot2):
-          c2.wait()
-
-        for t2 in range(tiles_n2):
-          sl2 = pl.ds(t2 * tn2, tn2)
-          for tr in range(num_trays):
-            w2_acc[pl.ds(tr * tray_m, tray_m), :] = jnp.zeros(
-                (tray_m, tn2), jnp.float32
-            )
-          for cs in range(steps_2):
-            n_sl = pl.ds(cs * chunk, chunk)
-            # Hoist w2 b11 weight unpack outside token_trays loop (1 unpack/chunk):
-            codes2, wscale2 = fold_chunk(
-                w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
-            )
-            for tr in range(num_trays):
-              r_sl = pl.ds(tr * tray_m, tray_m)
-              h_tr = h_buf[r_sl, n_sl]
-              w2_acc[r_sl, :] += (
-                  lax.dot_general(
-                      h_tr,
-                      codes2,
-                      dimension_numbers=dims,
-                      preferred_element_type=jnp.float32,
-                  )
-                  * wscale2
-              )
-          for tr in range(num_trays):
-            r_sl = pl.ds(tr * tray_m, tray_m)
-            down_bf16 = w2_acc[r_sl, :].astype(out_dtype).astype(jnp.float32)
-            w_g_tr = jnp.tile(w_expert_ref[g, r_sl, :], (1, tn2 // _LANES))
-            out_acc[r_sl, sl2] += down_bf16 * w_g_tr
-      else:
-        w_g = w_expert_ref[g]
-        for t in range(tiles_n13):
-          sl = pl.ds(t * tn13, tn13)
-          gate_acc[...] = jnp.zeros_like(gate_acc)
-          up_acc[...] = jnp.zeros_like(up_acc)
-          for cs in range(steps_13):
-            lhs_chunk = lhs_tile[:, cs * chunk : (cs + 1) * chunk]
-            g_codes, g_wscale = fold_chunk(
-                w13_pbuf[slot, 0, cs, :, sl], get_w13_scale(slot, 0, cs, sl)
-            )
-            gate_acc[...] += (
-                lax.dot_general(
-                    lhs_chunk,
-                    g_codes,
-                    dimension_numbers=dims,
-                    preferred_element_type=jnp.float32,
-                )
-                * g_wscale
-            )
-            u_codes, u_wscale = fold_chunk(
-                w13_pbuf[slot, 1, cs, :, sl], get_w13_scale(slot, 1, cs, sl)
-            )
-            up_acc[...] += (
-                lax.dot_general(
-                    lhs_chunk,
-                    u_codes,
-                    dimension_numbers=dims,
-                    preferred_element_type=jnp.float32,
-                )
-                * u_wscale
-            )
-          h_tile = _situ_f32(
-              gate_acc[...],
-              up_acc[...],
-              beta=situ_beta,
-              linear_beta=situ_linear_beta,
-          ).astype(out_dtype)
-          h_buf[:, sl] = h_tile
-
-        for c2 in copy_w2_expert(g, slot2):
-          c2.wait()
-
-        h_full = h_buf[...]
-        w_g_tile = jnp.tile(w_g, (1, tn2 // _LANES))
-        for t2 in range(tiles_n2):
-          sl2 = pl.ds(t2 * tn2, tn2)
-          w2_acc[...] = jnp.zeros_like(w2_acc)
-          for cs in range(steps_2):
-            h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
-            codes2, wscale2 = fold_chunk(
-                w2_pbuf[slot2, cs, :, sl2], get_w2_scale(slot2, cs, sl2)
-            )
-            w2_acc[...] += (
-                lax.dot_general(
-                    h_chunk,
-                    codes2,
-                    dimension_numbers=dims,
-                    preferred_element_type=jnp.float32,
-                )
-                * wscale2
-            )
-          down_bf16 = w2_acc[...].astype(out_dtype).astype(jnp.float32)
-          out_acc[:, sl2] += down_bf16 * w_g_tile
-
-      return carry
-
-    lax.fori_loop(0, nat_ref[0], visit_expert, 0)
-    if use_trays:
-      for tr in range(num_trays):
-        r_sl = pl.ds(tr * tray_m, tray_m)
-        for t2_ep in range(tiles_n2):
-          sl2_ep = pl.ds(t2_ep * tn2, tn2)
-          out_ref[r_sl, sl2_ep] = out_acc[r_sl, sl2_ep].astype(out_dtype)
-    else:
-      out_ref[...] = out_acc[...].astype(out_dtype)
-
-  scratch_shapes = [
-      pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
-      pltpu.VMEM(w13_sbuf_shape, jnp.uint8),
-      pltpu.VMEM((depth_w2, steps_2, plane_rows, k), jnp.uint8),
-      pltpu.VMEM(w2_sbuf_shape, jnp.uint8),
-      pltpu.VMEM((padded_m, tn13), jnp.float32),
-      pltpu.VMEM((padded_m, tn13), jnp.float32),
-      pltpu.VMEM((padded_m, tn2), jnp.float32),
-      pltpu.VMEM((padded_m, n), out_dtype),
-      pltpu.VMEM((padded_m, k), jnp.float32),
-      pltpu.SemaphoreType.DMA((depth_w13,)),
-      pltpu.SemaphoreType.DMA((depth_w13,)),
-      pltpu.SemaphoreType.DMA((depth_w2,)),
-      pltpu.SemaphoreType.DMA((depth_w2,)),
-  ]
-
-  compiler_params = pltpu.CompilerParams(
-      vmem_limit_bytes=_FUSED_DECODE_MOE_VMEM_LIMIT
-  )
-
-  kname = f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}"
-  if use_trays:
-    kname += f"_trays{num_trays}x{tray_m}"
-  if use_rank3_w13 or use_rank3_w2:
-    kname += "_s3d"
-
-  out = pl.pallas_call(
-      kernel,
-      grid=(),
-      in_specs=[
-          pl.BlockSpec(memory_space=pltpu.SMEM),
-          pl.BlockSpec(memory_space=pltpu.SMEM),
-          pl.BlockSpec(memory_space=pltpu.VMEM),
-          pl.BlockSpec(memory_space=pltpu.VMEM),
-          pl.BlockSpec(memory_space=pl.ANY),
-          pl.BlockSpec(memory_space=pl.ANY),
-          pl.BlockSpec(memory_space=pl.ANY),
-          pl.BlockSpec(memory_space=pl.ANY),
-      ],
-      out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
-      out_shape=jax.ShapeDtypeStruct((padded_m, k), out_dtype),
-      scratch_shapes=scratch_shapes,
-      compiler_params=compiler_params,
-      name=kname,
-  )(
-      active_ids,
-      num_active,
-      lhs,
-      w_expert,
-      w13_packed_5d,
-      w13_scales_in,
-      w2_packed_4d,
-      w2_scales_in,
-  )
-  return out[:orig_m]
-
+    out = pl.pallas_call(
+        kernel,
+        grid=(),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+        out_shape=jax.ShapeDtypeStruct((padded_m, k), out_dtype),
+        scratch_shapes=scratch_shapes,
+        compiler_params=compiler_params,
+        name=kname,
+    )(
+        active_ids,
+        num_active,
+        lhs,
+        w_expert,
+        w13_packed_5d,
+        w13_scales_in,
+        w2_packed_4d,
+        w2_scales_in,
+    )
+    return out[:orig_m]

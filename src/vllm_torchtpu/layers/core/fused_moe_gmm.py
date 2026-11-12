@@ -637,9 +637,7 @@ def fused_moe_func(
     resolved_trays = (
         active_trays_mode() if token_trays_mode is None else token_trays_mode
     )
-    resolved_rank3 = (
-        use_copy_opt() if rank3_scales is None else bool(rank3_scales)
-    )
+    resolved_rank3 = use_copy_opt() if rank3_scales is None else bool(rank3_scales)
     return _fused_moe_func_jitted(
         hidden_states,
         w1,
