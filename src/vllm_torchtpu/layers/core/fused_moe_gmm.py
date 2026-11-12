@@ -449,6 +449,7 @@ def moe_gmm(
     if is_planar_t_b11_layout(w1, w1_scale, rhs_quant_dtype=rhs_quant_dtype):
         # No other kernel can read the planar_t layout, so unsupported
         # operands must fail here rather than fall back.
+        assert w1_scale is not None and w2_scale is not None
         if w1_bias is not None or w2_bias is not None:
             raise NotImplementedError(
                 "The planar_t MXFP4 MoE kernel does not support expert biases."
@@ -708,6 +709,7 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
         max_tokens=fused_decode_max_tokens,
     ):
+        assert w1_scale is not None and w2_scale is not None
         logger.info_once(
             "Selected fused single-kernel decode MoE (planar_t_b11): tokens=%d",
             num_tokens,

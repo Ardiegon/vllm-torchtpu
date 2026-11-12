@@ -26,6 +26,10 @@ class HostUploadKeepalive:
     transfer has read it. That corrupted e.g. `logits_indices` on one TP rank
     in ~2% of prefills.
 
+    TODO: delete this class and upload directly once torch_tpu keeps the
+    source of a non-blocking host-to-device copy alive until the transfer
+    completes.
+
     Each uploaded tensor goes through three states: pending (uploaded, no
     fence recorded after it yet), fenced (a fence covering the upload has
     been recorded) and released (that fence has been waited on).
