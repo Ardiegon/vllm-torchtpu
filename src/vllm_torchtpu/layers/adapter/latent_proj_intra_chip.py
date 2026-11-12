@@ -181,7 +181,7 @@ def make_latent_projection(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> ReplicatedLinear | IntraChipColumnParallelLinear:
-    """The intra-chip or TP-sharded projection when it applies, else the replicated one."""
+    """Return a sharded projection if a shard group applies, else a replicated one."""
     group = shard_group_or_none(output_size)
     if group is None:
         group = tp_shard_group_or_none(output_size)
@@ -198,8 +198,7 @@ def make_latent_projection(
     # message, so naming the layer would emit 184 near-identical lines per rank
     # instead of one per distinct projection.
     logger.info_once(
-        "Latent MoE projection [%d, %d] sharded across %d ranks "
-        "(%d columns each).",
+        "Latent MoE projection [%d, %d] sharded across %d ranks (%d columns each).",
         output_size,
         input_size,
         group.world_size,
