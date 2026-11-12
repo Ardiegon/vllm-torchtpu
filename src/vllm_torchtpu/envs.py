@@ -198,7 +198,6 @@ if TYPE_CHECKING:
     TPU_KIMI_OPT_2D_EP_MESH: bool = False
     TPU_KIMI_OPT_PACKED_DP_AG: bool = False
     TPU_KIMI_OPT_LATENCY_COLLECTIVES: bool = False
-    TPU_KIMI_OPT_WORLD_LATENT_AG: bool = False
     TPU_KIMI_OPT_LATENCY_TP_PSUM: str = "off"
     TPU_KIMI_OPT_XLA_OVERLAP: str = "off"
     TPU_KIMI_OPT_SC_OFFLOAD: str = "off"
@@ -1172,9 +1171,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KIMI_OPT_LATENCY_COLLECTIVES": env_bool(
         "TPU_KIMI_OPT_LATENCY_COLLECTIVES", False
     ),
-    # Optional flat world = dp * tp 1-shot latency_all_gather_rows (cid=1) for
-    # A/B comparison against the 2-stage (tp latent AG -> pack -> dp AG) dispatch.
-    "TPU_KIMI_OPT_WORLD_LATENT_AG": env_bool("TPU_KIMI_OPT_WORLD_LATENT_AG", False),
     # Wire 1-shot deterministic Pallas latency_psum (cid=3, 4, 5) into Kimi K3
     # row-parallel TP exits ("off", "tp16"/"auto", "routed_only", "all", or an
     # integer max_dma_tokens threshold string such as "8").
