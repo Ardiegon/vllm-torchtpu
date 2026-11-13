@@ -18,10 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.kimi_k3.attention_residual import (
-    attention_residual,
-    attention_residual_bt,
-)
+from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual_bt
 
 
 def _float64_reference(prefix, history, weight) -> np.ndarray:
@@ -46,23 +43,10 @@ def _inputs(tokens: int, blocks: int, hidden: int = 128):
     return prefix, history, weight
 
 
-@pytest.mark.parametrize("blocks", [0, 1, 2, 4, 8])
-def test_fused_mix_matches_float64(blocks):
-    prefix, history, weight = _inputs(16, blocks)
-    actual = jax.jit(attention_residual, static_argnames=("interpret",))(
-        prefix, history, weight, interpret=True
-    )
-    np.testing.assert_allclose(
-        np.asarray(actual, np.float32),
-        _float64_reference(prefix, history, weight),
-        rtol=0.005,
-        atol=0.005,
-    )
-
-
 # 128 and 256 tokens exercise the 128-token tile (blocks < 6) and the
-# 64-token tile (blocks >= 6); 16 tokens the smallest tile.
-@pytest.mark.parametrize("tokens", [16, 128, 256])
+# 64-token tile (blocks >= 6); 48 exercises the non-power-of-two fallback to
+# 16-token tiles; 16 exercises the smallest tile directly.
+@pytest.mark.parametrize("tokens", [16, 48, 128, 256])
 @pytest.mark.parametrize("blocks", [0, 1, 2, 4, 6, 8])
 def test_fused_mix_blocks_first_matches_float64(tokens, blocks):
     prefix, history, weight = _inputs(tokens, blocks)

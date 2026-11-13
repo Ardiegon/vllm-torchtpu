@@ -176,9 +176,7 @@ class KimiDecoderLayer(nn.Module):
         assert block_residuals is not None
         prefix_sum = hidden_states
         if block_residuals.shape[0] > 0:
-            hidden_states = self.self_attention_res(
-                prefix_sum, block_residuals, blocks_first=True
-            )
+            hidden_states = self.self_attention_res(prefix_sum, block_residuals)
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residuals = torch.cat(
                 (block_residuals, prefix_sum.unsqueeze(0)), dim=0
@@ -190,7 +188,7 @@ class KimiDecoderLayer(nn.Module):
             positions, hidden_states, sequence_parallel=sequence_parallel
         )
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
-        hidden_states = self.mlp_res(prefix_sum, block_residuals, blocks_first=True)
+        hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
@@ -308,9 +306,7 @@ class KimiModel(nn.Module):
                 aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
-            hidden_states = self.output_attn_res(
-                hidden_states, block_residuals, blocks_first=True
-            )
+            hidden_states = self.output_attn_res(hidden_states, block_residuals)
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
             hidden_states = self.sp_group.all_gather(hidden_states, dim=0)

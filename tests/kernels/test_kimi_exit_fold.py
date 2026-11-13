@@ -16,6 +16,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -79,55 +80,137 @@ def test_jax_rms_norm_matches_float_reference():
     )
 
 
-def test_hierarchical_combine_single_rank_is_rms_norm():
-    mesh = _one_device_mesh()
-    moe_out = jax.random.normal(jax.random.key(2), (4, 32), jnp.float32).astype(
+@pytest.mark.parametrize(
+    ("act_kind", "linear_beta"),
+    [("situ", 25.0), ("situ", None), ("silu", None)],
+)
+def test_compute_shared_gu_and_act_matches_reference(act_kind, linear_beta):
+    hidden = jax.random.normal(jax.random.key(3), (5, 16), jnp.float32).astype(
         jnp.bfloat16
     )
-    norm_w = jnp.linspace(0.5, 1.5, 32, dtype=jnp.float32).astype(jnp.bfloat16)
-    tp_rank = jnp.zeros((1, 1), jnp.int32)
+    w_gu = jax.random.normal(jax.random.key(4), (16, 12), jnp.float32).astype(
+        jnp.bfloat16
+    )
+    got = exit_fold.compute_shared_gu_and_act(
+        hidden,
+        w_gu,
+        act_kind=act_kind,
+        situ_beta=4.0,
+        situ_linear_beta=linear_beta,
+    )
+    assert got.shape == (5, 6)
+    assert got.dtype == jnp.bfloat16
+    gate, up = jnp.split(jnp.matmul(hidden, w_gu), 2, axis=-1)
+    gf = gate.astype(jnp.float32)
+    if act_kind == "situ":
+        gate_act = (4.0 * jnp.tanh(gf / 4.0) * jax.nn.sigmoid(gf)).astype(jnp.bfloat16)
+        up_act = (
+            (linear_beta * jnp.tanh(up.astype(jnp.float32) / linear_beta)).astype(
+                jnp.bfloat16
+            )
+            if linear_beta is not None
+            else up
+        )
+    else:
+        gate_act = jax.nn.silu(gf).astype(jnp.bfloat16)
+        up_act = up
+    ref = (gate_act * up_act).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
-    def local(m, nw, r):
-        return exit_fold.hierarchical_combine_rms_slice(
-            m,
-            nw,
-            r,
+
+@pytest.mark.parametrize(
+    ("dp_size", "tp_size"),
+    [(1, 4), (4, 1), (1, 1)],
+)
+def test_hierarchical_combine_rejects_single_rank_axis(dp_size, tp_size):
+    moe_out = jnp.zeros((4, 32), jnp.bfloat16)
+    norm_w = jnp.ones((32,), jnp.bfloat16)
+    tp_rank = jnp.zeros((1, 1), jnp.int32)
+    with pytest.raises(AssertionError):
+        exit_fold.hierarchical_combine_rms_slice(
+            moe_out,
+            norm_w,
+            tp_rank,
             dp_axis_name="dp",
             tp_axis_name="tp",
-            dp_size=1,
-            tp_size=1,
+            dp_size=dp_size,
+            tp_size=tp_size,
             latent_dim=32,
             use_norm=True,
             rms_eps=1e-6,
+            max_dma_tokens=64,
         )
 
-    out = jax.shard_map(
-        local,
-        mesh=mesh,
-        in_specs=(P(None, None), P(None), P("dp", "tp")),
-        out_specs=P(None, None),
-        check_vma=False,
-    )(moe_out, norm_w, tp_rank)
-    np.testing.assert_array_equal(
-        np.asarray(out), np.asarray(exit_fold._jax_rms_norm(moe_out, norm_w, 1e-6))
-    )
 
-
-def test_async_dispatch_single_rank_is_identity():
+def test_async_dispatch_start_rejects_single_rank_axis():
     mesh = _one_device_mesh()
-    x = jnp.arange(4 * 200, dtype=jnp.float32).reshape(4, 200).astype(jnp.bfloat16)
+    x = jnp.zeros((4, 32), jnp.bfloat16)
 
     def local(a):
-        state, tok = exit_fold.async_ep_dispatch_start(a, "tp")
-        return exit_fold.async_ep_dispatch_wait(
-            state, tok, "tp", rows=4, orig_lanes=200
+        return exit_fold.async_ep_dispatch_start(
+            a, "tp", collective_id=exit_fold.COLLECTIVE_ID_MOE_DP_DISPATCH_AG
         )
 
-    y = jax.shard_map(
-        local,
-        mesh=mesh,
-        in_specs=P(None, None),
-        out_specs=P(None, None, None),
-        check_vma=False,
-    )(x)
-    np.testing.assert_array_equal(np.asarray(y[0]), np.asarray(x))
+    with pytest.raises(AssertionError, match="one rank"):
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=P(None, None),
+            out_specs=P(None, None),
+            check_vma=False,
+        )(x)
+
+
+@pytest.mark.parametrize("above_dma_cap", [True, False])
+def test_hierarchical_combine_rms_slice_matches_multi_rank_reference(
+    monkeypatch, above_dma_cap
+):
+    """Verify both the XLA prefill branch and the guarded DMA branch."""
+    dp_size, tp_size, b_dp, latent_dim = 2, 2, 4, 32
+    partials = jax.random.normal(
+        jax.random.key(5), (dp_size, tp_size, dp_size * b_dp, latent_dim), jnp.float32
+    ).astype(jnp.bfloat16)
+    norm_w = jnp.linspace(0.5, 1.5, latent_dim, dtype=jnp.float32).astype(jnp.bfloat16)
+    max_dma_tokens = 2 if above_dma_cap else 64
+
+    for dp_r in range(dp_size):
+        row_sum = jnp.sum(partials[:, :, dp_r * b_dp : (dp_r + 1) * b_dp], axis=0)
+        full_sum = jnp.sum(row_sum, axis=0)
+        normed = exit_fold._jax_rms_norm(full_sum, norm_w, 1e-6)
+        if above_dma_cap:
+            monkeypatch.setattr(
+                exit_fold.lax,
+                "psum_scatter",
+                lambda x, *a, _r=row_sum, **k: _r[0],
+            )
+            monkeypatch.setattr(
+                exit_fold.lax, "psum", lambda x, *a, _f=full_sum, **k: _f
+            )
+        else:
+            monkeypatch.setattr(
+                exit_fold,
+                "guarded_psum_scatter_rows",
+                lambda x, *a, _r=row_sum, **k: _r[0],
+            )
+            monkeypatch.setattr(
+                exit_fold, "guarded_psum", lambda x, *a, _f=full_sum, **k: _f
+            )
+        for tp_r in range(tp_size):
+            got = exit_fold.hierarchical_combine_rms_slice(
+                partials[dp_r, tp_r],
+                norm_w,
+                jnp.array([[tp_r]], jnp.int32),
+                dp_axis_name="dp",
+                tp_axis_name="tp",
+                dp_size=dp_size,
+                tp_size=tp_size,
+                latent_dim=latent_dim,
+                use_norm=True,
+                rms_eps=1e-6,
+                max_dma_tokens=max_dma_tokens,
+            )
+            expected = normed[
+                :,
+                tp_r * (latent_dim // tp_size) : (tp_r + 1) * (latent_dim // tp_size),
+            ]
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))

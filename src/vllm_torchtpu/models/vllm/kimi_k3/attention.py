@@ -72,8 +72,10 @@ from .collective_ops import FusedPrefillCollectives
 
 logger = init_logger(__name__)
 
-# Extra SparseCore-aligned row tile retained above max_model_len for draft blocks.
-_ROPE_DRAFT_ROW_MARGIN = 128
+# Row alignment applied when trimming the shared RoPE cos/sin table to the
+# served sequence length (+ any speculative draft window) so SparseCore gathers
+# stay lane-tile aligned without materializing unused positions.
+_ROPE_ROW_ALIGN = 128
 
 
 def kda_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
@@ -344,10 +346,9 @@ class MultiHeadLatentAttention(nn.Module):
                     else "deepseek_llama_scaling"
                 )
             if rope_parameters["rope_type"] == "deepseek_yarn":
-                # DeepSeek-style YaRN also rescales the attention logits by
-                # mscale(factor, mscale_all_dim)^2 (upstream vLLM K3 MLA and
-                # DeepseekV2 do the same); the Inferact K3 DSpark draft uses
-                # factor 32, mscale_all_dim 1 -> scale *= 1.3466^2.
+                # DeepSeek-style YaRN rescales the attention logits by
+                # mscale(factor, mscale_all_dim)^2 (matching upstream vLLM
+                # K3 MLA and DeepseekV2).
                 factor = float(rope_parameters["factor"])
                 mscale_all_dim = float(rope_parameters.get("mscale_all_dim", 0) or 0)
                 mscale = float(yarn_get_mscale(factor, mscale_all_dim))
@@ -359,16 +360,20 @@ class MultiHeadLatentAttention(nn.Module):
                 is_neox_style=False,
                 dtype=torch.float32,
             )
-            # YaRN builds the cos/sin table for original_max * factor (1 M
-            # positions for the K3 DSpark draft, 256 MiB f32) and every call
-            # re-formats the whole table on the SparseCore (~0.35 ms per
-            # draft program on v6e). Positions never exceed the served model
-            # length (+ the draft block), so keep only those rows; each row
-            # depends on its position alone, so the values are unchanged.
-            # get_rope caches one shared instance across all draft MLA layers,
-            # so slicing its buffer once keeps a single graph input.
+            # YaRN builds the cos/sin table for `original_max * factor`, while
+            # positions never exceed `max_model_len` plus any speculative draft
+            # block. Each row depends on its position alone, and `get_rope`
+            # caches one shared instance across layers, so trimming once to a
+            # tile-aligned bound keeps a single compact graph input.
+            spec_cfg = vllm_config.speculative_config
+            draft_rows = (
+                int(spec_cfg.num_speculative_tokens) + 1 if spec_cfg is not None else 0
+            )
+            min_rows = int(vllm_config.model_config.max_model_len) + max(
+                draft_rows, _ROPE_ROW_ALIGN
+            )
             max_rows = (
-                int(vllm_config.model_config.max_model_len) + _ROPE_DRAFT_ROW_MARGIN
+                (min_rows + _ROPE_ROW_ALIGN - 1) // _ROPE_ROW_ALIGN * _ROPE_ROW_ALIGN
             )
             assert rotary_emb is not None
             cache = rotary_emb.cos_sin_cache
@@ -647,6 +652,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         self.pooled_kda_verify_op = None
         self.pooled_kda_commit_op = None
+        self.verify_cache_qkv: torch.Tensor | None
+        self.verify_cache_gate: torch.Tensor | None
+        self.verify_cache_beta: torch.Tensor | None
         if self.defers_spec_state_commit:
             self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
                 build_pooled_kda_verify_commit_ops(
@@ -661,6 +669,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 self.num_spec_tokens + 1
             )
             act_dtype = vllm_config.model_config.dtype
+            assert isinstance(act_dtype, torch.dtype)
             for name, width in (
                 ("verify_cache_qkv", 3 * self.local_projection_size),
                 ("verify_cache_gate", self.local_projection_size),
@@ -671,6 +680,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                     torch.zeros(cache_rows, width, dtype=act_dtype),
                     persistent=False,
                 )
+        else:
+            for name in ("verify_cache_qkv", "verify_cache_gate", "verify_cache_beta"):
+                self.register_buffer(name, None, persistent=False)
 
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -732,18 +744,16 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self._pack_prefill_projection()
 
     def _pack_prefill_projection(self) -> None:
-        """Cache BF16 KDA input weights after the normal checkpoint loaders."""
+        """Concatenate the three BF16 KDA input projections and free the originals."""
         self.packed_prefill_weight = None
-        if not (
-            self.use_full_rank_gate and self.num_heads > 0 and self.head_dim == 128
-        ):
+        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
+        if not (self.use_full_rank_gate and self.head_dim == num_lanes):
             return
         if self.g_proj is None or self.f_a_proj is None:
             return
         local_proj = self.local_projection_size
         qkv_cols = 3 * local_proj
         # The beta columns are padded up to a lane tile boundary.
-        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
         beta_pad_cols = (self.num_heads + num_lanes - 1) // num_lanes * num_lanes
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
         expected = (
@@ -991,8 +1001,13 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         as that many sequential 1-token decode steps would.
         """
         assert self.defers_spec_state_commit and self.pooled_kda_commit_op is not None
+        assert self.verify_cache_qkv is not None
+        assert self.verify_cache_gate is not None
+        assert self.verify_cache_beta is not None
         if self.kv_cache is None or len(self.kv_cache) != 1:
-            raise RuntimeError("Speculative KDA commit requires the unified KV pool")
+            raise NotImplementedError(
+                "Speculative KDA commit requires the unified KV pool"
+            )
         self.pooled_kda_commit_op(
             self.kv_cache[0],
             self.verify_cache_qkv,

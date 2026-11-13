@@ -46,7 +46,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.collectives.one_shot_dma import (
-    DEFAULT_MAX_DMA_TOKENS,
+    DMA_LATENCY_METADATA,
     barrier_and_allocate,
     call_kernel,
     guarded_psum,
@@ -71,7 +71,9 @@ COLLECTIVE_ID_MOE_TP_ROUTED_PSUM = 3
 
 # The one-shot TP psum serves at most this many rows summed over the TP axis,
 # and never fewer than `_TP_PSUM_MIN_ROWS` per rank; wider buckets take
-# `lax.psum`.
+# `lax.psum`. Empirical values from TPU v6e (on TP=16, 128 // 16 = 8 keeps
+# single-token decode on the one-shot DMA psum while multi-token verify batches
+# take XLA's ring psum); not derived from a general cost model.
 _TP_PSUM_MAX_TOTAL_ROWS = 128
 _TP_PSUM_MIN_ROWS = 8
 
@@ -167,17 +169,16 @@ def async_ep_dispatch_start(
     send_shard: jax.Array,
     axis_name: str | tuple[str, ...],
     *,
-    collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
-) -> tuple[AsyncDispatchState | jax.Array, jax.Array]:
+    collective_id: int,
+) -> tuple[AsyncDispatchState, jax.Array]:
     """Barrier-allocate buffers and launch a non-blocking one-shot DMA gather.
 
-    Returns the in-flight state and a token for `async_ep_dispatch_wait`. On
-    a single-rank axis the state is `send_shard[None]` and no DMA is issued.
+    Returns the in-flight state and a token for `async_ep_dispatch_wait`. The
+    axis must have several ranks.
     """
     axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
-    if world_size == 1:
-        return send_shard[None, :, :], jnp.zeros((1,), dtype=jnp.int32)
+    assert world_size > 1, f"axis {axis_key} has one rank; nothing to dispatch"
 
     x_packed = seam_pieces_pack(send_shard[None, :, :], axis_size=1)
     recv_shape = (world_size, *x_packed.shape[1:])
@@ -225,7 +226,7 @@ def async_ep_dispatch_start(
 
     with xla_metadata.set_xla_metadata(
         async_type="collective-start",
-        latency_metadata="300000",
+        latency_metadata=DMA_LATENCY_METADATA,
     ):
         init_state = barrier_and_allocate(
             AsyncDispatchState(
@@ -253,13 +254,13 @@ def async_ep_dispatch_start(
 
 
 def async_ep_dispatch_wait(
-    state: AsyncDispatchState | jax.Array,
+    state: AsyncDispatchState,
     wait_tok: jax.Array,
     axis_name: str | tuple[str, ...],
     *,
     rows: int,
     orig_lanes: int,
-    collective_id: int = COLLECTIVE_ID_MOE_DP_DISPATCH_AG,
+    collective_id: int,
 ) -> jax.Array:
     """Wait for an in-flight EP dispatch, drain its sends, and unpack the rows.
 
@@ -268,11 +269,6 @@ def async_ep_dispatch_wait(
     """
     axis_key = normalize_axis_name(axis_name)
     world_size = jax.lax.axis_size(axis_key)
-    if world_size == 1:
-        assert isinstance(state, jax.Array)
-        return state
-
-    assert isinstance(state, AsyncDispatchState)
 
     def _wait_and_drain(state_ref: AsyncDispatchState) -> None:
         with jax.named_scope("wait_remote_dispatch_recv"):
@@ -299,7 +295,7 @@ def async_ep_dispatch_wait(
 
     with xla_metadata.set_xla_metadata(
         async_type="collective-done",
-        latency_metadata="300000",
+        latency_metadata=DMA_LATENCY_METADATA,
     ):
         (state_done,) = call_kernel(
             _wait_kernel_inplace,
@@ -360,37 +356,24 @@ def hierarchical_combine_rms_slice(
     latent_dim: int,
     use_norm: bool,
     rms_eps: float,
-    max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
+    max_dma_tokens: int,
 ) -> jax.Array:
     """Combine the routed expert partial sums of every rank.
 
     One-shot reduce-scatter of the rows over `dp_axis_name`, psum over
     `tp_axis_name`, exact `RMSNorm(latent_dim)` (when `use_norm`), then this
-    rank's `latent_dim / tp_size` columns. Batches above `max_dma_tokens`
-    (and a single-rank mesh) use XLA collectives; the DMA collectives receive
-    into VMEM.
+    rank's `latent_dim / tp_size` columns. Both axes must have several ranks.
+    Batches above `max_dma_tokens` use XLA collectives; the DMA collectives
+    receive into VMEM.
     """
+    assert dp_size > 1 and tp_size > 1, (dp_size, tp_size)
     latent_local = latent_dim // tp_size
-    world_size = dp_size * tp_size
-    if moe_out.shape[0] > max_dma_tokens or world_size == 1:
-        routed_dp = (
-            lax.psum_scatter(moe_out, dp_axis_name, scatter_dimension=0, tiled=True)
-            if dp_size > 1
-            else moe_out
+    if moe_out.shape[0] > max_dma_tokens:
+        routed_dp = lax.psum_scatter(
+            moe_out, dp_axis_name, scatter_dimension=0, tiled=True
         )
-        routed_full = lax.psum(routed_dp, tp_axis_name) if tp_size > 1 else routed_dp
-        if use_norm:
-            routed_full = _jax_rms_norm(routed_full, local_norm_w, rms_eps)
-        if tp_size > 1:
-            return lax.dynamic_slice_in_dim(
-                routed_full,
-                local_tp_rank[0, 0] * latent_local,
-                latent_local,
-                axis=1,
-            )
-        return routed_full
-
-    if dp_size > 1:
+        routed_full = lax.psum(routed_dp, tp_axis_name)
+    else:
         routed_dp = guarded_psum_scatter_rows(
             moe_out,
             dp_axis_name,
@@ -399,10 +382,6 @@ def hierarchical_combine_rms_slice(
             max_dma_tokens=max_dma_tokens,
             vmem_max_tokens=max_dma_tokens,
         )
-    else:
-        routed_dp = moe_out
-
-    if tp_size > 1:
         tp_psum_cap = min(
             max_dma_tokens, max(_TP_PSUM_MIN_ROWS, _TP_PSUM_MAX_TOTAL_ROWS // tp_size)
         )
@@ -414,20 +393,14 @@ def hierarchical_combine_rms_slice(
             max_dma_tokens=tp_psum_cap,
             vmem_max_tokens=max_dma_tokens,
         )
-    else:
-        routed_full = routed_dp
-
     if use_norm:
         routed_full = _jax_rms_norm(routed_full, local_norm_w, rms_eps)
-
-    if tp_size > 1:
-        return lax.dynamic_slice_in_dim(
-            routed_full,
-            local_tp_rank[0, 0] * latent_local,
-            latent_local,
-            axis=1,
-        )
-    return routed_full
+    return lax.dynamic_slice_in_dim(
+        routed_full,
+        local_tp_rank[0, 0] * latent_local,
+        latent_local,
+        axis=1,
+    )
 
 
 # =============================================================================

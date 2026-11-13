@@ -435,8 +435,10 @@ class K3DSparkForCausalLM(nn.Module):
         start = int(shard.org_vocab_start_index)
         end = int(shard.org_vocab_end_index)
         w2 = self.model.markov_head.markov_w2
+        w2_weight = w2.weight
+        assert isinstance(w2_weight, torch.Tensor)
         w2.weight = nn.Parameter(
-            w2.weight[start:end].contiguous().clone(), requires_grad=False
+            w2_weight[start:end].contiguous().clone(), requires_grad=False
         )
         self._markov_head_vocab_sharded = True
         return start
@@ -449,6 +451,7 @@ class K3DSparkForCausalLM(nn.Module):
         if processor.soft_cap is not None or processor.scale != 1.0:
             return "the logits are soft-capped or scaled"
         w2 = self.model.markov_head.markov_w2.weight
+        assert isinstance(w2, torch.Tensor)
         if w2.dim() != 2 or w2.shape[0] != processor.org_vocab_size:
             return "the Markov head rows do not match the lm_head vocab"
         if processor.org_vocab_size > _MAX_EXACT_FLOAT32_INT:
@@ -463,9 +466,9 @@ class K3DSparkForCausalLM(nn.Module):
     def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
         """The Markov bias over this rank's vocab rows."""
         assert self._markov_head_vocab_sharded
-        return nn.functional.linear(
-            markov_embed, self.model.markov_head.markov_w2.weight
-        )
+        w2_weight = self.model.markov_head.markov_w2.weight
+        assert isinstance(w2_weight, torch.Tensor)
+        return nn.functional.linear(markov_embed, w2_weight)
 
     def load_weights(
         self,

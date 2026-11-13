@@ -21,74 +21,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _mix_kernel(prefix, history, weight, output, *, eps):
-    values = jnp.concatenate((history[...], prefix[...][:, None, :]), axis=1).astype(
-        jnp.float32
-    )
-    inv_norm = jax.lax.rsqrt(jnp.mean(values * values, axis=-1, keepdims=True) + eps)
-    scores = (
-        jnp.sum(values * weight[...].astype(jnp.float32), axis=-1, keepdims=True)
-        * inv_norm
-    )
-    probabilities = jax.nn.softmax(scores, axis=1)
-    output[...] = jnp.sum(values * probabilities, axis=1).astype(output.dtype)
-
-
-def _validate_attention_residual(
-    prefix: jax.Array,
-    history_tokens: int,
-    history_hidden: int,
-    folded_weight: jax.Array,
-    history_name: str,
-) -> None:
-    """Shape checks shared by both history layouts."""
-    tokens, hidden = prefix.shape
-    if history_tokens != tokens or history_hidden != hidden:
-        raise ValueError(f"Attention Residual prefix/{history_name} shapes disagree")
-    if folded_weight.shape != (hidden,):
-        raise ValueError(
-            "Attention Residual needs one folded weight per hidden feature"
-        )
-
-
-def attention_residual(
-    prefix: jax.Array,
-    history: jax.Array,
-    folded_weight: jax.Array,
-    *,
-    eps: float = 1e-5,
-    interpret: bool = False,
-) -> jax.Array:
-    """Mix [tokens,hidden] prefix and [tokens,blocks,hidden] saved blocks.
-
-    Norm and projection weights are folded to one FP32 vector at load time.
-    All stored blocks are live; the production model carries their actual
-    count in the history shape. No state or cache is modified.
-    """
-    tokens, hidden = prefix.shape
-    _validate_attention_residual(
-        prefix, history.shape[0], history.shape[-1], folded_weight, "history"
-    )
-    if history.shape[1] == 0 or tokens == 0:
-        return prefix
-    if tokens % 16:
-        raise ValueError("Fused Attention Residual requires 16-token tiles")
-    return pl.pallas_call(
-        functools.partial(_mix_kernel, eps=eps),
-        out_shape=jax.ShapeDtypeStruct(prefix.shape, prefix.dtype),
-        grid=(tokens // 16,),
-        in_specs=(
-            pl.BlockSpec((16, hidden), lambda i: (i, 0)),
-            pl.BlockSpec((16, history.shape[1], hidden), lambda i: (i, 0, 0)),
-            pl.BlockSpec((hidden,), lambda i: (0,)),
-        ),
-        out_specs=pl.BlockSpec((16, hidden), lambda i: (i, 0)),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=63 * 1024**2),
-        interpret=interpret,
-        name="kimi_attnres_compact_m16",
-    )(prefix, history, folded_weight)
-
-
 def _mix_kernel_bt(prefix, weight, history_ref, output, *, eps):
     # The softmax over blocks is unrolled on purpose: every block stays a
     # separate 2D (bm, hidden) value, so no [bm, blocks, hidden] tensor (which
@@ -125,6 +57,10 @@ def attention_residual_bt(
 ) -> jax.Array:
     """Mix [tokens, hidden] prefix and [blocks, tokens, hidden] saved blocks.
 
+    Norm and projection weights are folded to one FP32 vector at load time.
+    All stored blocks are live; the production model carries their actual
+    count in the history shape. No state or cache is modified.
+
     Storing history with `blocks` on the leading axis and loading each block as
     a 2D `(bm, hidden)` slice (`history_ref[b]`) from a single
     `(num_blocks, bm, hidden)` VMEM tile avoids TPU v6e 8-sublane padding on
@@ -132,13 +68,20 @@ def attention_residual_bt(
     """
     tokens, hidden = prefix.shape
     num_blocks = history_bt.shape[0]
-    _validate_attention_residual(
-        prefix, history_bt.shape[1], history_bt.shape[-1], folded_weight, "history_bt"
-    )
+    if history_bt.shape[1] != tokens or history_bt.shape[-1] != hidden:
+        raise ValueError("Attention Residual prefix/history_bt shapes disagree")
+    if folded_weight.shape != (hidden,):
+        raise ValueError(
+            "Attention Residual needs one folded weight per hidden feature"
+        )
     if num_blocks == 0 or tokens == 0:
         return prefix
     if tokens % 16:
         raise ValueError("Fused Attention Residual requires 16-token tiles")
+    # Each step holds `(num_blocks, bm, hidden)` bf16 history plus `(bm, hidden)`
+    # prefix/output and f32 working slices in VMEM. Halving `max_bm` from 128 to
+    # 64 once `num_blocks >= 6` (calibrated for hidden=7168 on 64 MiB TPU v6e
+    # VMEM, leaving 1 MiB headroom at 63 MiB) keeps deep-layer tiles in VMEM.
     max_bm = 64 if num_blocks >= 6 else 128
     bm = min(max_bm, tokens)
     if tokens % bm != 0:

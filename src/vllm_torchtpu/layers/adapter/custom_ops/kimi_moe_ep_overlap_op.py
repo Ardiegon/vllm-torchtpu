@@ -35,6 +35,14 @@ activation and the normalized routed slice, concatenated. The Pallas and
 JAX building blocks live in `kernels/kimi_k3/exit_fold.py`. The routed
 experts must be in the planar_t MXFP4 layout (uint8 weights and scales, no
 biases).
+
+Serving note (`LIBTPU_INIT_ARGS`, consumed once by libtpu at PJRT startup):
+overlapping the split `'dp'` remote-DMA dispatch with the shared-expert matmul
+and fusing surrounding XLA collectives on TPU v6e uses::
+
+    --xla_msa_preferred_overlap_to_async_copy_ratio=12
+    --xla_tpu_enable_async_collective_fusion=true
+    --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true
 """
 
 from __future__ import annotations
@@ -111,7 +119,7 @@ def _operand_names(use_norm: bool) -> tuple[str, ...]:
     names = [
         "hidden_states",  # [dp * B_dp, H]
         "routed_down_local",  # [dp * B_dp, tp * d_local]
-        "packed_meta",  # [dp * B_dp, m_padded]
+        "packed_meta",  # [dp * B_dp, 3 * topk]
         "w_shared_gu",  # [H, tp * 2 * s_inter_tp]
         "w13",  # [dp, tp, E_local, ...]
         "w2",  # [dp, tp, E_local, ...]
@@ -305,17 +313,26 @@ def build_kimi_moe_ep_overlap_op(
     dev_ids = tuple(int(d.id) for d in mesh.devices.flat)
     use_sparse_core = bool(envs.USE_MOE_SPARSE_CORE)
     onehot_permute_threshold = int(resolve_onehot_permute_threshold())
-    # Every static setting that changes the traced program is in the name, so
-    # a warm compile cache never serves another variant.
-    op_name = (
+    base_name = (
         f"pallas::kimi_moe_ep_overlap_k{cfg.topk}_{cfg.shared_activation.value}"
         f"_n{int(cfg.use_norm)}_m{cfg.fused_decode_max_tokens}"
         f"_cap{max_dma_tokens}_dp{dp_size}_tp{tp_size}"
     )
-    cache_key = (op_name, dev_ids, cfg, use_sparse_core, onehot_permute_threshold)
-    cached = _OVERLAP_OPS.get(cache_key)
-    if cached is not None:
-        return cached
+    variant_key = (dev_ids, cfg, use_sparse_core, onehot_permute_threshold)
+    for k, cached in _OVERLAP_OPS.items():
+        if (k[0] == base_name or k[0].startswith(f"{base_name}_v")) and (
+            k[1:] == variant_key
+        ):
+            return cached
+    # Disambiguate custom-op registration if two layers share `base_name`
+    # dimensions while differing in `cfg`, device ids, or MoE env settings.
+    collision = sum(
+        1
+        for k in _OVERLAP_OPS
+        if k[0] == base_name or k[0].startswith(f"{base_name}_v")
+    )
+    op_name = base_name if collision == 0 else f"{base_name}_v{collision}"
+    cache_key = (op_name, *variant_key)
 
     jax_fn, in_specs, out_spec = _make_moe_ep_overlap_jax_fn(
         mesh,
@@ -324,6 +341,9 @@ def build_kimi_moe_ep_overlap_op(
         use_sparse_core=use_sparse_core,
         onehot_permute_threshold=onehot_permute_threshold,
     )
+    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
+    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
+    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         op_name,
         jax_fn,

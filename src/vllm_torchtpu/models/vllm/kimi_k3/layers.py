@@ -35,10 +35,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.kimi_k3.attention_residual import (
-    attention_residual,
-    attention_residual_bt,
-)
+from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual_bt
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import TokenShardCollectives
@@ -46,16 +43,6 @@ from .collective_ops import TokenShardCollectives
 
 def _eps_op_suffix(eps: float) -> str:
     return float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
-
-
-@cache
-def _build_attention_residual_op(eps: float):
-    def core(prefix: jax.Array, history: jax.Array, weight: jax.Array) -> jax.Array:
-        return attention_residual(prefix, history, weight, eps=eps)
-
-    op = pallas.jax_op(f"pallas::kimi_attention_residual_{_eps_op_suffix(eps)}", core)
-    op.register_fake(lambda prefix, history, weight: torch.empty_like(prefix))
-    return op
 
 
 @cache
@@ -205,9 +192,6 @@ class AttentionResidual(nn.Module):
         )
         out = fresh_buffer(folded)
         self.folded_weight = out
-        self._prefill_op = (
-            _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None
-        )
         self._prefill_bt_op = (
             _build_attention_residual_bt_op(self.eps)
             if out.device.type == "tpu"
@@ -218,43 +202,12 @@ class AttentionResidual(nn.Module):
         self,
         prefix_sum: torch.Tensor,
         block_residuals: torch.Tensor,
-        blocks_first: bool = False,
     ) -> torch.Tensor:
-        if blocks_first:
-            if block_residuals.shape[0] == 0:
-                return prefix_sum
-            if self._prefill_bt_op is not None and prefix_sum.shape[0] % 16 == 0:
-                return self._prefill_bt_op(
-                    prefix_sum, block_residuals, self.folded_weight
-                )
-            w = self.folded_weight
-            if prefix_sum.shape[0] == 1:
-                values = torch.cat(
-                    (block_residuals, prefix_sum.unsqueeze(0)), dim=0
-                ).float()  # [K, 1, hidden]
-                inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
-                probabilities = ((values * w).sum(-1) * inv).softmax(dim=0)
-                out = (probabilities.unsqueeze(-1) * values).sum(dim=0)
-                return out.to(block_residuals.dtype)
-            v_blocks = block_residuals.float()
-            v_prefix = prefix_sum.float()
-            inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
-            inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
-            scores = torch.cat(
-                (
-                    (v_blocks * w).sum(-1) * inv_blocks,
-                    ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(0),
-                ),
-                dim=0,
-            )  # [K, T]
-            probabilities = scores.softmax(dim=0)
-            out = (probabilities[:-1].unsqueeze(-1) * v_blocks).sum(dim=0)
-            out = out + probabilities[-1].unsqueeze(-1) * v_prefix
-            return out.to(block_residuals.dtype)
-        if block_residuals.shape[1] == 0:
+        """Mix `prefix_sum[T, hidden]` with `block_residuals[K, T, hidden]`."""
+        if block_residuals.shape[0] == 0:
             return prefix_sum
-        if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:
-            return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
+        if self._prefill_bt_op is not None and prefix_sum.shape[0] % 16 == 0:
+            return self._prefill_bt_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:
             # With one token the per-slot statistics below are scalars that
@@ -262,11 +215,11 @@ class AttentionResidual(nn.Module):
             # them one vector. A shape branch, so bucket 1 gets its own trace
             # (see compilation.shape_variants).
             values = torch.cat(
-                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
-            ).float()  # [1, K, hidden]
+                (block_residuals, prefix_sum.unsqueeze(0)), dim=0
+            ).float()  # [K, 1, hidden]
             inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
-            probabilities = ((values * w).sum(-1) * inv).softmax(dim=-1)
-            out = (probabilities.unsqueeze(-1) * values).sum(dim=-2)
+            probabilities = ((values * w).sum(-1) * inv).softmax(dim=0)
+            out = (probabilities.unsqueeze(-1) * values).sum(dim=0)
             return out.to(block_residuals.dtype)
         v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()
@@ -275,11 +228,11 @@ class AttentionResidual(nn.Module):
         scores = torch.cat(
             (
                 (v_blocks * w).sum(-1) * inv_blocks,
-                ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(-1),
+                ((v_prefix * w).sum(-1) * inv_prefix).unsqueeze(0),
             ),
-            dim=-1,
-        )  # [T, K]
-        probabilities = scores.softmax(dim=-1)
-        out = (probabilities[..., :-1].unsqueeze(-1) * v_blocks).sum(dim=-2)
-        out = out + probabilities[..., -1].unsqueeze(-1) * v_prefix
+            dim=0,
+        )  # [K, T]
+        probabilities = scores.softmax(dim=0)
+        out = (probabilities[:-1].unsqueeze(-1) * v_blocks).sum(dim=0)
+        out = out + probabilities[-1].unsqueeze(-1) * v_prefix
         return out.to(block_residuals.dtype)
