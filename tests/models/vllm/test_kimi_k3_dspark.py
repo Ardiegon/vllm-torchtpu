@@ -30,6 +30,7 @@ from vllm_torchtpu.models.vllm.kimi_k3.dspark import (
     _duplicate_context_kv_weights,
     _layer_major_context_kv,
 )
+from vllm_torchtpu.spec_decode.dspark import VocabParallelMarkovDraft
 
 
 @pytest.mark.parametrize(
@@ -116,6 +117,12 @@ def _draft_with_markov_head(
     )
     draft._markov_head_vocab_sharded = False
     return draft
+
+
+def test_kimi_k3_draft_opts_in_to_vocab_parallel_drafting():
+    draft = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
+    torch.nn.Module.__init__(draft)
+    assert isinstance(draft, VocabParallelMarkovDraft)
 
 
 def test_shard_markov_head_keeps_the_local_vocab_rows():

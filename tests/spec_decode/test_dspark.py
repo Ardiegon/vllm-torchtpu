@@ -20,7 +20,6 @@ import torch
 import vllm.distributed
 
 from vllm_torchtpu.models.vllm.deepseek_v4.dspark import DSparkDeepseekV4ForCausalLM
-from vllm_torchtpu.models.vllm.kimi_k3.dspark import K3DSparkForCausalLM
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer, VocabParallelMarkovDraft
 
@@ -433,9 +432,3 @@ def test_deepseek_v4_draft_loads_on_the_request_major_path():
     p = _loaded_proposer(draft)
     assert p._position_major_logits is False
     assert p._markov_vocab_start is None
-
-
-def test_kimi_k3_draft_opts_in_to_vocab_parallel_drafting():
-    draft = K3DSparkForCausalLM.__new__(K3DSparkForCausalLM)
-    torch.nn.Module.__init__(draft)
-    assert isinstance(draft, VocabParallelMarkovDraft)

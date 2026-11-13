@@ -697,7 +697,7 @@ DEEP_DEQUANT_BODIES = {DEQUANT_PLANAR_T_B11_DEEP: DEQUANT_PLANAR_T_B11}
 # stream with the decode.
 DEEP_STREAM_DEPTH = 4
 # Per-tile f32 accumulator bound of the deep kernel, per stack. Empirical,
-# from TPU v6e with 3584 x 3072 experts (Kimi K3); not derived.
+# from TPU v6e with hidden=3584, inter=3072 experts; not derived.
 DEEP_MAX_ACC_BYTES = 2 * 1024 * 1024
 # Row tile slots of the deep kernel: the visited `[tm, K]` lhs tile is
 # double buffered so visit j + 1's rows land while visit j computes.
@@ -1405,7 +1405,7 @@ V6E_DEEP_VMEM_BUDGET = 3 * _SCOPED_VMEM_LIMIT // 4
 # Routed row count up to which `moe_gmm_v6e_planar_t_b11` uses the deep
 # schedule and 32-row alignment; larger (prefill) batches use the rolled
 # schedule and 128-row alignment. Empirical decode / prefill boundary from
-# TPU v6e with 3584 x 3072 experts (Kimi K3); not derived.
+# TPU v6e with hidden=3584, inter=3072 experts; not derived.
 _MOE_GMM_DEEP_MAX_ROWS = 2048
 # Routed-row padding of `moe_gmm_v6e_planar_t_b11`: decode-sized batches
 # pad to a multiple of 32 rows, prefill-sized ones to 128.
@@ -1470,7 +1470,7 @@ def is_supported_by_planar_t_b11(
     A layer this rejects keeps the loader's default MXFP4 layout and kernels.
 
     Envelope: the kernels have been compiled and run on TPU v6e for
-    `hidden` 3584 x `inter` 3072 (Kimi K3) only. Other admitted widths rest
+    `hidden` 3584 x `inter` 3072 (7 experts/shard) only. Other admitted widths rest
     on the VMEM models, not on a measurement:
       * the grouped kernel needs a `default_tiling` under
         `V6E_ROLLED_VMEM_BUDGET`, which bounds both widths (checked here, so
@@ -1944,7 +1944,7 @@ FUSED_VERIFY_MOE_MAX_TOKENS = 256
 # 32, 573 at 16).
 FUSED_VERIFY_MOE_TRAY_M = 128
 # The three values below are empirical, from TPU v6e with 3584 x 3072
-# experts (Kimi K3); none is derived.
+# experts (7 experts/shard, 128-row trays); none is derived.
 # Bound on `_fused_verify_moe_vmem_bytes`, 2 MiB under the kernel's limit.
 _FUSED_VERIFY_MOE_VMEM_BUDGET = 46 * 1024 * 1024
 # Per-kernel VMEM limit requested by the fused decode/verify kernel (above
@@ -1961,7 +1961,7 @@ _FUSED_DECODE_MAX_SLAB_BYTES = 30 * 1024 * 1024
 # From this intermediate width on, the fused kernel single-buffers the w2
 # slab (fetched during the expert's own gate+up compute instead of one
 # expert ahead) to stay inside its VMEM limit. Empirical: 3072 is the only
-# width run on TPU v6e (Kimi K3); the true crossover is not measured.
+# width (with hidden=3584) run on TPU v6e; the true crossover is not measured.
 _FUSED_DECODE_W2_SINGLE_BUFFER_MIN_N = 3072
 
 
