@@ -114,3 +114,96 @@ def test_require_accepts_a_cached_rank_ordered_ep_mesh(ep_state):
     dp_tp_mesh.require_dp_tp_mesh_order()
 
     assert dp_tp_mesh.dp_tp_mesh_order_required()
+
+
+def _fake_2d_mesh(ids, shape, axis_names=("dp", "tp")):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    devs = np.array([SimpleNamespace(id=d) for d in ids], dtype=object).reshape(shape)
+    return SimpleNamespace(axis_names=axis_names, devices=devs)
+
+
+def test_build_dp_tp_mesh_validates_groups_and_ep_assignment(monkeypatch, ep_state):
+    from types import SimpleNamespace
+
+    from torch_tpu._internal import pallas as pallas_mod
+
+    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
+    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dp_tp_mesh.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(dp_tp_mesh.dist, "get_world_size", lambda: 4)
+    dp_ranks, tp_ranks = _groups(1, 2, 2)
+    monkeypatch.setattr(dp_tp_mesh.ps, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        dp_tp_mesh.ps, "get_dp_group", lambda: SimpleNamespace(ranks=dp_ranks)
+    )
+    monkeypatch.setattr(
+        dp_tp_mesh.ps, "get_tp_group", lambda: SimpleNamespace(ranks=tp_ranks)
+    )
+    rank_ids = (40, 20, 10, 30)
+    calls = []
+
+    def fake_get_pallas_mesh(*, axis_names, mesh_shape):
+        calls.append((axis_names, mesh_shape))
+        return _fake_2d_mesh(rank_ids, mesh_shape, axis_names)
+
+    monkeypatch.setattr(pallas_mod, "get_pallas_mesh", fake_get_pallas_mesh)
+    monkeypatch.setattr(
+        ep_mesh,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]),
+    )
+    monkeypatch.setattr(
+        ep_mesh, "build_ep_mesh", lambda: _fake_2d_mesh(rank_ids, (4,), ("d",))
+    )
+
+    mesh = dp_tp_mesh.build_dp_tp_mesh()
+    assert dp_tp_mesh.dp_tp_mesh_order_required()
+    assert calls[0] == (("dp", "tp"), (2, 2))
+    assert dp_tp_mesh.build_dp_tp_mesh() is mesh
+
+
+def test_build_dp_tp_mesh_rejects_conflicting_ep_device_assignment(
+    monkeypatch, ep_state
+):
+    from types import SimpleNamespace
+
+    from torch_tpu._internal import pallas as pallas_mod
+
+    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
+    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dp_tp_mesh.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dp_tp_mesh.dist, "get_world_size", lambda: 4)
+    monkeypatch.setattr(dp_tp_mesh.ps, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(
+        pallas_mod,
+        "get_pallas_mesh",
+        lambda *, axis_names, mesh_shape: _fake_2d_mesh(
+            (40, 20, 10, 30), mesh_shape, axis_names
+        ),
+    )
+    monkeypatch.setattr(
+        ep_mesh,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]),
+    )
+    monkeypatch.setattr(
+        ep_mesh, "build_ep_mesh", lambda: _fake_2d_mesh((10, 20, 30, 40), (4,), ("d",))
+    )
+
+    with pytest.raises(RuntimeError, match="Conflicting DeviceAssignment"):
+        dp_tp_mesh.build_dp_tp_mesh(2, 2)
+
+
+def test_build_dp_tp_mesh_inside_compile_requires_cached_entry(monkeypatch, ep_state):
+    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
+    monkeypatch.setattr(dp_tp_mesh.ps, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(dp_tp_mesh.torch.compiler, "is_compiling", lambda: True)
+
+    with pytest.raises(RuntimeError, match="before torch.compile tracing"):
+        dp_tp_mesh.build_dp_tp_mesh(2, 2)
+    cached = _fake_2d_mesh((0, 1, 2, 3), (2, 2))
+    dp_tp_mesh._MESH_2D_CACHE[(2, 2, (0, 1, 2, 3))] = cached
+    assert dp_tp_mesh.build_dp_tp_mesh(2, 2) is cached

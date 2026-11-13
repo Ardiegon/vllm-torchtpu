@@ -140,7 +140,9 @@ class DSparkProposer(DFlashProposer):
         # Set by `load_model` for a `VocabParallelMarkovDraft` draft model.
         self._position_major_logits = False
         # Rows of one aligned tile of position-major requests. Resolved here
-        # because the drafting forward is traced.
+        # because the drafting forward is traced. The table is per TensorCore:
+        # 1 is the only core count v6e and TPU7x accept, and the sublane count
+        # does not depend on it.
         self._request_tile_rows = pltpu.get_tpu_info_for_chip(
             get_chip_version(), 1
         ).num_sublanes
@@ -294,11 +296,11 @@ class DSparkProposer(DFlashProposer):
         """Reorder ``[reqs * block, H]`` hidden rows position-major.
 
         Viewing the ``[rows, vocab]`` logits as ``[reqs, block, vocab]``
-        relayouts the whole full-vocab tensor (a ~1.3 ms
-        while/dynamic-update-slice loop per draft on v6e when ``reqs`` is
-        not a multiple of the ``tile_rows``-row sublane tile). Reordering the
-        small hidden rows instead, with requests padded to the tile, makes
-        each position's logits one aligned ``[reqs_tile, vocab]`` slab.
+        relayouts the full-vocab tensor with a ``dynamic-update-slice`` loop
+        whenever ``reqs`` is not a multiple of the ``tile_rows``-row sublane
+        tile. Reordering the small hidden rows instead, with requests padded
+        to the tile, makes each position's logits one aligned
+        ``[reqs_tile, vocab]`` slab.
         Returns the flat ``[block * reqs_tile, H]`` hidden rows, the anchor
         ids padded to ``reqs_tile``, and ``reqs_tile``.
         """

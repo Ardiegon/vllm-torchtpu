@@ -173,6 +173,46 @@ class TestPooledCorePathSelection:
         # 6 request rows fit the 16-token bucket, so nothing is clamped.
         assert seen["reqs"].state_indices.shape == (6,)
 
+    def test_raiden_admission_from_one_source_rank_is_the_unsharded_layout(
+        self, kernel, monkeypatch
+    ):
+        """One Raiden source rank stores one conv shard: same geometry, same path.
+
+        The byte layout is then the unsharded one, which the TPU test
+        `test_pooled_kda_direct_matches_gather_scatter` compares between the
+        two paths.
+        """
+        monkeypatch.setattr(kop.tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
+        monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_KIMIK3_ADMISSION", True)
+        monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 1)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(linear_attn_config={"num_heads": H})
+            )
+        )
+        shard_heads = kop._pooled_conv_shard_heads(vllm_config)
+        assert shard_heads == H
+
+        b, dist = self._decode_batch()
+        unsharded, one_shard = (
+            kop._kda_pool_geometry(
+                b["pool"],
+                num_heads=H,
+                head_dim=D,
+                kernel_size=KS,
+                pool_block_tokens=b["pool_block_tokens"],
+                conv_shard_heads=heads,
+            )
+            for heads in (None, shard_heads)
+        )
+        assert one_shard == unsharded
+        assert one_shard.conv_shards == 1
+
+        _core(b, distribution=dist, conv_shard_heads=shard_heads)
+        (call,) = kernel.calls
+        assert call["state_source"] is b["pool"]
+        assert call["state_plan"] is not None
+
     def test_request_rows_are_clamped_to_the_token_bucket(self, kernel):
         # 6 request rows but only 2 token rows: at most 2 requests hold tokens.
         b = _batch(np.random.default_rng(6), [1, 1], pad_rows=4, num_tokens=2)

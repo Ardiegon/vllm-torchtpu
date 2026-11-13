@@ -360,3 +360,103 @@ def test_tp_shard_uses_the_tp_group_on_one_core_chips(monkeypatch):
     _patch_tp_state(monkeypatch, mod, initialized=True, group=group, cores_per_chip=1)
 
     assert mod.tp_shard_group_or_none(3584) is group
+
+
+class _RecordedSharded:
+    """Stands in for the sharded layer, whose constructor needs a real TP group."""
+
+    def __init__(self, input_size, output_size, *, bias, quant_config, prefix, group):
+        self.group = group
+
+
+class _RecordedReplicated:
+    """Stands in for ReplicatedLinear, whose constructor queries vLLM TP state."""
+
+    def __init__(self, input_size, output_size, *, bias, quant_config, prefix):
+        self.input_size = input_size
+        self.output_size = output_size
+
+
+def _make_projection(monkeypatch, mod, *, flag: bool, chip_group):
+    """Run ``make_latent_projection`` and return ``(layer, warning messages)``."""
+    from vllm_torchtpu import envs
+
+    warnings: list[str] = []
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", flag)
+    monkeypatch.setattr(mod, "get_intra_chip_group", lambda: chip_group)
+    monkeypatch.setattr(mod, "IntraChipColumnParallelLinear", _RecordedSharded)
+    monkeypatch.setattr(mod, "ReplicatedLinear", _RecordedReplicated)
+    monkeypatch.setattr(mod, "_warned", False)
+    monkeypatch.setattr(
+        mod.logger, "warning", lambda message, *args: warnings.append(message)
+    )
+    layer = mod.make_latent_projection(
+        32, 16, bias=False, quant_config=None, prefix="proj"
+    )
+    return layer, warnings
+
+
+def test_flag_on_a_one_core_chip_shards_over_tp_without_a_false_warning(monkeypatch):
+    """The flag asks for an intra-chip group a one-core chip cannot have.
+
+    The projections are sharded over the TP group anyway, so nothing may claim
+    they were left replicated.
+    """
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    tp_group = _FakeGroup(16, rank_in_group=3)
+    _patch_tp_state(
+        monkeypatch, mod, initialized=True, group=tp_group, cores_per_chip=1
+    )
+
+    layer, warnings = _make_projection(monkeypatch, mod, flag=True, chip_group=None)
+
+    assert isinstance(layer, _RecordedSharded)
+    assert layer.group is tp_group
+    assert warnings == []
+
+
+def test_multi_core_chip_prefers_the_chip_group_over_the_tp_group(monkeypatch):
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    chip_group = _FakeGroup(2, rank_in_group=1)
+    _patch_tp_state(
+        monkeypatch, mod, initialized=True, group=_FakeGroup(16), cores_per_chip=2
+    )
+
+    layer, warnings = _make_projection(
+        monkeypatch, mod, flag=True, chip_group=chip_group
+    )
+
+    assert isinstance(layer, _RecordedSharded)
+    assert layer.group is chip_group
+    assert warnings == []
+
+
+def test_replicating_across_a_multi_rank_tp_group_warns_once(monkeypatch):
+    """A chip not known as one-core keeps the replicated default, and says so."""
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    _patch_tp_state(
+        monkeypatch, mod, initialized=True, group=_FakeGroup(16), cores_per_chip=2
+    )
+
+    layer, warnings = _make_projection(monkeypatch, mod, flag=False, chip_group=None)
+    mod.make_latent_projection(32, 16, bias=False, quant_config=None, prefix="proj")
+
+    assert isinstance(layer, _RecordedReplicated)
+    assert len(warnings) == 1
+    assert "replicated" in warnings[0]
+
+
+def test_replicating_without_a_multi_rank_tp_group_is_silent(monkeypatch):
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    _patch_tp_state(
+        monkeypatch, mod, initialized=True, group=_FakeGroup(1), cores_per_chip=2
+    )
+
+    layer, warnings = _make_projection(monkeypatch, mod, flag=False, chip_group=None)
+
+    assert isinstance(layer, _RecordedReplicated)
+    assert warnings == []

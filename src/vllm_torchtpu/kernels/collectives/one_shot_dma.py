@@ -34,6 +34,16 @@ for the few rows of a decode step.
 
 Collectives that can be in flight at the same time must use different
 barrier ``collective_id`` values; callers assign them.
+
+Provenance: adapted from JAX/Pallas TPU one-shot remote-DMA collective
+patterns (explicit memory-space pinning across barrier and DMA custom calls,
+``make_async_remote_copy`` peer fan-out overlapped with a pipelined local VMEM
+copy, and 3D seam-piece packing), specialized here for ``[rows, cols]`` decode
+tensors with caller-assigned barrier ``collective_id`` values, shape-bounded
+VMEM/HBM receive-space selection, and trace-time ``jax.lax`` fallback above
+the small-batch envelope.
+
+This module has been run on TPU v6e only.
 """
 
 from __future__ import annotations
@@ -52,6 +62,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 Ref = Any
 
+# The row and byte limits below are not derived from a cost model. They are
+# fixed values that have only been run on TPU v6e, with decode batches of at
+# most 64 rows per rank; the DMA-vs-XLA crossover has not been measured.
 # Inputs with more rows than this take the jax.lax collective (prefill sizes).
 DEFAULT_MAX_DMA_TOKENS = 64
 # "auto" receive buffers go to VMEM only up to this many rows ...
@@ -63,7 +76,8 @@ _ONE_SHOT_MAX_TOTAL_ROWS = 1024
 # VMEM window of the local-copy pipeline in run_dense_a2a.
 _LOCAL_COPY_VMEM_WINDOW_BYTES = 3 * 1024 * 1024
 # XLA latency-hiding-scheduler estimate (cycles) for the barrier and the DMA.
-_DMA_LATENCY_METADATA = "300000"
+# A fixed estimate, not a measurement.
+DMA_LATENCY_METADATA = "300000"
 
 
 def normalize_axis_name(axis_name: str | Sequence[str]) -> str | tuple[str, ...]:
@@ -118,9 +132,13 @@ def _color_dma_operands(
             return x
         if x.dtype in (jnp.uint32, jnp.int32, jnp.uint16, jnp.int16):
             return x
-        is_dense_recv = any(getattr(entry, "name", None) == "x_recv" for entry in path)
+        is_dense_recv = any(
+            isinstance(entry, jax.tree_util.GetAttrKey) and entry.name == "x_recv"
+            for entry in path
+        )
         is_named_vmem = bool(vmem_names_set) and any(
-            getattr(entry, "name", None) in vmem_names_set for entry in path
+            isinstance(entry, jax.tree_util.GetAttrKey) and entry.name in vmem_names_set
+            for entry in path
         )
         if vmem_all_data or (vmem_dense_recv and is_dense_recv) or is_named_vmem:
             space = pltpu.MemorySpace.VMEM
@@ -264,6 +282,8 @@ def barrier_and_allocate(
                     core_index=0,
                 )
 
+    # The flags are passed from generation 7 on; that branch has not been run
+    # (see the module docstring), and why v6e omits them is not recorded.
     tpu_gen = pltpu.get_tpu_info().generation
     compiler_flags = (
         {
@@ -680,7 +700,7 @@ def _dense_all_to_all(
     recv_space = pltpu.VMEM if recv_memory_space == "vmem" else pltpu.HBM
     with xla_metadata.set_xla_metadata(
         async_type="collective-start",
-        latency_metadata=_DMA_LATENCY_METADATA,
+        latency_metadata=DMA_LATENCY_METADATA,
     ):
         recv_state = barrier_and_allocate(
             DenseReceiveState(
@@ -695,7 +715,7 @@ def _dense_all_to_all(
 
     with xla_metadata.set_xla_metadata(
         async_type="collective-done",
-        latency_metadata=_DMA_LATENCY_METADATA,
+        latency_metadata=DMA_LATENCY_METADATA,
     ):
         return run_dense_a2a(
             x,
@@ -816,7 +836,8 @@ def dense_all_to_all(
             ),
         )
 
-    out: jax.Array = _fwd_and_grad(x)
+    out = _fwd_and_grad(x)
+    assert isinstance(out, jax.Array)
 
     if retiled:
         out = unretile(out)

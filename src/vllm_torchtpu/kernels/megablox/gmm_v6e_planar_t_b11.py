@@ -30,7 +30,7 @@ equal float8_e4m3b11fnuz byte with the group's offset from the window's
 largest exponent folded into the byte, the codes meet bf16 activations on
 the MXU, and the window's largest scale is applied once to the f32
 accumulator. This is exact as long as every window's e8m0 spread is at
-most B11_FOLD_WINDOW octaves (`planar_t_b11_window_ok`).
+most B11_FOLD_WINDOW octaves.
 
 Entry points: `moe_gmm_v6e_planar_t_b11` (sorted routed tokens) and
 `fused_decode_moe_v6e_planar_t_b11` (one kernel for small batches).
@@ -55,26 +55,6 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import parse_situ, situ_and_mul
 # Nibble/scale stacks are handled on device (jax arrays and tracers) and on
 # the host (numpy) by the load-time layout helpers.
 _NibbleArray = jax.Array | np.ndarray
-
-# e2m1 decode table, index = sign<<3 | exp<<1 | mantissa.
-_E2M1_LUT = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
 
 # One e8m0 exponent per this many contraction elements (the MX block size).
 SCALE_GROUP = 32
@@ -235,8 +215,8 @@ def default_tiling(
         (`SCOPED_ELEM_BYTES_V6E` / `SCOPED_ELEM_BYTES_TPU7X`).
       force_chunk: pin the k chunk to this value when it is a valid candidate
         (planar weights require chunk == PLANAR_WINDOW). When the shape cannot
-        serve it the normal search runs instead and `can_use_kernel` rejects the
-        result, so this never errors on toy shapes.
+        serve it the normal search runs instead and `mxfp4_gmm` rejects the
+        result.
 
     Returns:
       `(tm, k_chunk, tn)`.
@@ -431,6 +411,11 @@ def _check_group_metadata(
     return group_metadata
 
 
+# Host bytes one slab of `repack_planar_stack`'s numpy walk covers. A host
+# memory bound chosen by hand, not a device quantity.
+_HOST_REPACK_SLAB_BYTES = 256 * 1024 * 1024
+
+
 def _planar_repack_windows(packed: _NibbleArray, window: int) -> _NibbleArray:
     """`[..., K/2]` interleaved nibble pairs -> planar window bytes.
 
@@ -487,6 +472,10 @@ def repack_planar_stack(
     Returns:
       The repacked array, same shape and dtype.
     """
+    if not isinstance(packed, (jax.Array, jax.core.Tracer, np.ndarray)):
+        # Lazy host array-likes (tensorstore / memmap views): materialize
+        # once, then the bounded slab walk below.
+        packed = np.asarray(packed)
     half_k = packed.shape[-1]
     k = 2 * half_k
     if window % (2 * SCALE_GROUP):
@@ -502,10 +491,6 @@ def repack_planar_stack(
         # jit/trace path: pure jnp; numpy here would raise
         # TracerArrayConversionError under a trace.
         return _planar_repack_windows(packed, window)
-    if not isinstance(packed, np.ndarray):
-        # Lazy host array-likes (tensorstore / memmap views): materialize
-        # once, then the bounded slab walk below.
-        packed = np.asarray(packed)
     if packed.ndim < 2:
         return _planar_repack_windows(packed, window)
     # Host arrays are checkpoint-scale ([E, N, K/2] is ~5 GiB per real
@@ -513,36 +498,10 @@ def repack_planar_stack(
     # view in bounded slabs so the load projection's peak stays small.
     flat = packed.reshape(-1, half_k)
     out = np.empty_like(flat)
-    step = max(1, (256 * 1024 * 1024) // max(half_k, 1))
+    step = max(1, _HOST_REPACK_SLAB_BYTES // max(half_k, 1))
     for s in range(0, flat.shape[0], step):
         out[s : s + step] = _planar_repack_windows(flat[s : s + step], window)
     return out.reshape(packed.shape)
-
-
-def unpack_planar_stack(
-    packed: _NibbleArray, window: int = PLANAR_WINDOW
-) -> _NibbleArray:
-    """The inverse of `repack_planar_stack` (back to interleaved pairs).
-
-    Round trips bitwise by construction; used by tests and reference
-    checks. Same trace-safety dispatch as the repack: jax values and tracers
-    stay on jnp, host arrays stay on numpy.
-    """
-    xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
-    half_k = packed.shape[-1]
-    k = 2 * half_k
-    hw = window // 2
-    if k % window:
-        raise ValueError(
-            f"contraction {k} must be a multiple of the planar window {window}."
-        )
-    lead = packed.shape[:-1]
-    planar = packed.reshape(lead + (k // window, hw))
-    # Original contraction order per window, then re-pair (even, odd).
-    codes = xp.concatenate([planar & 0x0F, planar >> 4], axis=-1)
-    even = codes[..., 0::2]
-    odd = codes[..., 1::2]
-    return (even | (odd << 4)).astype(packed.dtype).reshape(lead + (half_k,))
 
 
 def repack_planar_t_stack(
@@ -566,18 +525,6 @@ def repack_planar_t_stack(
     if isinstance(planar, (jax.Array, jax.core.Tracer)):
         return jnp.swapaxes(planar, -1, -2)
     return np.ascontiguousarray(np.swapaxes(planar, -1, -2))
-
-
-def unpack_planar_t_stack(
-    packed: _NibbleArray, window: int = PLANAR_WINDOW
-) -> _NibbleArray:
-    """The inverse of `repack_planar_t_stack` (back to interleaved pairs).
-
-    Round trips bitwise by construction (a transpose then the planar
-    unpack); used by tests and reference checks.
-    """
-    xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
-    return unpack_planar_stack(xp.swapaxes(packed, -1, -2), window)
 
 
 def transpose_scales_planar_t(scales: npt.ArrayLike | jax.Array) -> _NibbleArray:
@@ -618,58 +565,9 @@ def _b11_relabel_table(tn: int) -> jax.Array:
 # per-group e8m0 codes may span at most this many octaves. The fold is an
 # exponent-field subtraction on the e4m3b11 byte, so it is exact while the
 # folded code stays normal; e2m1's smallest magnitude (0.5) encodes at
-# E = 10, leaving 9 octaves of headroom. `planar_t_b11_window_ok` checks
-# it on concrete scales (a real checkpoint's 99th-percentile spread
-# is 2).
+# E = 10, leaving 9 octaves of headroom. The weight loader does not check
+# the spread (a real checkpoint's 99th-percentile spread is 2).
 B11_FOLD_WINDOW = 9
-
-
-def planar_t_scale_spread(
-    scales: npt.ArrayLike | jax.Array, chunk: int = PLANAR_WINDOW
-) -> int:
-    """Widest per-window e8m0 octave spread in `scales` (the fold demand).
-
-    The b11 fold rewrites a group's code as `w * 2^-delta` with
-    `delta = s_max - s` taken over the window, so the largest `delta` any
-    window asks for is exactly this spread. Runs on host values (numpy).
-
-    Args:
-      scales: e8m0 codes in any of the layouts this module uses; only the
-        contraction axis grouping matters, so `[..., N, K/32]` (checkpoint or
-        planar order) and `[..., K/32, N]` (planar_t) are both accepted.
-      chunk: the repack window in contraction elements.
-
-    Returns:
-      The maximum spread over every (column, window) pair.
-    """
-    arr = np.asarray(scales)
-    groups = chunk // SCALE_GROUP
-    # Find the axis that counts scale groups: the planar_t layouts put it
-    # second-minor, the checkpoint layouts minor.
-    axis = -1 if arr.shape[-1] % groups == 0 else -2
-    moved = np.moveaxis(arr, axis, -1)
-    windows = moved.reshape(*moved.shape[:-1], moved.shape[-1] // groups, groups)
-    spread = windows.max(axis=-1).astype(np.int32) - windows.min(axis=-1).astype(
-        np.int32
-    )
-    return int(spread.max())
-
-
-def planar_t_b11_window_ok(
-    scales: npt.ArrayLike | jax.Array, chunk: int = PLANAR_WINDOW
-) -> bool:
-    """True when every window column's e8m0 spread fits `B11_FOLD_WINDOW`.
-
-    Args:
-      scales: e8m0 codes, any layout `planar_t_scale_spread` accepts.
-      chunk: the repack window in contraction elements.
-
-    Returns:
-      Whether `planar_t_b11` decodes these weights exactly. A False here means
-      the wide columns would mis-decode. The vLLM weight-loading path does not
-      run this check.
-    """
-    return planar_t_scale_spread(scales, chunk) <= B11_FOLD_WINDOW
 
 
 def _dequantize_chunk_planar_t_b11(
@@ -798,22 +696,12 @@ DEEP_DEQUANT_BODIES = {DEQUANT_PLANAR_T_B11_DEEP: DEQUANT_PLANAR_T_B11}
 # in flight (instead of the BlockSpec pipeline's one) overlaps the
 # stream with the decode.
 DEEP_STREAM_DEPTH = 4
-# Per-tile f32 accumulator bound of the deep kernel, per stack.
+# Per-tile f32 accumulator bound of the deep kernel, per stack. Empirical,
+# from TPU v6e with 3584 x 3072 experts (Kimi K3); not derived.
 DEEP_MAX_ACC_BYTES = 2 * 1024 * 1024
 # Row tile slots of the deep kernel: the visited `[tm, K]` lhs tile is
 # double buffered so visit j + 1's rows land while visit j computes.
 DEEP_ROW_TILE_SLOTS = 2
-
-
-def _e8m0_to_f32(scales: jax.Array) -> jax.Array:
-    """2^(u8-127) by exponent-bit construction, exact for all 256 codes.
-
-    Not a libm exp2: code 0 is the f32 subnormal 2^-127 (whose bit pattern
-    is not e<<23) and 255 is inf, so building the exponent field directly
-    matches np.exp2 bit for bit.
-    """
-    exps = lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
-    return jnp.where(scales == 0, jnp.float32(2.0**-127), exps)
 
 
 def _use_k_loop(k: int, chunk: int) -> bool:
@@ -1327,8 +1215,7 @@ def mxfp4_gmm(
         raise ValueError(
             f"planar weights are repacked per {PLANAR_WINDOW}-element window,"
             f" so the kernel k chunk must equal it; got chunk {chunk} for k"
-            f" {k}. Callers gate on can_use_kernel(...) for shapes that cannot"
-            " serve the window."
+            f" {k}."
         )
     _validate(lhs, packed, scales, group_sizes, (tm, chunk, tn))
     if jnp.dtype(lhs.dtype).itemsize == 1:
@@ -1506,132 +1393,6 @@ def mxfp4_gmm(
     )
 
 
-def mxfp4_gmm_reference(
-    lhs: jax.Array,
-    packed: jax.Array,
-    scales: jax.Array,
-    group_sizes: jax.Array,
-    *,
-    preferred_element_type: jax.typing.DTypeLike | None = None,
-) -> jax.Array:
-    """Grouped MXFP4 matmul without Pallas, for CPU and equality tests.
-
-    Dequantizes the whole stack and runs `jax.lax.ragged_dot`. Unlike
-    `mxfp4_gmm` it takes the checkpoint layout.
-
-    Args:
-      lhs: `[M, K]` activations, rows grouped by expert.
-      packed: `[E, N, K/2]` uint8 MXFP4 nibble pairs (checkpoint order).
-      scales: `[E, N, K/32]` uint8 e8m0 exponents.
-      group_sizes: `[E]` int32 rows per expert.
-      preferred_element_type: output dtype; None keeps the activation dtype.
-
-    Returns:
-      `[M, N]` products; rows outside every group are zero.
-    """
-    e, n, half_k = packed.shape
-    k = half_k * 2
-    codes = jnp.stack([packed & 0x0F, packed >> 4], axis=-1).reshape(e, n, k)
-    values = jnp.take(jnp.asarray(_E2M1_LUT, jnp.float32), codes.astype(jnp.int32))
-    exps = _e8m0_to_f32(scales)
-    groups = scales.shape[-1]
-    values = values.reshape(e, n, groups, k // groups) * exps[..., None]
-    # [E, N, K] -> [E, K, N]: ragged_dot contracts lhs's minor with the
-    # rhs's SECOND-minor, while the kernel contracts both minors.
-    dense = values.reshape(e, n, k).transpose(0, 2, 1).astype(jnp.bfloat16)
-    out = jax.lax.ragged_dot(lhs, dense.astype(lhs.dtype), group_sizes)
-    return out if preferred_element_type is None else out.astype(preferred_element_type)
-
-
-def mxfp4_fused_gate_up_reference(
-    lhs: jax.Array,
-    gate_packed: jax.Array,
-    gate_scales: jax.Array,
-    up_packed: jax.Array,
-    up_scales: jax.Array,
-    group_sizes: jax.Array,
-    *,
-    situ_beta: float,
-    situ_linear_beta: float | None,
-) -> jax.Array:
-    """Fused gate+up MXFP4 matmul with the SiTU epilogue, without Pallas.
-
-    Two `mxfp4_gmm_reference` matmuls followed by `_situ_f32`, so rows
-    outside every group come back zero where the kernels leave them
-    unspecified. Output keeps the activation dtype.
-
-    Args:
-      lhs: `[M, K]` activations, rows grouped by expert.
-      gate_packed: `[E, N, K/2]` uint8 gate nibble pairs (checkpoint order).
-      gate_scales: `[E, N, K/32]` uint8 gate e8m0 exponents.
-      up_packed: `[E, N, K/2]` uint8 up nibble pairs.
-      up_scales: `[E, N, K/32]` uint8 up e8m0 exponents.
-      group_sizes: `[E]` int32 rows per expert.
-      situ_beta: SiTU gate clamp (0.0 for SiLU).
-      situ_linear_beta: SiTU linear clamp, or None.
-
-    Returns:
-      `[M, N]` SiTU-gated activations.
-    """
-    gate = mxfp4_gmm_reference(lhs, gate_packed, gate_scales, group_sizes)
-    up = mxfp4_gmm_reference(lhs, up_packed, up_scales, group_sizes)
-    return _situ_f32(gate, up, beta=situ_beta, linear_beta=situ_linear_beta).astype(
-        gate.dtype
-    )
-
-
-def can_use_kernel(
-    lhs_rows: int,
-    k: int,
-    tiling: tuple[int, int, int] | None = None,
-    rhs_pairs: int = 1,
-    vmem_budget: int | None = None,
-    scoped_elem_bytes: int = SCOPED_ELEM_BYTES_V6E,
-    dequant: str = DEQUANT_PLANAR_T_B11,
-) -> bool:
-    """Whether `mxfp4_gmm`'s tiling constraints hold for these shapes.
-
-    Toy configs (a 12-wide latent, say) cannot tile a 32-element scale group
-    or the 512-element planar window. `rhs_pairs=2` sizes the default tiling
-    for the fused gate+up kernel (same constraint set, doubled rhs working
-    set); `vmem_budget` and `scoped_elem_bytes` as `default_tiling`.
-
-    Args:
-      lhs_rows: lhs rows (M).
-      k: contraction.
-      tiling: explicit `(tm, k_chunk, tn)`, or None for `default_tiling`.
-      rhs_pairs: weight stacks streamed per lhs block.
-      vmem_budget: as `default_tiling`.
-      scoped_elem_bytes: as `default_tiling`.
-      dequant: one of `DEQUANT_MODES`.
-
-    Returns:
-      Whether the kernel can serve the shape.
-    """
-    if dequant not in DEQUANT_MODES:
-        raise ValueError(
-            f"unknown dequant mode {dequant!r}, want one of {DEQUANT_MODES}"
-        )
-    tm, chunk, _ = tiling or default_tiling(
-        lhs_rows,
-        k,
-        1,
-        rhs_pairs=rhs_pairs,
-        vmem_budget=vmem_budget,
-        scoped_elem_bytes=scoped_elem_bytes,
-        force_chunk=PLANAR_WINDOW,
-    )
-    tm, chunk = min(tm, lhs_rows), min(chunk, k)
-    return (
-        k % SCALE_GROUP == 0
-        and chunk % SCALE_GROUP == 0
-        and k % chunk == 0
-        and lhs_rows % tm == 0
-        and (tm % 8 == 0 or tm == lhs_rows)
-        and chunk == PLANAR_WINDOW
-    )
-
-
 # ============================================================================
 # Served entry points (TPU v6e)
 # ============================================================================
@@ -1643,7 +1404,8 @@ V6E_ROLLED_VMEM_BUDGET = _SCOPED_VMEM_LIMIT // 2
 V6E_DEEP_VMEM_BUDGET = 3 * _SCOPED_VMEM_LIMIT // 4
 # Routed row count up to which `moe_gmm_v6e_planar_t_b11` uses the deep
 # schedule and 32-row alignment; larger (prefill) batches use the rolled
-# schedule and 128-row alignment.
+# schedule and 128-row alignment. Empirical decode / prefill boundary from
+# TPU v6e with 3584 x 3072 experts (Kimi K3); not derived.
 _MOE_GMM_DEEP_MAX_ROWS = 2048
 # Routed-row padding of `moe_gmm_v6e_planar_t_b11`: decode-sized batches
 # pad to a multiple of 32 rows, prefill-sized ones to 128.
@@ -1651,7 +1413,8 @@ _MOE_GMM_DECODE_ROW_ALIGN = 32
 _MOE_GMM_PREFILL_ROW_ALIGN = 128
 # Expert-parallel shard count assumed when sizing the row tile: each
 # shard expects to own about `padded_m / _MOE_GMM_EP_SHARDS` of the routed
-# rows (`default_tiling(expected_rows=...)`).
+# rows (`default_tiling(expected_rows=...)`). A fixed assumption, not read
+# from the deployment: it only steers the row tile, every value is correct.
 _MOE_GMM_EP_SHARDS = 8
 
 
@@ -1678,26 +1441,63 @@ def is_planar_t_b11_layout(
     )
 
 
+# The smallest row and column tiles `default_tiling` falls back to for the
+# row counts `moe_gmm_v6e_planar_t_b11` pads to and PLANAR_WINDOW-aligned
+# widths.
+_SMALLEST_ROW_TILE = 8
+_SMALLEST_COL_TILE = 128
+
+
+def _smallest_tiling_fits(k: int, rhs_pairs: int) -> bool:
+    """Whether `moe_gmm_v6e_planar_t_b11` finds a tiling for contraction `k`.
+
+    `default_tiling` raises when its smallest candidate exceeds the budget;
+    this is that candidate for bf16 activations.
+    """
+    return (
+        _vmem_bytes(
+            _SMALLEST_ROW_TILE, k, _SMALLEST_COL_TILE, PLANAR_WINDOW, 2, rhs_pairs
+        )
+        <= V6E_ROLLED_VMEM_BUDGET
+    )
+
+
 def is_supported_by_planar_t_b11(
     hidden: int, inter: int, *, chip_version: pltpu.ChipVersion, activation: str
 ) -> bool:
     """Whether an MXFP4 MoE layer can be served by this module's kernels.
 
+    A layer this rejects keeps the loader's default MXFP4 layout and kernels.
+
+    Envelope: the kernels have been compiled and run on TPU v6e for
+    `hidden` 3584 x `inter` 3072 (Kimi K3) only. Other admitted widths rest
+    on the VMEM models, not on a measurement:
+      * the grouped kernel needs a `default_tiling` under
+        `V6E_ROLLED_VMEM_BUDGET`, which bounds both widths (checked here, so
+        a wider layer is rejected instead of failing to trace);
+      * the fused decode kernel has its own gate
+        (`can_use_fused_decode_moe_v6e_planar_t_b11`: slab bytes and a VMEM
+        estimate) and falls back to the grouped kernel.
+
     Args:
       hidden: model (contraction) width of the gate+up projection.
       inter: expert intermediate width.
-      chip_version: TPU generation; the b11 decode relies on TPU v6e's
-        hardware float8_e4m3b11fnuz expansion.
+      chip_version: TPU generation. Compared directly because the decode
+        relies on TPU v6e's hardware float8_e4m3b11fnuz expansion and all
+        tables here are the v6e ones; chips that decode FP4 on the MXU keep
+        the default layout.
       activation: expert activation string (see `parse_situ_activation`).
 
     Returns:
-      True for TPU v6e, PLANAR_WINDOW-aligned widths and a SiTU or SiLU
-      activation.
+      True for TPU v6e, PLANAR_WINDOW-aligned widths that fit the grouped
+      kernel's smallest tiling, and a SiTU or SiLU activation.
     """
     return (
         chip_version == pltpu.ChipVersion.TPU_V6E
         and hidden % PLANAR_WINDOW == 0
         and inter % PLANAR_WINDOW == 0
+        and _smallest_tiling_fits(hidden, rhs_pairs=2)
+        and _smallest_tiling_fits(inter, rhs_pairs=1)
         and (activation == "silu" or activation.startswith("situ:"))
     )
 
@@ -1772,6 +1572,7 @@ def repack_w2_planar_t(
       `[E, N/32, 1, L]` uint8 transposed scales.
     """
     w2_pt = repack_planar_t_stack(w2_packed)
+    assert isinstance(w2_pt, jax.Array)
     w2_sc = jnp.expand_dims(transpose_scales_planar_t(w2_scale), axis=2)
     return w2_pt, w2_sc
 
@@ -2074,6 +1875,7 @@ def moe_gmm_v6e_planar_t_b11(
         rhs_pairs=2,
         expected_rows=expected_rows,
         vmem_budget=V6E_ROLLED_VMEM_BUDGET,
+        # Not the v6e value: see the calibration note at the constants.
         scoped_elem_bytes=SCOPED_ELEM_BYTES_TPU7X,
         force_chunk=PLANAR_WINDOW,
     )
@@ -2141,19 +1943,25 @@ FUSED_VERIFY_MOE_MAX_TOKENS = 256
 # and 179 at 32; M=192: 203 vs 196 at 64; M=256: 204 vs 215 at 64, 325 at
 # 32, 573 at 16).
 FUSED_VERIFY_MOE_TRAY_M = 128
+# The three values below are empirical, from TPU v6e with 3584 x 3072
+# experts (Kimi K3); none is derived.
+# Bound on `_fused_verify_moe_vmem_bytes`, 2 MiB under the kernel's limit.
 _FUSED_VERIFY_MOE_VMEM_BUDGET = 46 * 1024 * 1024
-# Per-kernel VMEM limit requested by the fused decode/verify kernel.
+# Per-kernel VMEM limit requested by the fused decode/verify kernel (above
+# Mosaic's default `_SCOPED_VMEM_LIMIT`).
 _FUSED_DECODE_MOE_VMEM_LIMIT = 48 * 1024 * 1024
 # Fewest rows the single-tile variant is compiled for.
 _MIN_FUSED_DECODE_ROWS = 16
 
 
 # Expert slabs (w13 plus w2 of one expert) above this many bytes do not fit
-# the fused kernel's VMEM.
+# the fused kernel's VMEM. Empirical: the only slab run on TPU v6e is the
+# 3584 x 3072 one (27.9 MiB); larger slabs are refused, not measured.
 _FUSED_DECODE_MAX_SLAB_BYTES = 30 * 1024 * 1024
 # From this intermediate width on, the fused kernel single-buffers the w2
 # slab (fetched during the expert's own gate+up compute instead of one
-# expert ahead) to stay inside its VMEM limit.
+# expert ahead) to stay inside its VMEM limit. Empirical: 3072 is the only
+# width run on TPU v6e (Kimi K3); the true crossover is not measured.
 _FUSED_DECODE_W2_SINGLE_BUFFER_MIN_N = 3072
 
 

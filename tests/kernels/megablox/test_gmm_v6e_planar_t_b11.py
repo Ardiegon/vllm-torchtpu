@@ -36,15 +36,64 @@ def _ckpt_stack(rng, e, n, k, lo=124, hi=131):
     return packed, scales
 
 
+# e2m1 decode table, index = sign<<3 | exp<<1 | mantissa.
+_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_LUT += tuple(-v for v in _E2M1_LUT)
+
+
 def _dequant(packed, scales):
     """Dense f32 `[..., n, k]` weights of a checkpoint-layout MXFP4 stack."""
-    lut = np.asarray(gmm._E2M1_LUT, np.float32)
+    lut = np.asarray(_E2M1_LUT, np.float32)
     codes = np.stack([packed & 0x0F, packed >> 4], axis=-1)
     values = lut[codes.reshape(*packed.shape[:-1], -1)]
     exps = np.exp2(scales.astype(np.float32) - 127.0)
     k = values.shape[-1]
     values = values.reshape(*values.shape[:-1], k // 32, 32) * exps[..., None]
     return values.reshape(*packed.shape[:-1], k)
+
+
+def _unpack_planar_t_stack(packed, window=gmm.PLANAR_WINDOW):
+    """The inverse of `repack_planar_t_stack` (back to interleaved pairs)."""
+    planar = np.swapaxes(np.asarray(packed), -1, -2)
+    lead, half_k = planar.shape[:-1], planar.shape[-1]
+    planar = planar.reshape(lead + (2 * half_k // window, window // 2))
+    # Original contraction order per window, then re-pair (even, odd).
+    codes = np.concatenate([planar & 0x0F, planar >> 4], axis=-1)
+    even, odd = codes[..., 0::2], codes[..., 1::2]
+    return (even | (odd << 4)).astype(np.uint8).reshape(lead + (half_k,))
+
+
+def _scale_spread(scales, chunk=gmm.PLANAR_WINDOW):
+    """Widest e8m0 octave spread inside one window of `[..., N, K/32]` scales."""
+    arr = np.asarray(scales).astype(np.int32)
+    groups = chunk // gmm.SCALE_GROUP
+    windows = arr.reshape(*arr.shape[:-1], arr.shape[-1] // groups, groups)
+    return int((windows.max(axis=-1) - windows.min(axis=-1)).max())
+
+
+def _gmm_reference(lhs, packed, scales, group_sizes, preferred_element_type=None):
+    """Grouped MXFP4 matmul without Pallas, on checkpoint-layout weights.
+
+    `[M, K]` rows grouped by expert against `[E, N, K/2]` nibbles and
+    `[E, N, K/32]` scales; rows outside every group are zero.
+    """
+    dense = jnp.asarray(_dequant(np.asarray(packed), np.asarray(scales)))
+    # [E, N, K] -> [E, K, N]: ragged_dot contracts lhs's minor with the rhs's
+    # second-minor.
+    dense = dense.transpose(0, 2, 1).astype(jnp.bfloat16)
+    out = jax.lax.ragged_dot(lhs, dense.astype(lhs.dtype), group_sizes)
+    return out if preferred_element_type is None else out.astype(preferred_element_type)
+
+
+def _fused_gate_up_reference(
+    lhs, gate_packed, gate_scales, up_packed, up_scales, group_sizes
+):
+    """Gate and up `_gmm_reference` matmuls followed by the SiTU epilogue."""
+    gate = _gmm_reference(lhs, gate_packed, gate_scales, group_sizes)
+    up = _gmm_reference(lhs, up_packed, up_scales, group_sizes)
+    return gmm._situ_f32(gate, up, beta=BETA, linear_beta=LINEAR_BETA).astype(
+        gate.dtype
+    )
 
 
 def _assert_close(actual, expected, rel=2e-2):
@@ -82,9 +131,7 @@ def test_planar_t_repack_round_trips(as_jax):
     repacked = gmm.repack_planar_t_stack(src)
     assert repacked.shape == (2, 512, 64)
     assert isinstance(repacked, jax.Array if as_jax else np.ndarray)
-    np.testing.assert_array_equal(
-        np.asarray(gmm.unpack_planar_t_stack(repacked)), packed
-    )
+    np.testing.assert_array_equal(_unpack_planar_t_stack(repacked), packed)
 
 
 def test_planar_repack_puts_window_halves_in_one_byte():
@@ -124,7 +171,7 @@ def test_b11_chunk_decode_is_exact_inside_fold_window(spread):
     )
     decoded = np.asarray(codes.astype(jnp.float32) * wscale)
     np.testing.assert_array_equal(decoded, _dequant(packed, scales).T)
-    assert gmm.planar_t_b11_window_ok(scales)
+    assert _scale_spread(scales) <= gmm.B11_FOLD_WINDOW
 
 
 def test_b11_chunk_decode_misdecodes_past_fold_window():
@@ -136,8 +183,7 @@ def test_b11_chunk_decode_misdecodes_past_fold_window():
     )
     decoded = np.asarray(codes.astype(jnp.float32) * wscale)
     assert not np.array_equal(decoded, _dequant(packed, scales).T)
-    assert gmm.planar_t_scale_spread(scales) == spread
-    assert not gmm.planar_t_b11_window_ok(scales)
+    assert _scale_spread(scales) == spread
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +223,7 @@ def test_mxfp4_gmm_matches_reference(weights, dequant):
         dequant=dequant,
         deep_vmem_budget=gmm.V6E_DEEP_VMEM_BUDGET,
     )
-    ref = gmm.mxfp4_gmm_reference(
+    ref = _gmm_reference(
         h,
         jnp.asarray(w2),
         jnp.asarray(s2),
@@ -212,19 +258,10 @@ def test_deep_and_rolled_schedules_are_bitwise_identical(weights):
 
 def _moe_reference(weights, lhs, group_sizes):
     w13, s13, w2, s2 = (jnp.asarray(a) for a in weights["ckpt"])
-    h = gmm.mxfp4_fused_gate_up_reference(
-        lhs,
-        w13[:, :INTER],
-        s13[:, :INTER],
-        w13[:, INTER:],
-        s13[:, INTER:],
-        group_sizes,
-        situ_beta=BETA,
-        situ_linear_beta=LINEAR_BETA,
+    h = _fused_gate_up_reference(
+        lhs, w13[:, :INTER], s13[:, :INTER], w13[:, INTER:], s13[:, INTER:], group_sizes
     )
-    return gmm.mxfp4_gmm_reference(
-        h, w2, s2, group_sizes, preferred_element_type=jnp.float32
-    )
+    return _gmm_reference(h, w2, s2, group_sizes, preferred_element_type=jnp.float32)
 
 
 @pytest.mark.parametrize("sizes", [[3, 0, 5], [17, 9, 14]])
@@ -352,12 +389,6 @@ def test_can_use_fused_decode_envelope():
     )
 
 
-def test_can_use_kernel_requires_the_planar_window():
-    assert gmm.can_use_kernel(64, 3584)
-    assert not gmm.can_use_kernel(64, 96)
-    assert not gmm.can_use_kernel(64, 1024, tiling=(32, 256, 512))
-
-
 def test_layout_and_support_predicates():
     u8 = jax.ShapeDtypeStruct((E, K, INTER), jnp.uint8)
     sc = jax.ShapeDtypeStruct((E, 32, 1, INTER), jnp.uint8)
@@ -371,6 +402,41 @@ def test_layout_and_support_predicates():
     assert not supported(3584, 3072, chip_version=v7x, activation=ACT)
     assert not supported(3584, 3000, chip_version=v6e, activation=ACT)
     assert not supported(3584, 3072, chip_version=v6e, activation="gelu")
+
+
+@pytest.mark.parametrize("rhs_pairs", [1, 2])
+def test_support_predicate_rejects_exactly_the_widths_without_a_tiling(rhs_pairs):
+    """The width bound is `default_tiling`'s own failure, not a second model."""
+
+    def has_tiling(k):
+        try:
+            gmm.default_tiling(
+                gmm._MOE_GMM_DECODE_ROW_ALIGN,
+                k,
+                gmm.PLANAR_WINDOW,
+                rhs_pairs=rhs_pairs,
+                vmem_budget=gmm.V6E_ROLLED_VMEM_BUDGET,
+                scoped_elem_bytes=gmm.SCOPED_ELEM_BYTES_TPU7X,
+                force_chunk=gmm.PLANAR_WINDOW,
+            )
+        except ValueError:
+            return False
+        return True
+
+    widths = range(gmm.PLANAR_WINDOW, 250 * gmm.PLANAR_WINDOW, gmm.PLANAR_WINDOW)
+    fits = [gmm._smallest_tiling_fits(k, rhs_pairs) for k in widths]
+    assert fits == [has_tiling(k) for k in widths]
+    # Both outcomes occur, and the measured widths are far inside the bound.
+    assert fits[0] and not fits[-1]
+    assert gmm._smallest_tiling_fits(8 * 3584, rhs_pairs)
+
+
+def test_support_predicate_rejects_a_width_without_a_tiling():
+    v6e = pltpu.ChipVersion.TPU_V6E
+    supported = gmm.is_supported_by_planar_t_b11
+    too_wide = 249 * gmm.PLANAR_WINDOW
+    assert not supported(too_wide, 3072, chip_version=v6e, activation=ACT)
+    assert not supported(3584, too_wide, chip_version=v6e, activation=ACT)
 
 
 def test_parse_situ_activation():

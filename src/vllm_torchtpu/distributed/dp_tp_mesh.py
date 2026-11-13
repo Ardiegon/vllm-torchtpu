@@ -200,7 +200,6 @@ def build_dp_tp_mesh(
     *,
     dp_ranks: Sequence[int] | None = None,
     tp_ranks: Sequence[int] | None = None,
-    validate_ep_device_assignment: bool = True,
 ) -> Mesh:
     """Build (or return cached) rank-ordered 2D ``('dp', 'tp')`` JAX mesh.
 
@@ -246,8 +245,7 @@ def build_dp_tp_mesh(
     if len(set(flat_device_ids)) != len(flat_device_ids):
         raise RuntimeError(f"Duplicate TPU device IDs in 2D mesh: {flat_device_ids}")
 
-    if validate_ep_device_assignment:
-        _check_matches_ep_mesh(flat_device_ids)
+    _check_matches_ep_mesh(flat_device_ids)
 
     cache_key = (dp_size, tp_size, flat_device_ids)
     if cache_key not in _MESH_2D_CACHE:

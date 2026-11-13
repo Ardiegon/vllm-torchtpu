@@ -224,7 +224,7 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
         get_pcp_world_size() > 1
         or get_dcp_world_size() > 1
         or envs.MOE_FUSED_EP_SORTED_GATHER
-        or _rank_order_required
+        or rank_order_required()
     ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
