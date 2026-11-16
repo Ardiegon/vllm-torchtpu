@@ -175,11 +175,11 @@ class KimiDecoderLayer(nn.Module):
 
         assert block_residuals is not None
         prefix_sum = hidden_states
-        if block_residuals.shape[-2] > 0:
+        if block_residuals.shape[0] > 0:
             hidden_states = self.self_attention_res(prefix_sum, block_residuals)
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residuals = torch.cat(
-                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
+                (block_residuals, prefix_sum.unsqueeze(0)), dim=0
             )
             prefix_sum = None
 
@@ -285,7 +285,7 @@ class KimiModel(nn.Module):
         # A view avoids passing a symbolic local token count to TorchTPU's
         # concrete-size allocation kernel during the dynamic trace.
         block_residuals = (
-            hidden_states.unsqueeze(1)[:, :0, :]
+            hidden_states.unsqueeze(0)[:0, :, :]
             if self.attn_res_block_size is not None
             else None
         )
@@ -398,16 +398,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def process_weights_after_loading(self) -> None:
-        """Fold every AttentionResidual's norm and projection weights.
+        """Finalize the loaded weights of the modules the loader does not visit.
 
         The generic loader hook fires per module only for attention layers,
-        so the residuals are folded from here instead.
+        so the residuals, the MoE blocks and the MLA gate are handled from
+        here instead.
         """
         for module in self.modules():
-            if isinstance(module, AttentionResidual):
+            if isinstance(module, (AttentionResidual, KimiMoE)):
                 module.process_weights_after_loading()
-            elif isinstance(module, KimiMoE):
-                module.initialize_dummy_router()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
 

@@ -379,7 +379,18 @@ class StateOutBufferedRef(_GranuleStateRef):
     the others.
     """
 
+    def _num_written(self, p_id, idx):
+        assert self.cfg.state_write != config.StateWrite.NONE
+        is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+        r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+        if self.cfg.state_write == config.StateWrite.LAST:
+            return jnp.where(jnp.logical_and(is_last_tile, r_size > 0), 1, 0)
+        num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+        return jnp.where(is_last_tile, num_ckpts, 0)
+
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        if self.cfg.state_write == config.StateWrite.NONE:
+            return
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
@@ -390,6 +401,21 @@ class StateOutBufferedRef(_GranuleStateRef):
         vmem_ref = granule_view(vmem_ref, vmem_ref.shape[:2])
         dst_ref = granule_view(dst_ref, dst_ref.shape[:1])
         num_granules = vmem_ref.shape[2]
+
+        if self.cfg.state_write == config.StateWrite.LAST:
+            last = self.cfg.window_size - 1
+            for idx in range(self.cfg.seq_tile_size):
+                s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+                dma_size = self._num_written(p_id, idx)
+                state_idx = self._ckpt_state_idx(s_idx, 0)
+                pltpu.make_async_copy(
+                    vmem_ref.at[pl.ds(idx, dma_size), last],
+                    dst_ref.at[
+                        pl.ds(state_idx, dma_size), pl.ds(self.offset, num_granules)
+                    ],
+                    sem,
+                ).start()
+            return
 
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
@@ -432,6 +458,8 @@ class StateOutBufferedRef(_GranuleStateRef):
                 ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        if self.cfg.state_write == config.StateWrite.NONE:
+            return
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
@@ -441,10 +469,7 @@ class StateOutBufferedRef(_GranuleStateRef):
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
-            is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
-            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            dma_size += self._num_written(p_id, idx)
             if self.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
                 is_ckpt_tile = self.metadata_ref.is_prefill_ckpt_tile(p_id, idx)
                 dma_size += jnp.where(is_ckpt_tile, 1, 0)

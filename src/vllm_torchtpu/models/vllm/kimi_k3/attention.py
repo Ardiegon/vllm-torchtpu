@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import cast
 
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -41,6 +42,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding.common import yarn_get_mscale
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -54,6 +56,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
+    build_pooled_kda_verify_commit_ops,
+    supports_deferred_spec_commit,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -61,11 +65,17 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 
 logger = init_logger(__name__)
+
+# Row alignment applied when trimming the shared RoPE cos/sin table to the
+# served sequence length (+ any speculative draft window) so SparseCore gathers
+# stay lane-tile aligned without materializing unused positions.
+_ROPE_ROW_ALIGN = 128
 
 
 def kda_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
@@ -320,6 +330,7 @@ class MultiHeadLatentAttention(nn.Module):
             reduce_results=False,
         )
         rotary_emb = None
+        softmax_scale = qk_head_dim**-0.5
         if use_rope:
             rope_parameters = dict(
                 getattr(config, "rope_parameters", None)
@@ -334,6 +345,14 @@ class MultiHeadLatentAttention(nn.Module):
                     if rope_parameters.get("apply_yarn_scaling", True)
                     else "deepseek_llama_scaling"
                 )
+            if rope_parameters["rope_type"] == "deepseek_yarn":
+                # DeepSeek-style YaRN rescales the attention logits by
+                # mscale(factor, mscale_all_dim)^2 (matching upstream vLLM
+                # K3 MLA and DeepseekV2).
+                factor = float(rope_parameters["factor"])
+                mscale_all_dim = float(rope_parameters.get("mscale_all_dim", 0) or 0)
+                mscale = float(yarn_get_mscale(factor, mscale_all_dim))
+                softmax_scale *= mscale * mscale
             rotary_emb = get_rope(
                 self.qk_rope_head_dim,
                 max_position=config.max_position_embeddings,
@@ -341,6 +360,26 @@ class MultiHeadLatentAttention(nn.Module):
                 is_neox_style=False,
                 dtype=torch.float32,
             )
+            # YaRN builds the cos/sin table for `original_max * factor`, while
+            # positions never exceed `max_model_len` plus any speculative draft
+            # block. Each row depends on its position alone, and `get_rope`
+            # caches one shared instance across layers, so trimming once to a
+            # tile-aligned bound keeps a single compact graph input.
+            spec_cfg = vllm_config.speculative_config
+            draft_rows = (
+                int(spec_cfg.num_speculative_tokens) + 1 if spec_cfg is not None else 0
+            )
+            min_rows = int(vllm_config.model_config.max_model_len) + max(
+                draft_rows, _ROPE_ROW_ALIGN
+            )
+            max_rows = (
+                (min_rows + _ROPE_ROW_ALIGN - 1) // _ROPE_ROW_ALIGN * _ROPE_ROW_ALIGN
+            )
+            assert rotary_emb is not None
+            cache = rotary_emb.cos_sin_cache
+            assert isinstance(cache, torch.Tensor)
+            if cache.shape[0] > max_rows:
+                rotary_emb.cos_sin_cache = cache[:max_rows].contiguous()
 
         self.prefill_group = (
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
@@ -363,7 +402,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
-            qk_head_dim**-0.5,
+            softmax_scale,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
@@ -472,6 +511,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         self.prefix = prefix
         self.vllm_config = vllm_config
+        self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.head_dim = int(kda_config["head_dim"])
         self.total_heads = int(kda_config["num_heads"])
@@ -601,6 +641,48 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
         )
+        # Under speculative decoding the unified-pool KDA runs a
+        # side-effect-free W = 1 + K verify that caches its kernel inputs, and
+        # the runner commits each request's accepted prefix after rejection
+        # sampling (`commit_spec`): one state write per request instead of
+        # W. The caches hold the leading `max_num_seqs * W` token rows, which
+        # cover every windowed row ([decode][verify][prefill] batch order).
+        self.defers_spec_state_commit = (
+            self.num_spec_tokens > 0 and supports_deferred_spec_commit(vllm_config)
+        )
+        self.pooled_kda_verify_op = None
+        self.pooled_kda_commit_op = None
+        self.verify_cache_qkv: torch.Tensor | None
+        self.verify_cache_gate: torch.Tensor | None
+        self.verify_cache_beta: torch.Tensor | None
+        if self.defers_spec_state_commit:
+            self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
+                build_pooled_kda_verify_commit_ops(
+                    prefix,
+                    lower_bound=self.gate_lower_bound,
+                    eps=config.rms_norm_eps,
+                    vllm_config=vllm_config,
+                    num_spec_tokens=self.num_spec_tokens,
+                )
+            )
+            cache_rows = vllm_config.scheduler_config.max_num_seqs * (
+                self.num_spec_tokens + 1
+            )
+            act_dtype = vllm_config.model_config.dtype
+            assert isinstance(act_dtype, torch.dtype)
+            for name, width in (
+                ("verify_cache_qkv", 3 * self.local_projection_size),
+                ("verify_cache_gate", self.local_projection_size),
+                ("verify_cache_beta", self.num_heads),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.zeros(cache_rows, width, dtype=act_dtype),
+                    persistent=False,
+                )
+        else:
+            for name in ("verify_cache_qkv", "verify_cache_gate", "verify_cache_beta"):
+                self.register_buffer(name, None, persistent=False)
 
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -661,36 +743,63 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
-    def _pack_prefill_projection(self):
-        """Cache BF16 KDA input weights after the normal checkpoint loaders."""
+    def _pack_prefill_projection(self) -> None:
+        """Concatenate the three BF16 KDA input projections and free the originals."""
         self.packed_prefill_weight = None
-        if not (
-            isinstance(getattr(self, "prefill_group", None), FusedPrefillCollectives)
-            and self.use_full_rank_gate
-            and self.num_heads == 3
-            and self.head_dim == 128
-        ):
+        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
+        if not (self.use_full_rank_gate and self.head_dim == num_lanes):
             return
+        if self.g_proj is None or self.f_a_proj is None:
+            return
+        local_proj = self.local_projection_size
+        qkv_cols = 3 * local_proj
+        # The beta columns are padded up to a lane tile boundary.
+        beta_pad_cols = (self.num_heads + num_lanes - 1) // num_lanes * num_lanes
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
-        expected = ((7168, 1155), (7168, 384), (7168, 128))
-        weights = []
+        expected = (
+            (self.hidden_size, qkv_cols + self.num_heads),
+            (self.hidden_size, local_proj),
+            (self.hidden_size, self.head_dim),
+        )
+        weights: list[torch.Tensor] = []
         for projection, shape in zip(projections, expected):
             weight = getattr(projection, "weight", None)
+            if weight is None or not isinstance(weight, torch.Tensor):
+                logger.warning_once(
+                    "KimiDeltaAttention[%s]: packed prefill projection disabled "
+                    "(missing weight on %s)",
+                    self.prefix,
+                    type(projection).__name__,
+                )
+                return
             if (
-                weight is None
-                or weight.dtype != torch.bfloat16
+                weight.dtype != torch.bfloat16
                 or weight.shape != shape
                 or not getattr(projection, WEIGHT_FLIPPED_ATTR, False)
             ):
+                logger.warning_once(
+                    "KimiDeltaAttention[%s]: packed prefill projection disabled "
+                    "(expected flipped bfloat16 %s, got shape=%s dtype=%s)",
+                    self.prefix,
+                    shape,
+                    tuple(weight.shape),
+                    weight.dtype,
+                )
                 return
             weights.append(weight)
-        # q/k/v occupy 1152 columns; pad the 3 beta columns to an MXU tile.
         qkvb, gate, fa = weights
+        pad_cols = beta_pad_cols - self.num_heads
+        empty_dtype = qkvb.dtype
+        empty_device = qkvb.device
         with torch.no_grad():
-            packed = torch.cat((qkvb, qkvb.new_zeros((7168, 125)), gate, fa), dim=-1)
+            packed = torch.cat(
+                (qkvb, qkvb.new_zeros((self.hidden_size, pad_cols)), gate, fa), dim=-1
+            )
             # Materialize the layout once, avoiding a lazy cat at every call.
-            self.packed_prefill_weight = torch.empty_like(packed)
-            self.packed_prefill_weight.copy_(packed)
+            self.packed_prefill_weight = fresh_buffer(packed)
+            del packed
+            for weight in weights:
+                weight.data = torch.empty(0, dtype=empty_dtype, device=empty_device)
 
     def forward(
         self,
@@ -704,6 +813,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         output_gate: torch.Tensor | None = None
         # Set and read only on the low-rank gate path.
         gate_input: torch.Tensor | None = None
+        local_proj = self.local_projection_size
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
@@ -713,11 +823,13 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)
                 packed = hidden_states @ self.packed_prefill_weight
+            qkv_cols = 3 * local_proj
+            beta_pad_cols = packed.shape[-1] - qkv_cols - local_proj - self.head_dim
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
-                [1152, 128, 384, 128], dim=-1
+                [qkv_cols, beta_pad_cols, local_proj, self.head_dim], dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, : self.local_projection_size]
+            query = mixed_qkv[:, :local_proj]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
@@ -825,13 +937,40 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
         ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
+        conv_weight = self.conv_weight_fused
+        if self.defers_spec_state_commit:
+            assert self.pooled_kda_verify_op is not None
+            return self.pooled_kda_verify_op(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                pool,
+                conv_weight,
+                self.A_log,
+                self.dt_bias,
+                self.o_norm.weight,
+                cast(torch.Tensor, metadata.query_start_loc),
+                cast(torch.Tensor, state_indices),
+                cast(torch.Tensor, metadata.seq_lens),
+                cast(torch.Tensor, metadata.request_distribution),
+                cast(
+                    torch.Tensor,
+                    window_distribution
+                    if window_distribution is not None
+                    else metadata.request_distribution,
+                ),
+                cast(torch.Tensor, self.verify_cache_qkv),
+                cast(torch.Tensor, self.verify_cache_gate),
+                cast(torch.Tensor, self.verify_cache_beta),
+            )
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
             beta,
             output_gate,
             pool,
-            self.conv_weight_fused,
+            conv_weight,
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
@@ -842,4 +981,44 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             window_distribution,
             slot_read_offsets,
             ckpt_indices,
+        )
+
+    def commit_spec(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_distribution: torch.Tensor,
+        accepted_lens: torch.Tensor,
+    ) -> None:
+        """Commit each windowed request's accepted verify prefix.
+
+        The metadata tensors are this layer's (mamba group's) attention
+        metadata of the verify step; `accepted_lens[r]` is the number of
+        window tokens of batch row `r` whose inputs became context
+        (`num_accepted_drafts + 1`; the whole window on non-verify steps).
+        Advances the KDA conv + recurrent state in the unified pool exactly
+        as that many sequential 1-token decode steps would.
+        """
+        assert self.defers_spec_state_commit and self.pooled_kda_commit_op is not None
+        assert self.verify_cache_qkv is not None
+        assert self.verify_cache_gate is not None
+        assert self.verify_cache_beta is not None
+        if self.kv_cache is None or len(self.kv_cache) != 1:
+            raise NotImplementedError(
+                "Speculative KDA commit requires the unified KV pool"
+            )
+        self.pooled_kda_commit_op(
+            self.kv_cache[0],
+            self.verify_cache_qkv,
+            self.verify_cache_gate,
+            self.verify_cache_beta,
+            self.conv_weight_fused,
+            self.A_log,
+            self.dt_bias,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            window_distribution,
+            accepted_lens,
         )

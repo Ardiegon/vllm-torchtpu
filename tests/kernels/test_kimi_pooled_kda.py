@@ -31,7 +31,11 @@ from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     _build_fused_core,
+    _clamp_active_requests,
+    _kda_pool_geometry,
     _pooled_kda_core,
+    _pooled_kda_direct,
+    _pooled_kda_gather_scatter,
 )
 
 # Kimi-Linear TP8 shard geometry on an MLA pool.
@@ -700,3 +704,139 @@ def test_pooled_kda_speculative_checkpoints(split, seed, pool_dtype):
         np.testing.assert_array_equal(
             np.asarray(restored[-1].view(jnp.uint8)), sentinel
         )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "conv_shard_heads", [None, NUM_HEADS], ids=["unsharded", "raiden-one-source-rank"]
+)
+@pytest.mark.parametrize(
+    ("query_lens", "seq_lens", "decode_end"),
+    [([1, 5, 3], [9, 5, 11], 1), ([1, 1], [4, 7], 2)],
+    ids=["mixed", "decode-only"],
+)
+def test_pooled_kda_direct_matches_gather_scatter(
+    query_lens, seq_lens, decode_end, conv_shard_heads
+):
+    """K = 0 with one conv shard: direct granule-view vs gather/scatter."""
+    num_seqs = len(query_lens)
+    rng = np.random.default_rng(0)
+    inputs = _inputs(rng, query_lens, seq_lens)
+    conv_init, ssm_init = _initial_states(rng, num_seqs)
+    block_ids = [1, 2, 3][:num_seqs]
+    pool = _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads)
+    geom = _kda_pool_geometry(
+        pool,
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        kernel_size=KERNEL_SIZE,
+        pool_block_tokens=BLOCK_SIZE * PACK,
+        conv_shard_heads=conv_shard_heads,
+    )
+    assert geom.conv_shards == 1
+    reqs = _clamp_active_requests(
+        inputs["mixed_qkv"].shape[0],
+        inputs["query_start_loc"],
+        jnp.asarray(block_ids, dtype=jnp.int32),
+        inputs["seq_lens"],
+        jnp.asarray([decode_end, num_seqs, num_seqs], dtype=jnp.int32),
+        None,
+    )
+    operands = (
+        inputs["mixed_qkv"],
+        inputs["raw_gate"],
+        inputs["beta"],
+        inputs["output_gate"],
+        pool,
+        inputs["conv_weight"],
+        inputs["a_log"],
+        inputs["dt_bias"],
+        inputs["norm_weight"],
+    )
+
+    out_gathered, pool_gathered = _pooled_kda_gather_scatter(
+        *operands,
+        reqs,
+        geom=geom,
+        lower_bound=LOWER_BOUND,
+        eps=EPS,
+        num_spec_tokens=0,
+    )
+    out_direct, pool_direct = _pooled_kda_direct(
+        *operands,
+        reqs.query_start_loc,
+        reqs.state_indices,
+        reqs.seq_lens,
+        reqs.distribution,
+        geom=geom,
+        lower_bound=LOWER_BOUND,
+        eps=EPS,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(out_direct.view(jnp.uint16)),
+        np.asarray(out_gathered.view(jnp.uint16)),
+    )
+    np.testing.assert_array_equal(_raw(pool_direct), _raw(pool_gathered))
+
+
+@pytest.mark.parametrize(
+    ("raiden_admission", "conv_shard_heads"), [(False, None), (True, 2)]
+)
+def test_build_pooled_op_derives_conv_sharding(
+    monkeypatch: pytest.MonkeyPatch,
+    raiden_admission: bool,
+    conv_shard_heads: int | None,
+) -> None:
+    """The conv-state sharding comes from the deployment and tags the op name."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kop
+
+    monkeypatch.setattr(
+        kop.tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", raiden_admission
+    )
+    monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_KIMIK3_ADMISSION", raiden_admission)
+    monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 4)
+    registered: dict[str, object] = {}
+
+    class _FakeOp:
+        def register_fake(self, _fake):
+            pass
+
+    def fake_jax_op(name, fn, donate_argnums=()):
+        del donate_argnums
+        registered["name"] = name
+        registered["fn"] = fn
+        return _FakeOp()
+
+    seen: dict[str, object] = {}
+
+    def fake_core(*args, **kwargs):
+        del args
+        seen.update(kwargs)
+        return "out", "pool"
+
+    monkeypatch.setattr(kop.pallas, "jax_op", fake_jax_op)
+    monkeypatch.setattr(kop, "_pooled_kda_core", fake_core)
+    vllm_cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(linear_attn_config={"num_heads": 8})
+        ),
+    )
+    kop.build_kimi_pooled_kda_op(
+        "model.layers.0.self_attn",
+        lower_bound=LOWER_BOUND,
+        eps=EPS,
+        vllm_config=vllm_cfg,
+        num_spec_tokens=0,
+    )
+    op_name = str(registered["name"])
+    assert op_name.endswith("_direct_pool") is not raiden_admission
+    assert ("_conv_rank_blocks_v1_h2" in op_name) is raiden_admission
+    fn = registered["fn"]
+    assert callable(fn)
+    fn(*([None] * 13))
+    assert seen["conv_shard_heads"] == conv_shard_heads
+    assert seen["pool_block_tokens"] == 128
