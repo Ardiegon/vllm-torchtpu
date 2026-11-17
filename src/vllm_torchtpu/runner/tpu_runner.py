@@ -20,7 +20,6 @@ import bisect
 import contextlib
 import copy
 import dataclasses
-import functools
 import math
 import os
 import time
@@ -28,7 +27,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -236,26 +235,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
-@runtime_checkable
-class SpecStateCommitLayer(Protocol):
-    """A recurrent-state layer whose verify forward has no side effects."""
-
-    prefix: str
-    num_spec_tokens: int
-    defers_spec_state_commit: bool
-
-    def commit_spec(
-        self,
-        query_start_loc: torch.Tensor,
-        state_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        window_distribution: torch.Tensor,
-        accepted_lens: torch.Tensor,
-    ) -> None:
-        """Commit the first `accepted_lens[r]` window tokens of batch row `r`."""
-        ...
-
-
 @dataclass
 class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
@@ -287,7 +266,6 @@ class ExecuteModelState:
     prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = field(
         default_factory=list
     )
-    spec_commit_metadata_list: list[dict[str, Any] | None] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -324,58 +302,6 @@ def _rollback_offsets_migrate_impl(
     read_offsets: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
 ) -> None:
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
-
-
-def _spec_state_commit_impl(
-    layers: tuple[SpecStateCommitLayer, ...],
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    window_distribution: torch.Tensor,
-    state_indices: list[torch.Tensor],
-    accepted_lens: torch.Tensor,
-) -> None:
-    """Masked commit of every deferred-commit layer in one program."""
-    for layer, layer_state_indices in zip(layers, state_indices):
-        layer.commit_spec(
-            query_start_loc,
-            layer_state_indices,
-            seq_lens,
-            window_distribution,
-            accepted_lens,
-        )
-
-
-def _check_single_chunk_spec_commit(
-    layers: tuple[SpecStateCommitLayer, ...], num_chunks: int
-) -> None:
-    """Fail closed on multi-chunk steps when a layer defers its commit."""
-    if layers and num_chunks > 1:
-        raise NotImplementedError(
-            "Speculative verify with deferred state commit supports "
-            f"single-chunk steps only (got {num_chunks} forward chunks); "
-            "lower max_num_batched_tokens or disable chunking."
-        )
-
-
-def _dp_zero_tokens_across_dp(vllm_config: "VllmConfig") -> torch.Tensor | None:
-    dp_size = vllm_config.parallel_config.data_parallel_size
-    if dp_size <= 1:
-        return None
-    return torch.zeros(dp_size, dtype=torch.int32)
-
-
-def _commit_spec_state_and_offsets(
-    runner: "TPUModelRunner",
-    spec_commit_metadata: dict[str, Any] | None,
-    mamba_indices: list[torch.Tensor] | None,
-    next_tokens: torch.Tensor | None,
-    num_reqs: int,
-) -> torch.Tensor | None:
-    """Commit deferred spec state (if any), then update the read offsets."""
-    if spec_commit_metadata is not None:
-        runner._commit_spec_state(spec_commit_metadata, next_tokens, num_reqs)
-        next_tokens = None
-    return runner._update_mamba_slot_read_offsets(mamba_indices, next_tokens, num_reqs)
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1311,8 +1237,6 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
-        self._spec_commit_layers_cache: tuple[SpecStateCommitLayer, ...] | None = None
-        self._spec_commit_fn: Callable[..., None] | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -4490,9 +4414,6 @@ class TPUModelRunner(GPUModelRunner):
         spec_decode_metadata_list = []
         mamba_state_indices_list: list[list[torch.Tensor] | None] = []
         mamba_boundary_plans: list[spec_boundary_state.SpecBoundaryPlan | None] = []
-        spec_commit_metadata_list: list[dict[str, Any] | None] = []
-        spec_commit_layers = self._spec_commit_layers()
-        _check_single_chunk_spec_commit(spec_commit_layers, target_num_chunks)
         draft_chunks: list[DraftChunkInputs] = []
         prompt_logprobs_chunks: list[prompt_logprobs.PromptLogprobsChunk] = []
         is_draft_model = self._is_async_drafter
@@ -4771,9 +4692,6 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
-            spec_commit_metadata_list.append(
-                attn_metadata if spec_commit_layers else None
-            )
             ctx = self._attn_metadata_builder_ctx
             if self.mamba_slot_read_offsets is None:
                 # No mamba layers, or no spec decoding: nothing to roll back.
@@ -4840,7 +4758,6 @@ class TPUModelRunner(GPUModelRunner):
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
             prompt_logprobs_chunks=prompt_logprobs_chunks,
-            spec_commit_metadata_list=spec_commit_metadata_list,
         )
 
         if self.is_pooling_model:
@@ -5080,65 +4997,6 @@ class TPUModelRunner(GPUModelRunner):
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
         return offsets
-
-    def _spec_commit_layers(self) -> tuple[SpecStateCommitLayer, ...]:
-        """Layers that defer their speculative state commit (cached)."""
-        layers = self._spec_commit_layers_cache
-        if layers is None:
-            context = self.vllm_config.compilation_config.static_forward_context
-            layers = tuple(
-                module
-                for _, module in sorted(context.items())
-                if isinstance(module, SpecStateCommitLayer)
-                and module.defers_spec_state_commit
-            )
-            self._spec_commit_layers_cache = layers
-            if layers:
-                self._spec_commit_fn = _tpu_compile(
-                    functools.partial(_spec_state_commit_impl, layers)
-                )
-        return layers
-
-    @torch.no_grad()
-    def _commit_spec_state(
-        self,
-        attn_metadata: dict[str, Any],
-        next_tokens: torch.Tensor | None,
-        num_reqs: int,
-    ) -> None:
-        """Commit this chunk's accepted prefixes of the deferred-commit layers."""
-        layers = self._spec_commit_layers()
-        if not layers:
-            return
-        first = attn_metadata[layers[0].prefix]
-        width = int(first.mamba_state_indices.shape[0])
-        window = layers[0].num_spec_tokens + 1
-        if next_tokens is None:
-            accepted = torch.full(
-                (width,), window, dtype=torch.int32, device=self.device
-            )
-        else:
-            rows = min(width, int(next_tokens.shape[0]))
-            num_valid = (next_tokens[:rows] != INVALID_TOKEN_ID).sum(dim=1)
-            accepted = torch.zeros((width,), dtype=torch.int32, device=self.device)
-            accepted[:rows] = num_valid.to(torch.int32)
-        if num_reqs < width:
-            accepted[num_reqs:] = 0
-        window_distribution = first.mamba_request_distribution
-        if window_distribution is None:
-            window_distribution = first.request_distribution
-        state_indices = [
-            attn_metadata[layer.prefix].mamba_state_indices for layer in layers
-        ]
-        assert self._spec_commit_fn is not None
-        with self._stage_timing.stage("spec_state_commit"):
-            self._spec_commit_fn(
-                first.query_start_loc,
-                first.seq_lens,
-                window_distribution,
-                state_indices,
-                accepted,
-            )
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -5562,9 +5420,6 @@ class TPUModelRunner(GPUModelRunner):
             state.logits_list
         )
         boundary_plans = state.mamba_boundary_plans or [None] * len(state.logits_list)
-        spec_commit_md_list = state.spec_commit_metadata_list or [None] * len(
-            state.logits_list
-        )
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -5576,20 +5431,12 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for (
-                logits,
-                num_reqs,
-                md,
-                mamba_indices,
-                boundary_plan,
-                spec_commit_md,
-            ) in zip(
+            for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
                 boundary_plans,
-                spec_commit_md_list,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -5609,8 +5456,8 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    read_offsets = _commit_spec_state_and_offsets(
-                        self, spec_commit_md, mamba_indices, next_tokens, num_reqs
+                    read_offsets = self._update_mamba_slot_read_offsets(
+                        mamba_indices, next_tokens, num_reqs
                     )
                     spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
                     if needs_logprobs:
@@ -5702,11 +5549,9 @@ class TPUModelRunner(GPUModelRunner):
                                 row_starts=np.arange(num_reqs),
                             )
                         )
-                    # Non-verify chunk in a spec step: commit deferred state
-                    # in full and reset the read offsets.
-                    _commit_spec_state_and_offsets(
-                        self, spec_commit_md, mamba_indices, None, num_reqs
-                    )
+                    # Non-verify chunk in a spec step: reset the read offsets
+                    # (the latest state checkpoint is at the group base).
+                    self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
@@ -5715,18 +5560,13 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, mamba_indices, spec_commit_md in zip(
-                state.logits_list,
-                state.num_reqs_list,
-                mamba_idx_list,
-                spec_commit_md_list,
+            for logits, num_reqs, mamba_indices in zip(
+                state.logits_list, state.num_reqs_list, mamba_idx_list
             ):
                 cur_end_idx = cur_start_idx + num_reqs
-                # Non-spec step (prefill / plain decode): commit deferred state
-                # in full and reset the mamba read offsets.
-                _commit_spec_state_and_offsets(
-                    self, spec_commit_md, mamba_indices, None, num_reqs
-                )
+                # Non-spec step (prefill / plain decode): reset the mamba
+                # read offsets so the next step resumes from the group base.
+                self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
@@ -6733,7 +6573,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens if dp_lockstep else 0,
                 num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
                 if dp_lockstep
-                else _dp_zero_tokens_across_dp(self.vllm_config),
+                else None,
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,
@@ -8480,8 +8320,6 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         # The most requests one step may hold (see _spec_warmup_bucket_grid).
         max_seqs = int(self.scheduler_config.max_num_seqs)
-        if max_seqs < R:
-            return
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))

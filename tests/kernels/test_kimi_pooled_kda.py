@@ -840,3 +840,23 @@ def test_build_pooled_op_derives_conv_sharding(
     fn(*([None] * 13))
     assert seen["conv_shard_heads"] == conv_shard_heads
     assert seen["pool_block_tokens"] == 128
+
+
+def test_clamp_keeps_block_indexed_slot_read_offsets() -> None:
+    """`slot_read_offsets` is indexed by state block id, not by request row."""
+    offsets = jnp.arange(16, dtype=jnp.int32)
+    reqs = _clamp_active_requests(
+        2,
+        jnp.asarray([0, 1, 2, 2, 2], dtype=jnp.int32),
+        jnp.asarray([9, 12, 0, 0], dtype=jnp.int32),
+        jnp.asarray([3, 4, 0, 0], dtype=jnp.int32),
+        jnp.asarray([2, 2, 2], dtype=jnp.int32),
+        None,
+        slot_read_offsets=offsets,
+        ckpt_indices=jnp.zeros((4, 8), dtype=jnp.int32),
+    )
+    assert reqs.state_indices.shape == (2,)
+    assert reqs.slot_read_offsets is offsets
+    np.testing.assert_array_equal(
+        np.asarray(reqs.slot_read_offsets[reqs.state_indices]), [9, 12]
+    )

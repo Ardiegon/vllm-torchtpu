@@ -33,7 +33,6 @@ from vllm_torchtpu.gdn_pool_layout import (
     pooled_gdn_conv_state_bytes,
     pooled_gdn_ssm_state_bytes,
     pooled_gdn_state_itemsize,
-    unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
@@ -648,8 +647,6 @@ def _run_kda_window_kernel(
     geom: _KdaPoolGeometry,
     lower_bound: float | None,
     num_spec_tokens: int,
-    batched_state_write: gdn_config.StateWrite = gdn_config.StateWrite.ALL,
-    window_lens: jax.Array | None = None,
     batched_only: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """One fused conv1d + KDA pass streaming state directly from/to `pool`."""
@@ -691,8 +688,6 @@ def _run_kda_window_kernel(
         conv_dtype=geom.conv_dtype,
         num_spec_tokens=num_spec_tokens,
         batched_only=batched_only,
-        batched_state_write=batched_state_write,
-        window_lens=window_lens,
         shared_conv_granule_offset=_shared_conv_granule_offset(geom),
     )
     new_pool = (
@@ -723,15 +718,17 @@ def _clamp_active_requests(
     slot_read_offsets: jax.Array | None = None,
     ckpt_indices: jax.Array | None = None,
 ) -> _ActiveRequests:
-    """Bound the static per-request width to the padded token bucket."""
+    """Bound the static per-request width to the padded token bucket.
+
+    `slot_read_offsets` is indexed by state block id (not by request row), so
+    it is passed through unclamped.
+    """
     num_reqs = state_indices.shape[0]
     active_reqs = max(1, min(num_reqs, num_tokens))
     if active_reqs < num_reqs:
         state_indices = state_indices[:active_reqs]
         seq_lens = seq_lens[:active_reqs]
         query_start_loc = query_start_loc[: active_reqs + 1]
-        if slot_read_offsets is not None:
-            slot_read_offsets = slot_read_offsets[:active_reqs]
         if ckpt_indices is not None:
             ckpt_indices = ckpt_indices[:active_reqs]
         distribution = jnp.minimum(distribution, active_reqs)
@@ -1029,16 +1026,6 @@ def _pooled_conv_shard_heads(vllm_config: VllmConfig) -> int | None:
     return total_heads // source_tp
 
 
-def supports_deferred_spec_commit(vllm_config: VllmConfig) -> bool:
-    """Whether pooled KDA can verify without state writes and commit afterwards."""
-    return (
-        unified_kv_layout_enabled_for_architecture(
-            vllm_config.model_config.architecture
-        )
-        and _pooled_conv_shard_heads(vllm_config) is None
-    )
-
-
 def build_kimi_pooled_kda_op(
     prefix: str,
     *,
@@ -1163,371 +1150,3 @@ def build_kimi_pooled_kda_op(
         return output
 
     return pooled_impl
-
-
-def pooled_kda_verify(
-    mixed_qkv: jax.Array,
-    raw_gate: jax.Array,
-    beta: jax.Array,
-    output_gate: jax.Array,
-    pool: jax.Array,
-    conv_weight: jax.Array,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    norm_weight: jax.Array,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    seq_lens: jax.Array,
-    distribution: jax.Array,
-    window_distribution: jax.Array,
-    cache_qkv: jax.Array,
-    cache_gate: jax.Array,
-    cache_beta: jax.Array,
-    *,
-    lower_bound: float | None,
-    eps: float,
-    pool_block_tokens: int,
-    num_spec_tokens: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Side-effect-free speculative KDA verify over uniform `W = 1 + K` windows."""
-    if not num_spec_tokens:
-        raise ValueError("Pooled KDA speculative verify requires num_spec_tokens > 0")
-    num_tokens = mixed_qkv.shape[0]
-    reqs = _clamp_active_requests(
-        num_tokens,
-        query_start_loc,
-        state_indices,
-        seq_lens,
-        distribution,
-        window_distribution,
-    )
-    num_heads = a_log.shape[0]
-    head_dim = norm_weight.shape[0]
-    kernel_size = conv_weight.shape[0]
-    geom = _kda_pool_geometry(
-        pool,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        kernel_size=kernel_size,
-        pool_block_tokens=pool_block_tokens,
-        conv_shard_heads=None,
-    )
-    assert geom.conv_shards == 1, geom.conv_shards
-    new_pool, out = _run_kda_window_kernel(
-        mixed_qkv,
-        raw_gate,
-        beta,
-        pool,
-        conv_weight,
-        a_log,
-        dt_bias,
-        reqs.query_start_loc,
-        reqs.state_indices,
-        reqs.seq_lens,
-        reqs.distribution
-        if reqs.window_distribution is None
-        else reqs.window_distribution,
-        geom=geom,
-        lower_bound=lower_bound,
-        num_spec_tokens=num_spec_tokens,
-        batched_state_write=gdn_config.StateWrite.NONE,
-    )
-    output = out.reshape(num_tokens, num_heads, head_dim)
-    output = _gated_output_norm(output, output_gate, norm_weight, eps, mixed_qkv.dtype)
-
-    rows = min(num_tokens, cache_qkv.shape[0])
-
-    def _cache(cache: jax.Array, value: jax.Array) -> jax.Array:
-        return jax.lax.dynamic_update_slice(
-            cache, value[:rows].astype(cache.dtype), (0, 0)
-        )
-
-    return (
-        output,
-        new_pool,
-        _cache(cache_qkv, mixed_qkv),
-        _cache(cache_gate, raw_gate),
-        _cache(cache_beta, beta),
-    )
-
-
-def pooled_kda_commit(
-    pool: jax.Array,
-    cache_qkv: jax.Array,
-    cache_gate: jax.Array,
-    cache_beta: jax.Array,
-    conv_weight: jax.Array,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    seq_lens: jax.Array,
-    window_distribution: jax.Array,
-    accepted_lens: jax.Array,
-    *,
-    lower_bound: float | None,
-    pool_block_tokens: int,
-    num_spec_tokens: int,
-) -> jax.Array:
-    """Masked commit of the accepted prefix of each verify window."""
-    num_heads = a_log.shape[0]
-    head_dim = dt_bias.shape[0] // num_heads
-    kernel_size = conv_weight.shape[0]
-    geom = _kda_pool_geometry(
-        pool,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        kernel_size=kernel_size,
-        pool_block_tokens=pool_block_tokens,
-        conv_shard_heads=None,
-    )
-    assert geom.conv_shards == 1, geom.conv_shards
-    num_reqs = state_indices.shape[0]
-    window = num_spec_tokens + 1
-    active_reqs = max(1, min(num_reqs, cache_qkv.shape[0] // window))
-    if active_reqs < num_reqs:
-        state_indices = state_indices[:active_reqs]
-        seq_lens = seq_lens[:active_reqs]
-        query_start_loc = query_start_loc[: active_reqs + 1]
-        accepted_lens = accepted_lens[:active_reqs]
-        window_distribution = jnp.minimum(window_distribution, active_reqs)
-    new_pool, _ = _run_kda_window_kernel(
-        cache_qkv,
-        cache_gate,
-        cache_beta,
-        pool,
-        conv_weight,
-        a_log,
-        dt_bias,
-        query_start_loc,
-        state_indices,
-        seq_lens,
-        window_distribution,
-        geom=geom,
-        lower_bound=lower_bound,
-        num_spec_tokens=num_spec_tokens,
-        batched_state_write=gdn_config.StateWrite.LAST,
-        window_lens=accepted_lens.astype(jnp.int32),
-        batched_only=True,
-    )
-    return new_pool
-
-
-def build_pooled_kda_verify_commit_ops(
-    prefix: str,
-    *,
-    lower_bound: float | None,
-    eps: float,
-    vllm_config: VllmConfig,
-    num_spec_tokens: int,
-):
-    """Build the speculative verify and masked-commit pooled KDA ops."""
-    if num_spec_tokens <= 0:
-        raise ValueError("Pooled KDA verify/commit ops require num_spec_tokens > 0")
-    if not supports_deferred_spec_commit(vllm_config):
-        raise NotImplementedError(
-            "Pooled KDA verify/commit ops stream state straight from the unified "
-            "KV pool and need an unsharded conv state; use the checkpoint-window "
-            "pooled op for this deployment."
-        )
-    window = num_spec_tokens + 1
-    conv_tag = DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch.")
-    layer_tag = prefix.replace(".", "_")
-
-    def verify_core(
-        mixed_qkv: jax.Array,
-        raw_gate: jax.Array,
-        beta: jax.Array,
-        output_gate: jax.Array,
-        pool: jax.Array,
-        conv_weight: jax.Array,
-        a_log: jax.Array,
-        dt_bias: jax.Array,
-        norm_weight: jax.Array,
-        query_start_loc: jax.Array,
-        state_indices: jax.Array,
-        seq_lens: jax.Array,
-        distribution: jax.Array,
-        window_distribution: jax.Array,
-        cache_qkv: jax.Array,
-        cache_gate: jax.Array,
-        cache_beta: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        return pooled_kda_verify(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            pool,
-            conv_weight,
-            a_log,
-            dt_bias,
-            norm_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            distribution,
-            window_distribution,
-            cache_qkv,
-            cache_gate,
-            cache_beta,
-            lower_bound=lower_bound,
-            eps=eps,
-            pool_block_tokens=vllm_config.cache_config.block_size,
-            num_spec_tokens=num_spec_tokens,
-        )
-
-    def commit_core(
-        pool: jax.Array,
-        cache_qkv: jax.Array,
-        cache_gate: jax.Array,
-        cache_beta: jax.Array,
-        conv_weight: jax.Array,
-        a_log: jax.Array,
-        dt_bias: jax.Array,
-        query_start_loc: jax.Array,
-        state_indices: jax.Array,
-        seq_lens: jax.Array,
-        window_distribution: jax.Array,
-        accepted_lens: jax.Array,
-    ) -> jax.Array:
-        return pooled_kda_commit(
-            pool,
-            cache_qkv,
-            cache_gate,
-            cache_beta,
-            conv_weight,
-            a_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            window_distribution,
-            accepted_lens,
-            lower_bound=lower_bound,
-            pool_block_tokens=vllm_config.cache_config.block_size,
-            num_spec_tokens=num_spec_tokens,
-        )
-
-    verify_name = (
-        f"pallas::kda_pooled_verify_w{window}_{layer_tag}_conv_{conv_tag}_direct_pool"
-    )
-    commit_name = (
-        f"pallas::kda_pooled_commit_w{window}_{layer_tag}_conv_{conv_tag}_direct_pool"
-    )
-    verify_op = pallas.jax_op(verify_name, verify_core, donate_argnums=(4, 14, 15, 16))
-    commit_op = pallas.jax_op(commit_name, commit_core, donate_argnums=(0,))
-
-    def _fake_verify(
-        mixed_qkv,
-        _raw_gate,
-        _beta,
-        _output_gate,
-        pool,
-        _conv_weight,
-        a_log,
-        _dt_bias,
-        norm_weight,
-        _query_start_loc,
-        _state_indices,
-        _seq_lens,
-        _distribution,
-        _window_distribution,
-        cache_qkv,
-        cache_gate,
-        cache_beta,
-    ):
-        output = torch.empty(
-            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
-            dtype=mixed_qkv.dtype,
-            device=mixed_qkv.device,
-        )
-        return (
-            output,
-            torch.empty_like(pool),
-            torch.empty_like(cache_qkv),
-            torch.empty_like(cache_gate),
-            torch.empty_like(cache_beta),
-        )
-
-    def _fake_commit(pool, *args, **kwargs):
-        return torch.empty_like(pool)
-
-    verify_op.register_fake(_fake_verify)
-    commit_op.register_fake(_fake_commit)
-
-    def verify_impl(
-        mixed_qkv: torch.Tensor,
-        raw_gate: torch.Tensor,
-        beta: torch.Tensor,
-        output_gate: torch.Tensor,
-        pool: torch.Tensor,
-        conv_weight: torch.Tensor,
-        a_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        norm_weight: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        state_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        distribution: torch.Tensor,
-        window_distribution: torch.Tensor,
-        cache_qkv: torch.Tensor,
-        cache_gate: torch.Tensor,
-        cache_beta: torch.Tensor,
-    ) -> torch.Tensor:
-        output, new_pool, new_qkv, new_gate, new_beta = verify_op(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            pool,
-            conv_weight,
-            a_log,
-            dt_bias,
-            norm_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            distribution,
-            window_distribution,
-            cache_qkv,
-            cache_gate,
-            cache_beta,
-        )
-        pool.copy_(new_pool)
-        cache_qkv.copy_(new_qkv)
-        cache_gate.copy_(new_gate)
-        cache_beta.copy_(new_beta)
-        return output
-
-    def commit_impl(
-        pool: torch.Tensor,
-        cache_qkv: torch.Tensor,
-        cache_gate: torch.Tensor,
-        cache_beta: torch.Tensor,
-        conv_weight: torch.Tensor,
-        a_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        state_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        window_distribution: torch.Tensor,
-        accepted_lens: torch.Tensor,
-    ) -> None:
-        new_pool = commit_op(
-            pool,
-            cache_qkv,
-            cache_gate,
-            cache_beta,
-            conv_weight,
-            a_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            window_distribution,
-            accepted_lens,
-        )
-        pool.copy_(new_pool)
-
-    return verify_impl, commit_impl

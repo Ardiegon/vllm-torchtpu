@@ -2154,29 +2154,11 @@ def _mla_ragged_paged_attention_kernel(
     ### ------- Kernel end ------- ###
 
 
-def _q_heads_alignment(dtype: jnp.dtype) -> int:
-    """Multiple the q head count is padded to.
-
-    Heads sit on the sublane axis of the q tiles, `get_dtype_packing(dtype)`
-    of them per sublane. A chip that does not pack the dtype that densely
-    (bf16 on TPU v6e: one row per sublane) tiles the head axis by whole
-    sublane tiles, and Mosaic rejects a head slice that is not a multiple of
-    the tile ("Slice sizes along tiled dimensions must be aligned to tiles"),
-    so there the heads are padded to the tile.
-    """
-    packing = get_dtype_packing(dtype)
-    tpu_info = pltpu.get_tpu_info()
-    sublane_tiling = tpu_info.get_sublane_tiling(dtype)
-    if sublane_tiling == packing * tpu_info.num_sublanes:
-        return packing
-    return sublane_tiling
-
-
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
     _, actual_num_q_heads, actual_head_dim = q.shape
-    num_q_heads = align_to(actual_num_q_heads, _q_heads_alignment(q.dtype))
+    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype))
     head_dim = align_to(actual_head_dim, 128)
     q = jnp.pad(
         q,
@@ -2202,7 +2184,7 @@ def prepare_q_nope_inputs(
     Returns: [max_num_tokens, num_q_heads, head_dim]
     """
     actual_num_q_heads, actual_max_num_tokens, actual_head_dim = q.shape
-    num_q_heads = align_to(actual_num_q_heads, _q_heads_alignment(q.dtype))
+    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype))
     head_dim = align_to(actual_head_dim, 128)
 
     # Align T to sublane_multiple (i.e. dtype_packing * 8).
