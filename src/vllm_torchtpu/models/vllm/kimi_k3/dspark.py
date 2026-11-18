@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
@@ -67,6 +69,39 @@ def _duplicate_context_kv_weights(
         duplicate = weight.detach()
         duplicate.shard_id = layer_idx
         yield f"context_kv_proj.{param_name}", duplicate
+
+
+def _context_tp_shards(tp_size: int, hidden_size: int, kv_width: int) -> int:
+    """TP shard count of the context projections (1 means replicated).
+
+    Under TP the two context projections are sharded by output rows and their
+    (small) outputs all-gathered instead of replicating the weights. Every
+    output element is still one full-K dot product on one chip, so the values
+    match the replicated layers. Both output widths must divide by
+    ``tp_size``.
+    """
+    if tp_size > 1 and hidden_size % tp_size == 0 and kv_width % tp_size == 0:
+        return tp_size
+    return 1
+
+
+def _layer_major_context_kv(
+    all_kv: torch.Tensor, shards: int, num_layers: int, kv_width: int
+) -> torch.Tensor:
+    """``[tokens, num_layers * kv_width]`` context KV as ``[tokens, layer, kv]``.
+
+    A TP-sharded ``context_kv_proj`` gathers its output rank-major
+    (``[rank][layer][kv_width / shards]``); reorder it to the layer-major
+    layout of the replicated projection.
+    """
+    num_tokens = all_kv.shape[0]
+    if shards > 1:
+        return (
+            all_kv.view(num_tokens, shards, num_layers, kv_width // shards)
+            .transpose(1, 2)
+            .reshape(num_tokens, num_layers, kv_width)
+        )
+    return all_kv.view(num_tokens, num_layers, kv_width)
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -128,13 +163,30 @@ class K3DSparkModel(nn.Module):
 
         # Aliased to the target embedding after the draft checkpoint loads.
         self.embed_tokens: nn.Module | None = None
-        self.context_proj = ReplicatedLinear(
-            self.config.target_hidden_size * self.config.num_target_layers,
+        kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
+        self.context_tp_shards = _context_tp_shards(
+            get_tensor_model_parallel_world_size(),
             self.config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "context_proj"),
+            kv_width,
         )
+        context_in = self.config.target_hidden_size * self.config.num_target_layers
+        if self.context_tp_shards > 1:
+            self.context_proj = ColumnParallelLinear(
+                context_in,
+                self.config.hidden_size,
+                bias=False,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "context_proj"),
+            )
+        else:
+            self.context_proj = ReplicatedLinear(
+                context_in,
+                self.config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "context_proj"),
+            )
         self.context_norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [
@@ -149,14 +201,15 @@ class K3DSparkModel(nn.Module):
             ]
         )
 
-        kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
+        sharded_kv = self.context_tp_shards > 1
         self.context_kv_proj = MergedColumnParallelLinear(
             self.config.hidden_size,
             [kv_width] * self.config.num_hidden_layers,
             bias=False,
+            gather_output=sharded_kv,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "context_kv_proj"),
-            disable_tp=True,
+            disable_tp=not sharded_kv,
         )
         self.final_norm = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(
@@ -192,7 +245,9 @@ class K3DSparkModel(nn.Module):
         num_tokens = context.shape[0]
         num_layers = len(self.layers)
         kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
-        all_kv = all_kv.view(num_tokens, num_layers, kv_width)
+        all_kv = _layer_major_context_kv(
+            all_kv, self.context_tp_shards, num_layers, kv_width
+        )
 
         for layer_idx, layer in enumerate(
             cast("Iterable[K3DSparkDecoderLayer]", self.layers)
