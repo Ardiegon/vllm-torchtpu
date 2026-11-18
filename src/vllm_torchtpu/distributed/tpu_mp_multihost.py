@@ -94,6 +94,16 @@ def _rendezvous_port(base_port: int) -> int:
     return int(base_port) + 1
 
 
+def mp_multihost_dp_master_port(master_port: int) -> int:
+    """Deterministic TorchTPU DP master port for `--nnodes` + DP runs.
+
+    Placed past both `master_port` (vLLM's coordination port) and
+    `_rendezvous_port(master_port)` (the multi-host TCPStore bootstrap,
+    including an overridden `TORCH_TPU_MP_RENDEZVOUS_PORT`).
+    """
+    return max(int(master_port) + 1, _rendezvous_port(master_port)) + 1
+
+
 def _rendezvous_host_ips(
     *, num_peers: int, peer_index: int, master_addr: str, port: int, key_prefix: str
 ) -> tuple[list[str], str]:
