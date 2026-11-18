@@ -2633,3 +2633,74 @@ def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> N
         KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
             stub, 1000, 1, 1, torch.device("cpu"), torch.float32
         )
+
+
+def test_moe_gate_correction_bias_is_float32(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Routing e_score_correction_bias stays float32 under a bf16 default dtype."""
+
+    class Fake(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    class FakeGate(nn.Module):
+        def __init__(self, input_size: int, output_size: int, **kwargs) -> None:
+            super().__init__()
+            del input_size, kwargs
+            self.output_size = output_size
+
+        def forward(
+            self, hidden_states: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            return (
+                torch.zeros(
+                    hidden_states.shape[0], self.output_size, dtype=torch.float32
+                ),
+                None,
+            )
+
+    class FakeExperts(nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.correction_bias = kwargs["e_score_correction_bias"]
+
+        def forward(
+            self, *, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        ) -> torch.Tensor:
+            scores = torch.sigmoid(router_logits) + self.correction_bias
+            top_expert = scores.argmax(dim=-1, keepdim=True).to(hidden_states.dtype)
+            return top_expert.expand_as(hidden_states)
+
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "KimiMLP", Fake)
+    monkeypatch.setattr(kimi_moe, "make_latent_projection", Fake)
+    monkeypatch.setattr(
+        kimi_moe, "FusedMoEFactory", lambda **kwargs: FakeExperts(**kwargs)
+    )
+    monkeypatch.setattr(kimi_moe, "RMSNorm", Fake)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_experts=8,
+        num_experts_per_token=2,
+        moe_intermediate_size=32,
+        routed_expert_hidden_size=8,
+        latent_moe_use_norm=False,
+    )
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    assert layer.gate.e_score_correction_bias.dtype == torch.float32
+    assert layer.gate.e_score_correction_bias.shape == (8,)
+
+    # 1.0 + 1e-4 collapses to 1.0 in bf16 (tying expert 0), so forward routing
+    # selects expert 1 only when e_score_correction_bias stays fp32.
+    with torch.no_grad():
+        layer.gate.e_score_correction_bias.copy_(
+            torch.tensor([1.0, 1.0 + 1e-4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        )
+    out = layer(torch.ones(2, 16, dtype=torch.bfloat16))
+    assert out[:, 0].tolist() == [1.0, 1.0]

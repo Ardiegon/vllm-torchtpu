@@ -101,7 +101,7 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.zeros(config.num_experts)
+            torch.zeros(config.num_experts, dtype=torch.float32)
         )
 
         # Replicated by default; sharded across a chip's cores under
