@@ -38,6 +38,23 @@ class GDNMode(enum.StrEnum):
     PER_SEQ = enum.auto()
 
 
+class StateWrite(enum.StrEnum):
+    """Which window checkpoints `copy_out` writes back to a shared state pool."""
+
+    # One checkpoint per valid window position: vLLM's checkpoint-selection
+    # rollback scheme.
+    ALL = enum.auto()
+    # Nothing: a side-effect-free verify that streams the committed state in
+    # and leaves the pool bytes untouched.
+    NONE = enum.auto()
+    # Only window position `window_size - 1`, written to the sequence's own
+    # state block (checkpoint 0). With ragged real sizes the masked tail
+    # tokens are exact no-ops (unit decay, zero k/v/beta, frozen conv shift),
+    # so that position holds the state after the sequence's last real token:
+    # a masked commit of the accepted prefix.
+    LAST = enum.auto()
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Dtypes:
@@ -78,10 +95,18 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    # Which window checkpoints copy_out writes back to a shared state pool.
+    state_write: StateWrite = StateWrite.ALL
+    # Optional explicit granule offset of the conv region inside a shared pool
+    # block (needed when packed attention token rows pad the end of the SSM
+    # region, e.g. 5-granule MLA rows).
+    shared_conv_granule_offset: int | None = None
 
     @property
     def conv_hbm_offset(self) -> int:
         if self.is_shared:
+            if self.shared_conv_granule_offset is not None:
+                return self.shared_conv_granule_offset
             # In Unified pool. Conv state is stored after recurrent state.
             # Offset is calculated via recurrent state size.
             lane_bytes = pltpu.get_tpu_info().num_lanes * 4
@@ -188,6 +213,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.state_write != StateWrite.ALL:
+            suffix += f"_sw{self.state_write}"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
@@ -198,6 +225,10 @@ class GDNConfig:
         ret = {}
         for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
+            if key == "state_write":
+                if val == StateWrite.ALL:
+                    continue
+                val = str(val)
             if not isinstance(val, str | int | float):
                 val = str(val)
             ret[key] = val
