@@ -29,6 +29,7 @@ from vllm.distributed.parallel_state import get_dp_group
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.core.fused_moe_gmm import FUSED_DECODE_MOE_MAX_TOKENS
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
@@ -204,6 +205,7 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    fused_decode_max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -294,6 +296,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            fused_decode_max_tokens=fused_decode_max_tokens,
         )
 
         if parallel_size > 1:
@@ -381,6 +384,7 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            fused_decode_max_tokens=fused_decode_max_tokens,
         )
 
         # Reduce-scatter partial output for current chunk

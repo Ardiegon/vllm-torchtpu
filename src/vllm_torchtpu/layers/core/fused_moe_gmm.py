@@ -25,6 +25,9 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    FUSED_DECODE_MOE_MAX_TOKENS,
+    can_use_fused_decode_moe_v6e_planar_t_b11,
+    fused_decode_moe_v6e_planar_t_b11,
     is_planar_t_b11_layout,
     moe_gmm_v6e_planar_t_b11,
 )
@@ -696,6 +699,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "fused_decode_max_tokens",
     ),
 )
 def fused_moe_func(
@@ -716,6 +720,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    fused_decode_max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -735,6 +740,10 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    `fused_decode_max_tokens` is the largest batch the fused small-batch MXFP4
+    kernel serves (planar_t weights only); larger batches take the routed GMM
+    path.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -774,6 +783,34 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if can_use_fused_decode_moe_v6e_planar_t_b11(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        rhs_quant_dtype=rhs_quant_dtype,
+        max_tokens=fused_decode_max_tokens,
+    ):
+        assert w1_scale is not None and w2_scale is not None
+        logger.info_once(
+            "Selected fused single-kernel decode MoE (planar_t_b11): tokens=%d",
+            num_tokens,
+        )
+        return fused_decode_moe_v6e_planar_t_b11(
+            hidden_states,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            preferred_element_type=hidden_states.dtype,
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.

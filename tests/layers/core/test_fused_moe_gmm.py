@@ -1512,3 +1512,79 @@ def test_moe_gmm_dispatches_planar_t_and_rejects_biases(monkeypatch):
             onehot_moe_permute_threshold=0,
             rhs_quant_dtype=None,
         )
+
+
+def test_fused_moe_func_dispatches_fused_decode_and_verify_trays(monkeypatch):
+    from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+        FUSED_DECODE_MOE_MAX_TOKENS,
+        FUSED_VERIFY_MOE_MAX_TOKENS,
+    )
+
+    rng = np.random.default_rng(23)
+    _, (w13_pt, w13_sc, w2_pt, w2_sc) = _planar_t_test_weights(rng)
+    calls: list[tuple[str, int]] = []
+    real_fused = fused_moe_gmm.fused_decode_moe_v6e_planar_t_b11
+    real_routed = fused_moe_gmm.moe_gmm
+
+    def spy_fused(hs, *args, **kwargs):
+        calls.append(("fused", hs.shape[0]))
+        return real_fused(hs, *args, **kwargs)
+
+    def spy_routed(x, *args, **kwargs):
+        calls.append(("routed", kwargs["num_tokens"]))
+        return real_routed(x, *args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_gmm, "fused_decode_moe_v6e_planar_t_b11", spy_fused)
+    monkeypatch.setattr(fused_moe_gmm, "moe_gmm", spy_routed)
+
+    def _inputs(m: int):
+        hs = jnp.asarray(rng.standard_normal((m, 512)) * 0.25, jnp.bfloat16)
+        tw = jnp.full((m, 2), 0.5, jnp.bfloat16)
+        ti = jnp.tile(jnp.asarray([[0, 1]], jnp.int32), (m, 1))
+        return hs, tw, ti
+
+    def _run(hs, tw, ti, max_tokens: int) -> jax.Array:
+        with pltpu.force_tpu_interpret_mode():
+            # Call `fused_moe_func.__wrapped__` so the spy records Python dispatch
+            # per call without `@jax.jit` caching across identical shapes.
+            return fused_moe_func.__wrapped__(
+                hs,
+                w13_pt,
+                w2_pt,
+                w13_sc,
+                w2_sc,
+                None,
+                None,
+                tw,
+                ti,
+                jnp.int32(0),
+                topk=2,
+                activation="silu",
+                use_ep=False,
+                use_sparse_core=False,
+                onehot_moe_permute_threshold=0,
+                rhs_quant_dtype=None,
+                skip_padded_tokens=True,
+                fused_decode_max_tokens=max_tokens,
+            )
+
+    hs_8, tw_8, ti_8 = _inputs(8)
+    out_small = _run(hs_8, tw_8, ti_8, FUSED_DECODE_MOE_MAX_TOKENS)
+    assert out_small.shape == (8, 512)
+    assert calls[-1] == ("fused", 8)
+
+    # 72 tokens exceeds the decode cap (64) unless the caller opts into verify (256).
+    hs_72, tw_72, ti_72 = _inputs(72)
+    out_routed = _run(hs_72, tw_72, ti_72, FUSED_DECODE_MOE_MAX_TOKENS)
+    assert calls[-1] == ("routed", 72)
+
+    out_verify = _run(hs_72, tw_72, ti_72, FUSED_VERIFY_MOE_MAX_TOKENS)
+    assert calls[-1] == ("fused", 72)
+    expected = np.asarray(out_routed, np.float32)
+    scale = max(float(np.max(np.abs(expected))), 1.0)
+    np.testing.assert_allclose(
+        np.asarray(out_verify, np.float32),
+        expected,
+        rtol=0,
+        atol=2e-2 * scale,
+    )
