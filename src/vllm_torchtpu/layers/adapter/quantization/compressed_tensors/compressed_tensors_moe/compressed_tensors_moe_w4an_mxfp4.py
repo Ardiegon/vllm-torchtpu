@@ -13,9 +13,11 @@
 # limitations under the License.
 import math
 import zlib
+from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
 import torch
+from torch_tpu._internal import pallas
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
@@ -23,6 +25,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    is_supported_by_planar_t_b11,
+    repack_w2_planar_t,
+    repack_w13_planar_t,
+)
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -40,10 +47,62 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     release_memory_to_os,
 )
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32_bits
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
+
+_planar_t_load_ops: dict[str, Callable] = {}
+
+
+def _fake_load_w13_planar_t(
+    w13_packed: torch.Tensor, s13_u8: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    e, two_n, half_k = w13_packed.shape
+    n = two_n // 2
+    return (
+        w13_packed.new_empty((e, half_k * 2, n)),
+        s13_u8.new_empty((e, 2 * s13_u8.shape[2], 1, n)),
+    )
+
+
+def _fake_load_w2_planar_t(
+    w2_packed: torch.Tensor, s2_u8: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    e, out_dim, half_n = w2_packed.shape
+    return (
+        w2_packed.new_empty((e, half_n, out_dim)),
+        s2_u8.new_empty((e, s2_u8.shape[2], 1, out_dim)),
+    )
+
+
+def _planar_t_load_op(name: str, fn: Callable, fake_fn: Callable) -> Callable:
+    """Cached torch bridge of a planar_t MXFP4 load transform."""
+    op = _planar_t_load_ops.get(name)
+    if op is None:
+        op = pallas.jax_op(name, fn)
+        op.register_fake(fake_fn)
+        _planar_t_load_ops[name] = op
+    return op
+
+
+def load_w13_planar_t_mxfp4(
+    w13_u8: torch.Tensor, s13_u8: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-time load transform of MXFP4 gate+up weights to planar_t."""
+    return _planar_t_load_op(
+        "pallas::mxfp4_load_w13_planar_t", repack_w13_planar_t, _fake_load_w13_planar_t
+    )(w13_u8, s13_u8)
+
+
+def load_w2_planar_t_mxfp4(
+    w2_u8: torch.Tensor, s2_u8: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-time load transform of MXFP4 down-projection weights to planar_t."""
+    return _planar_t_load_op(
+        "pallas::mxfp4_load_w2_planar_t", repack_w2_planar_t, _fake_load_w2_planar_t
+    )(w2_u8, s2_u8)
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
@@ -183,17 +242,34 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w2_weight_packed = self._loaded_data(layer.w2_weight_packed).to("tpu")
         w2_weight_scale = self._loaded_data(layer.w2_weight_scale).to("tpu")
 
-        # Convert e8m0 scales to fp32
-        w13_scale = e8m0_to_fp32_bits(w13_weight_scale)
-        w2_scale = e8m0_to_fp32_bits(w2_weight_scale)
-
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
-        if requant_block is not None:
+        hidden = w13_weight_packed.shape[-1] * 2
+        inter = w2_weight_packed.shape[-1] * 2
+        activation_str = self._set_tpu_activation(layer)
+        is_v6e_planar_t_eligible = (
+            requant_block is None
+            and is_supported_by_planar_t_b11(
+                hidden,
+                inter,
+                chip_version=get_chip_version(),
+                activation=activation_str,
+            )
+        )
+
+        if is_v6e_planar_t_eligible:
+            w13_weight, w13_scale_4d = load_w13_planar_t_mxfp4(
+                fresh_buffer(w13_weight_packed),
+                fresh_buffer(w13_weight_scale),
+            )
+            w2_weight, w2_scale_4d = load_w2_planar_t_mxfp4(
+                fresh_buffer(w2_weight_packed),
+                fresh_buffer(w2_weight_scale),
+            )
+        elif requant_block is not None:
+            w13_scale = e8m0_to_fp32_bits(w13_weight_scale)
+            w2_scale = e8m0_to_fp32_bits(w2_weight_scale)
             requant_block = int(requant_block)
 
-            # The last dim of packed weights is K/2. So K is shape[-1] * 2.
-            hidden = w13_weight_packed.shape[-1] * 2
-            inter = w2_weight_packed.shape[-1] * 2
             if hidden % requant_block != 0 or inter % requant_block != 0:
                 raise ValueError(
                     f"W4A8 requantization needs hidden ({hidden}) and inter ({inter}) "
@@ -209,6 +285,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 fresh_buffer(w2_weight_packed), w2_scale, requant_block
             )
         else:
+            w13_scale = e8m0_to_fp32_bits(w13_weight_scale)
+            w2_scale = e8m0_to_fp32_bits(w2_weight_scale)
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
                 # scale shape: [E, N, num_blocks]
@@ -260,7 +338,6 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         release_memory_to_os()
 
-        activation_str = self._set_tpu_activation(layer)
         use_ep = layer.moe_config.moe_parallel_config.use_ep
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)
