@@ -3892,6 +3892,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 spec_decode_metadata_list=[None],
                 mamba_state_indices_list=None,
                 mamba_boundary_plans=None,
+                spec_commit_metadata_list=None,
                 pooler_output_list=[],
                 top_tokens=False,
                 kv_save_nan_check=None,
@@ -4249,3 +4250,238 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+class _FakeSpecCommitLayer(torch.nn.Module):
+    """Minimal SpecStateCommitLayer: records each commit_spec call."""
+
+    def __init__(self, prefix: str, num_spec_tokens: int, defers: bool = True):
+        super().__init__()
+        self.prefix = prefix
+        self.num_spec_tokens = num_spec_tokens
+        self.defers_spec_state_commit = defers
+        self.calls: list[tuple[torch.Tensor, ...]] = []
+
+    def commit_spec(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_distribution: torch.Tensor,
+        accepted_lens: torch.Tensor,
+    ) -> None:
+        self.calls.append(
+            (
+                query_start_loc,
+                state_indices,
+                seq_lens,
+                window_distribution,
+                accepted_lens,
+            )
+        )
+
+
+def _spec_commit_runner(layers: tuple[_FakeSpecCommitLayer, ...]) -> SimpleNamespace:
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _stage_timing=SimpleNamespace(stage=lambda name: contextlib.nullcontext()),
+        _spec_commit_layers_cache=layers,
+        _spec_commit_fn=lambda *args: tpu_runner._spec_state_commit_impl(layers, *args),
+    )
+    runner._spec_commit_layers = TPUModelRunner._spec_commit_layers.__get__(runner)
+    return runner
+
+
+def _spec_commit_metadata(prefix: str, width: int, *, mamba_distribution: bool):
+    distribution = torch.tensor([0, 2, 2], dtype=torch.int32)
+    return {
+        prefix: SimpleNamespace(
+            mamba_state_indices=torch.arange(1, width + 1, dtype=torch.int32),
+            mamba_request_distribution=distribution if mamba_distribution else None,
+            request_distribution=distribution,
+            query_start_loc=torch.arange(width + 1, dtype=torch.int32) * 4,
+            seq_lens=torch.full((width,), 9, dtype=torch.int32),
+        )
+    }
+
+
+class TestSpecStateCommit:
+    """sample_tokens commits each request's accepted prefix to deferred layers."""
+
+    def _commit(self, next_tokens, num_reqs, *, mamba_distribution=True):
+        layer = _FakeSpecCommitLayer("layers.0.attn", num_spec_tokens=3)
+        runner = _spec_commit_runner((layer,))
+        metadata = _spec_commit_metadata(
+            layer.prefix, width=4, mamba_distribution=mamba_distribution
+        )
+        TPUModelRunner._commit_spec_state(runner, metadata, next_tokens, num_reqs)
+        assert len(layer.calls) == 1
+        return layer.calls[0]
+
+    def test_accepted_lens_count_valid_tokens_per_request(self):
+        invalid = tpu_runner.INVALID_TOKEN_ID
+        next_tokens = torch.tensor(
+            [[5, 6, invalid, invalid], [5, invalid, invalid, invalid]]
+        )
+        *_, accepted = self._commit(next_tokens, num_reqs=2)
+        assert accepted.tolist() == [2, 1, 0, 0]
+        assert accepted.dtype == torch.int32
+
+    def test_rows_beyond_num_reqs_commit_nothing(self):
+        invalid = tpu_runner.INVALID_TOKEN_ID
+        next_tokens = torch.tensor([[5, invalid, invalid], [5, 6, 7]])
+        *_, accepted = self._commit(next_tokens, num_reqs=1)
+        assert accepted.tolist() == [1, 0, 0, 0]
+
+    def test_chunk_without_drafts_commits_full_windows(self):
+        *_, accepted = self._commit(None, num_reqs=2)
+        assert accepted.tolist() == [4, 4, 0, 0]
+
+    def test_window_distribution_falls_back_to_request_distribution(self):
+        _, state_indices, _, window_distribution, _ = self._commit(
+            None, num_reqs=2, mamba_distribution=False
+        )
+        assert window_distribution.tolist() == [0, 2, 2]
+        assert state_indices.tolist() == [1, 2, 3, 4]
+
+    def test_no_deferred_layers_is_a_noop(self):
+        runner = _spec_commit_runner(())
+        runner._spec_commit_fn = MagicMock()
+        TPUModelRunner._commit_spec_state(runner, {}, None, 2)
+        runner._spec_commit_fn.assert_not_called()
+
+    def test_layers_discovered_by_protocol_and_flag(self):
+        deferring = _FakeSpecCommitLayer("b.attn", num_spec_tokens=3)
+        other = _FakeSpecCommitLayer("a.attn", num_spec_tokens=3)
+        not_deferring = _FakeSpecCommitLayer("c.attn", 3, defers=False)
+        runner = SimpleNamespace(
+            _spec_commit_layers_cache=None,
+            _spec_commit_fn=None,
+            vllm_config=SimpleNamespace(
+                compilation_config=SimpleNamespace(
+                    static_forward_context={
+                        "b.attn": deferring,
+                        "c.attn": not_deferring,
+                        "mla": torch.nn.Linear(2, 2),
+                        "a.attn": other,
+                    }
+                )
+            ),
+        )
+        layers = TPUModelRunner._spec_commit_layers(runner)
+        assert layers == (other, deferring)
+        assert runner._spec_commit_layers_cache == layers
+        assert runner._spec_commit_fn is not None
+
+    def test_offsets_reset_after_a_deferred_commit_and_return_read_offsets(self):
+        expected_offsets = torch.zeros(2, dtype=torch.int32)
+        runner = SimpleNamespace(
+            _commit_spec_state=MagicMock(),
+            _update_mamba_slot_read_offsets=MagicMock(return_value=expected_offsets),
+        )
+        next_tokens = torch.tensor([[5, 6]])
+        metadata = {"layers.0.attn": object()}
+        got = tpu_runner._commit_spec_state_and_offsets(
+            runner, metadata, ["indices"], next_tokens, 1
+        )
+        assert got is expected_offsets
+        runner._commit_spec_state.assert_called_once_with(metadata, next_tokens, 1)
+        runner._update_mamba_slot_read_offsets.assert_called_once_with(
+            ["indices"], None, 1
+        )
+
+    def test_offsets_follow_next_tokens_without_a_deferred_commit(self, monkeypatch):
+        from vllm_torchtpu.runner import spec_boundary_state
+
+        expected_offsets = torch.tensor([1], dtype=torch.int32)
+        runner = SimpleNamespace(
+            _commit_spec_state=MagicMock(),
+            _update_mamba_slot_read_offsets=MagicMock(return_value=expected_offsets),
+        )
+        next_tokens = torch.tensor([[5, 6]])
+        got = tpu_runner._commit_spec_state_and_offsets(
+            runner, None, ["indices"], next_tokens, 1
+        )
+        assert got is expected_offsets
+        runner._commit_spec_state.assert_not_called()
+        runner._update_mamba_slot_read_offsets.assert_called_once_with(
+            ["indices"], next_tokens, 1
+        )
+
+        # Compact-mamba models (`spec_commit_metadata=None`) rely on the real
+        # `_update_mamba_slot_read_offsets` returning per-request `accepted - 1`
+        # offsets so `spec_boundary_state.copy_states` copies the boundary slot.
+        monkeypatch.setattr(
+            tpu_runner,
+            "copy_mamba_state_blocks",
+            lambda pools, src, dst: [
+                pool.__setitem__(dst.long(), pool[src.long()].clone()) for pool in pools
+            ],
+        )
+        pool = torch.full((32, 4), -1.0)
+        bt = torch.arange(1, 17, dtype=torch.int32).unsqueeze(0)
+        compact_runner = SimpleNamespace(
+            _mamba_ckpt_window=4,
+            mamba_slot_read_offsets=torch.zeros(32, dtype=torch.int32),
+            _mamba_copy_plan=[(1, [pool])],
+            _mamba_state_block_size=16,
+            _pool_block_split=1,
+            bm_pool_layout=None,
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            vllm_config=SimpleNamespace(kv_transfer_config=None),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=SimpleNamespace(num_speculative_tokens=3),
+            max_num_reqs=8,
+            device="cpu",
+            _unfenced_h2d_sources=[],
+            _registered_h2d_sources=set(),
+            input_batch=SimpleNamespace(
+                req_ids=["r0"],
+                num_computed_tokens_cpu=np.array([14], dtype=np.int32),
+                block_table=[
+                    SimpleNamespace(get_cpu_tensor=lambda: None),
+                    SimpleNamespace(get_cpu_tensor=lambda: bt),
+                ],
+            ),
+        )
+        compact_runner._bucket_len = TPUModelRunner._bucket_len
+        for method_name in (
+            "_pad_dev_to_bucket",
+            "_expand_pool_split",
+            "_copy_mamba_state_blocks",
+            "_mamba_column_stride",
+            "_update_mamba_slot_read_offsets",
+        ):
+            setattr(
+                compact_runner,
+                method_name,
+                getattr(TPUModelRunner, method_name).__get__(compact_runner),
+            )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens={"r0": [0, 0, 0]},
+            num_scheduled_tokens={"r0": 4},
+        )
+        seq_lens = torch.tensor([18, 0, 0, 0], dtype=torch.int32)
+        plan = spec_boundary_state.plan_copies(compact_runner, sched, 0, 1, seq_lens)
+        # Window starting at 14 writes checkpoints 15, 16, 17, 18 into blocks 2..5.
+        for t in range(4):
+            pool[2 + t] = float(15 + t)
+        invalid = tpu_runner.INVALID_TOKEN_ID
+        real_next = torch.tensor([[7, 8, 9, invalid]], dtype=torch.int64)
+        indices = [torch.tensor([2, 0, 0, 0], dtype=torch.int32)]
+        read_offsets = tpu_runner._commit_spec_state_and_offsets(
+            compact_runner, None, indices, real_next, 1
+        )
+        assert read_offsets is not None
+        # 3 accepted tokens -> offset 2 -> block 1 (completed at token 16) gets
+        # checkpoint t=1 (value 16.0).
+        assert int(compact_runner.mamba_slot_read_offsets[2]) == 2
+        spec_boundary_state.copy_states(compact_runner, plan, read_offsets)
+        assert torch.all(pool[1] == 16.0)
+
+    def test_multi_chunk_step_fails_closed(self):
+        layer = _FakeSpecCommitLayer("layers.0.attn", num_spec_tokens=3)
+        with pytest.raises(NotImplementedError, match="single-chunk"):
+            tpu_runner._check_single_chunk_spec_commit((layer,), 2)
+        tpu_runner._check_single_chunk_spec_commit((layer,), 1)
+        tpu_runner._check_single_chunk_spec_commit((), 2)
