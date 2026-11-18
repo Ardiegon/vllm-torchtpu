@@ -29,7 +29,6 @@ from vllm.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -52,7 +51,6 @@ from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.kimi_moe_ep_overlap_op import (
     MoeOverlapConfig,
-    SharedExpertActivation,
     build_dp_tp_mesh,
     build_kimi_moe_ep_overlap_op,
 )
@@ -98,35 +96,26 @@ def make_latent_projection(
     if get_num_cores_per_chip() == 1 and parallel_state.model_parallel_is_initialized():
         tp_group = parallel_state.get_tp_group()
         if tp_group is not None and tp_group.world_size >= 2:
-            if output_size % tp_group.world_size == 0:
-                logger.info_once(
-                    "Latent MoE projection [%d, %d] sharded across %d TP "
-                    "ranks (%d columns each).",
-                    output_size,
-                    input_size,
-                    tp_group.world_size,
-                    output_size // tp_group.world_size,
+            if output_size % tp_group.world_size != 0:
+                raise ValueError(
+                    f"Latent projection output {output_size} does not divide "
+                    f"across {tp_group.world_size} TP ranks"
                 )
-                return IntraChipColumnParallelLinear(
-                    input_size,
-                    output_size,
-                    bias=bias,
-                    quant_config=quant_config,
-                    prefix=prefix,
-                    group=tp_group,
-                )
-            logger.warning_once(
-                "Latent projection output %d does not divide across %d TP "
-                "ranks; leaving it replicated.",
+            logger.info_once(
+                "Latent MoE projection [%d, %d] sharded across %d TP "
+                "ranks (%d columns each).",
                 output_size,
+                input_size,
                 tp_group.world_size,
+                output_size // tp_group.world_size,
             )
-            return ReplicatedLinear(
+            return IntraChipColumnParallelLinear(
                 input_size,
                 output_size,
                 bias=bias,
                 quant_config=quant_config,
                 prefix=prefix,
+                group=tp_group,
             )
     return _make_intra_chip_latent_projection(
         input_size,
@@ -172,6 +161,7 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
+        # Replicated or intra-chip sharded; both return ``(output, bias)``.
         up_proj: nn.Module,
     ) -> None:
         super().__init__()
@@ -230,6 +220,9 @@ class KimiMoE(nn.Module):
             torch.zeros(config.num_experts, dtype=torch.float32)
         )
 
+        # Replicated by default; sharded across a chip's cores under
+        # TPU_LATENT_PROJ_INTRA_CHIP_TP. These two are the model's largest
+        # unquantized weights and are read in full by every rank each step.
         self.routed_expert_down_proj = (
             make_latent_projection(
                 hidden_size,
@@ -315,6 +308,9 @@ class KimiMoE(nn.Module):
         situ_linear_beta = (
             config.activation_situ_linear_beta if config.hidden_act == "situ" else None
         )
+        # Under TPU_MOE_HIERARCHICAL_EP this builds the routed experts
+        # with expert parallelism between chips and tensor parallelism
+        # within one chip, instead of vLLM's flat all-experts-per-device EP.
         with hierarchical_moe_parallel_config():
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
@@ -362,7 +358,12 @@ class KimiMoE(nn.Module):
         )
 
     def initialize_dummy_router(self) -> None:
-        """Use fan-in random weights and fixed, distinct random layer biases."""
+        """Use fan-in random weights and fixed, distinct random layer biases.
+
+        The generic dummy loader's +/-0.001 weights make the correction bias
+        dominate sigmoid routing scores. Match the prototype's unit logit
+        variance for normalized inputs without imposing any route counts.
+        """
         config = get_current_vllm_config_or_none()
         if config is None or str(config.load_config.load_format).lower() != "dummy":
             return
@@ -382,6 +383,8 @@ class KimiMoE(nn.Module):
         weight = torch.randn(
             weight_param.shape, generator=generator, dtype=torch.float32
         )
+        # The TPU dense loader transposes weights to [input, output]. Use
+        # the logical fan-in rather than depending on the stored layout.
         weight *= self.gate.input_size**-0.5
         with torch.no_grad():
             bias_param.copy_(bias)
@@ -420,38 +423,21 @@ class KimiMoE(nn.Module):
             )
         )
 
-    def _routed_experts_are_planar_t(self) -> bool:
-        """Whether the loaded routed experts are in the planar_t MXFP4 layout."""
-        routed = cast("TpuRoutedExperts", self.experts.routed_experts)
-        return all(
-            tensor.dtype == torch.uint8
-            for tensor in (
-                routed.w13_weight,
-                routed.w2_weight,
-                routed.w13_weight_scale,
-                routed.w2_weight_scale,
-            )
-        )
-
     def process_weights_after_loading(self) -> None:
         """Build the fused EP-overlap layer exit where it applies."""
         self.initialize_dummy_router()
-        if self._uses_ep_overlap and self._pack_ep_overlap_weights():
+        if self._uses_ep_overlap:
+            self._pack_ep_overlap_weights()
             self._build_ep_overlap_op()
 
-    def _pack_ep_overlap_weights(self) -> bool:
-        """Set the weights the EP-overlap layer exit reads; False if it cannot."""
+    def _pack_ep_overlap_weights(self) -> None:
+        """Set the weights the EP-overlap layer exit reads."""
         shared_experts = self.shared_experts
         down_proj = self.routed_expert_down_proj
         up_proj = self.routed_expert_up_proj
         assert shared_experts is not None
         assert isinstance(down_proj, IntraChipColumnParallelLinear)
         assert isinstance(up_proj, IntraChipColumnParallelLinear)
-        if not self._routed_experts_are_planar_t():
-            self._warn_ep_overlap_not_built(
-                "the routed experts were not loaded in the planar_t MXFP4 layout"
-            )
-            return False
         layers = (
             shared_experts.gate_up_proj,
             down_proj,
@@ -462,11 +448,10 @@ class KimiMoE(nn.Module):
         for layer in layers:
             weight = _unbiased_bf16_weight(layer)
             if weight is None:
-                self._warn_ep_overlap_not_built(
-                    "a shared-expert or latent projection is not an unquantized, "
-                    "unbiased bf16 linear layer"
+                raise ValueError(
+                    "[kimi_moe] the EP-overlap layer exit needs unquantized, "
+                    f"unbiased bf16 shared-expert and latent projections ({layer})"
                 )
-                return False
             weights.append(weight)
 
         with torch.no_grad():
@@ -499,24 +484,13 @@ class KimiMoE(nn.Module):
             )
             for weight in weights:
                 weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
-        return True
 
     def _build_ep_overlap_op(self) -> None:
         """Build the fused EP-overlap op for the split entry weights."""
         assert self.shared_experts is not None and self.w_shared_gu is not None
         routed = cast("TpuRoutedExperts", self.experts.routed_experts)
         act_fn = self.shared_experts.act_fn
-        if isinstance(act_fn, SituAndMul):
-            shared_activation = SharedExpertActivation.SITU
-            situ_beta = float(act_fn.beta)
-            situ_linear_beta = (
-                None if act_fn.linear_beta is None else float(act_fn.linear_beta)
-            )
-        elif isinstance(act_fn, SiluAndMul):
-            shared_activation = SharedExpertActivation.SILU
-            situ_beta = 1.0
-            situ_linear_beta = None
-        else:
+        if not isinstance(act_fn, SituAndMul):
             raise NotImplementedError(
                 f"shared_experts activation {type(act_fn).__name__} is not supported "
                 "by the EP-overlap op"
@@ -534,9 +508,10 @@ class KimiMoE(nn.Module):
             topk=int(routed.moe_config.experts_per_token),
             use_norm=norm is not None,
             rms_eps=float(norm.variance_epsilon) if norm is not None else 0.0,
-            shared_activation=shared_activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
+            situ_beta=float(act_fn.beta),
+            situ_linear_beta=(
+                None if act_fn.linear_beta is None else float(act_fn.linear_beta)
+            ),
             fused_decode_max_tokens=self._fused_decode_max_tokens,
         )
         self._tp_rank = torch.tensor(
@@ -545,14 +520,6 @@ class KimiMoE(nn.Module):
             device=self.w_shared_gu.device,
         )
         self._ep_overlap_op = build_kimi_moe_ep_overlap_op(build_dp_tp_mesh(), cfg)
-
-    def _warn_ep_overlap_not_built(self, reason: str) -> None:
-        logger.warning_once(
-            "[kimi_moe] The parallel layout selects the fused EP-overlap MoE "
-            "layer exit, but it cannot be built: %s. The MoE layers run the "
-            "shared and routed experts unfused instead (slower decode).",
-            reason,
-        )
 
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False

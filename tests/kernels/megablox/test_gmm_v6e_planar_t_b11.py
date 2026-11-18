@@ -124,13 +124,10 @@ def _lhs(m, seed, k=K):
 # ---------------------------------------------------------------------------
 # Layout helpers
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("as_jax", [False, True])
-def test_planar_t_repack_round_trips(as_jax):
+def test_planar_t_repack_round_trips():
     packed = np.random.default_rng(1).integers(0, 256, (2, 64, 512), np.uint8)
-    src = jnp.asarray(packed) if as_jax else packed
-    repacked = gmm.repack_planar_t_stack(src)
+    repacked = gmm.repack_planar_t_stack(jnp.asarray(packed))
     assert repacked.shape == (2, 512, 64)
-    assert isinstance(repacked, jax.Array if as_jax else np.ndarray)
     np.testing.assert_array_equal(_unpack_planar_t_stack(repacked), packed)
 
 
@@ -138,16 +135,18 @@ def test_planar_repack_puts_window_halves_in_one_byte():
     # One 512-element window: byte j holds elements j (low) and j + 256 (high).
     codes = np.arange(512, dtype=np.int64) % 16
     interleaved = (codes[0::2] | (codes[1::2] << 4)).astype(np.uint8)
-    planar = gmm.repack_planar_stack(interleaved)
+    planar = np.asarray(gmm.repack_planar_stack(jnp.asarray(interleaved)))
     np.testing.assert_array_equal(planar & 0x0F, codes[:256])
     np.testing.assert_array_equal(planar >> 4, codes[256:])
 
 
 def test_transpose_scales_planar_t_is_an_involution():
     scales = np.random.default_rng(2).integers(0, 256, (2, 40, 32), np.uint8)
-    out = gmm.transpose_scales_planar_t(scales)
+    out = gmm.transpose_scales_planar_t(jnp.asarray(scales))
     assert out.shape == (2, 32, 40)
-    np.testing.assert_array_equal(gmm.transpose_scales_planar_t(out), scales)
+    np.testing.assert_array_equal(
+        np.asarray(gmm.transpose_scales_planar_t(out)), scales
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +165,8 @@ def _window(spread, seed, tn=128, lo=118):
 def test_b11_chunk_decode_is_exact_inside_fold_window(spread):
     packed, scales = _window(spread, seed=10 + spread)
     codes, wscale = gmm._dequantize_chunk_planar_t_b11(
-        jnp.asarray(gmm.repack_planar_t_stack(packed)),
-        jnp.asarray(gmm.transpose_scales_planar_t(scales)),
+        gmm.repack_planar_t_stack(jnp.asarray(packed)),
+        gmm.transpose_scales_planar_t(jnp.asarray(scales)),
     )
     decoded = np.asarray(codes.astype(jnp.float32) * wscale)
     np.testing.assert_array_equal(decoded, _dequant(packed, scales).T)
@@ -178,8 +177,8 @@ def test_b11_chunk_decode_misdecodes_past_fold_window():
     spread = gmm.B11_FOLD_WINDOW + 1
     packed, scales = _window(spread, seed=30)
     codes, wscale = gmm._dequantize_chunk_planar_t_b11(
-        jnp.asarray(gmm.repack_planar_t_stack(packed)),
-        jnp.asarray(gmm.transpose_scales_planar_t(scales)),
+        gmm.repack_planar_t_stack(jnp.asarray(packed)),
+        gmm.transpose_scales_planar_t(jnp.asarray(scales)),
     )
     decoded = np.asarray(codes.astype(jnp.float32) * wscale)
     assert not np.array_equal(decoded, _dequant(packed, scales).T)
@@ -203,10 +202,7 @@ def _served_tiling(m, k, n, pairs):
     )
 
 
-@pytest.mark.parametrize(
-    "dequant", [gmm.DEQUANT_PLANAR_T_B11, gmm.DEQUANT_PLANAR_T_B11_DEEP]
-)
-def test_mxfp4_gmm_matches_reference(weights, dequant):
+def test_mxfp4_gmm_matches_reference(weights):
     _, _, w2, s2 = weights["ckpt"]
     _, _, w2_pt, w2_sc = weights["planar_t"]
     m = 64
@@ -219,9 +215,10 @@ def test_mxfp4_gmm_matches_reference(weights, dequant):
         jnp.squeeze(w2_sc, 2),
         group_sizes,
         tiling=tiling,
+        group_metadata=gmm._make_group_metadata(
+            group_sizes, m=m, tm=tiling[0], num_groups=E
+        ),
         interpret=True,
-        dequant=dequant,
-        deep_vmem_budget=gmm.V6E_DEEP_VMEM_BUDGET,
     )
     ref = _gmm_reference(
         h,
@@ -232,28 +229,6 @@ def test_mxfp4_gmm_matches_reference(weights, dequant):
     )
     assert out.shape == (m, K) and out.dtype == jnp.bfloat16
     _assert_close(out, ref)
-
-
-def test_deep_and_rolled_schedules_are_bitwise_identical(weights):
-    _, _, w2_pt, w2_sc = weights["planar_t"]
-    m = 64
-    h = _lhs(m, 201, k=INTER)
-    group_sizes = jnp.asarray([32, 32, 0], jnp.int32)
-    tiling = _served_tiling(m, INTER, K, 1)
-    outs = [
-        gmm.mxfp4_gmm(
-            h,
-            w2_pt,
-            jnp.squeeze(w2_sc, 2),
-            group_sizes,
-            tiling=tiling,
-            interpret=True,
-            dequant=dequant,
-            deep_vmem_budget=gmm.V6E_DEEP_VMEM_BUDGET,
-        )
-        for dequant in gmm.DEQUANT_MODES
-    ]
-    np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
 
 
 def _moe_reference(weights, lhs, group_sizes):
@@ -398,7 +373,7 @@ def test_layout_and_support_predicates():
     v6e, v7x = pltpu.ChipVersion.TPU_V6E, pltpu.ChipVersion.TPU_7X
     supported = gmm.is_supported_by_planar_t_b11
     assert supported(3584, 3072, chip_version=v6e, activation=ACT)
-    assert supported(512, 512, chip_version=v6e, activation="silu")
+    assert not supported(512, 512, chip_version=v6e, activation="silu")
     assert not supported(3584, 3072, chip_version=v7x, activation=ACT)
     assert not supported(3584, 3000, chip_version=v6e, activation=ACT)
     assert not supported(3584, 3072, chip_version=v6e, activation="gelu")
@@ -411,10 +386,12 @@ def test_support_predicate_rejects_exactly_the_widths_without_a_tiling(rhs_pairs
     def has_tiling(k):
         try:
             gmm.default_tiling(
-                gmm._MOE_GMM_DECODE_ROW_ALIGN,
+                gmm._MOE_GMM_ROW_ALIGN,
                 k,
                 gmm.PLANAR_WINDOW,
+                lhs_bytes=2,
                 rhs_pairs=rhs_pairs,
+                expected_rows=None,
                 vmem_budget=gmm.V6E_ROLLED_VMEM_BUDGET,
                 scoped_elem_bytes=gmm.SCOPED_ELEM_BYTES_TPU7X,
                 force_chunk=gmm.PLANAR_WINDOW,
@@ -442,6 +419,6 @@ def test_support_predicate_rejects_a_width_without_a_tiling():
 def test_parse_situ_activation():
     assert gmm.parse_situ_activation("situ:4.0:25.0") == (4.0, 25.0)
     assert gmm.parse_situ_activation("situ:2:none") == (2.0, None)
-    assert gmm.parse_situ_activation("silu") == (0.0, None)
-    with pytest.raises(NotImplementedError):
-        gmm.parse_situ_activation("gelu")
+    for activation in ("silu", "gelu"):
+        with pytest.raises(NotImplementedError):
+            gmm.parse_situ_activation(activation)

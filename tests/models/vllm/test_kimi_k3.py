@@ -855,11 +855,11 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    layer.use_full_rank_gate = False
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = False
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -914,11 +914,11 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    layer.use_full_rank_gate = False
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = False
     layer.use_naive_kda = False
     layer.defers_spec_state_commit = False
 
@@ -1047,7 +1047,7 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     ("num_spec_tokens", "pool_streams_directly", "defers"),
     [(0, True, False), (7, False, False), (7, True, True)],
 )
-def test_kda_defers_spec_commit_on_the_direct_pool_path(
+def test_kda_defers_spec_commit_on_the_unified_pool(
     monkeypatch: pytest.MonkeyPatch,
     num_spec_tokens: int,
     pool_streams_directly: bool,
@@ -1297,11 +1297,11 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
-    layer.use_full_rank_gate = use_full_rank_gate
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = use_full_rank_gate
     layer.defers_spec_state_commit = False
     if use_full_rank_gate:
         layer.f_a_proj = _Projection(2)
@@ -1588,11 +1588,11 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    layer.use_full_rank_gate = False
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.use_full_rank_gate = False
     layer.dispatched_kda_op = kimi_custom_ops.build_kimi_dispatched_kda_op(
         "test_compile",
         lower_bound=None,
@@ -1677,13 +1677,13 @@ def test_attention_residual_matches_reference(num_blocks: int) -> None:
     module.process_weights_after_loading()
 
     prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
-    block_residuals = torch.randn(num_blocks, num_tokens, hidden, dtype=torch.bfloat16)
+    block_residuals = torch.randn(num_tokens, num_blocks, hidden, dtype=torch.bfloat16)
 
-    values = torch.cat((block_residuals, prefix_sum.unsqueeze(0)), dim=0).float()
+    values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)), dim=-2).float()
     normed = values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + eps)
     scores = normed @ (module.norm.weight.float() * module.proj.weight[0].float())
-    probabilities = scores.softmax(dim=0)
-    expected = (probabilities.unsqueeze(-1) * values).sum(dim=0).to(prefix_sum.dtype)
+    probabilities = scores.softmax(dim=-1)
+    expected = (probabilities.unsqueeze(-1) * values).sum(dim=-2).to(prefix_sum.dtype)
 
     actual = module(prefix_sum, block_residuals)
 
@@ -1713,11 +1713,11 @@ def test_attention_residual_single_token_matches_batched_rows() -> None:
     torch.manual_seed(0)
     module = _attention_residual_stub(hidden=64, eps=1e-5)
     prefix_sum = torch.randn(5, 64, dtype=torch.bfloat16)
-    block_residuals = torch.randn(8, 5, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(5, 8, 64, dtype=torch.bfloat16)
 
     batched = module(prefix_sum, block_residuals)
     for row in range(5):
-        alone = module(prefix_sum[row : row + 1], block_residuals[:, row : row + 1])
+        alone = module(prefix_sum[row : row + 1], block_residuals[row : row + 1])
         torch.testing.assert_close(alone, batched[row : row + 1])
 
 
@@ -1737,9 +1737,9 @@ def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
         return graph.forward
 
     prefix_sum = torch.randn(1, 64, dtype=torch.bfloat16)
-    block_residuals = torch.randn(8, 1, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(1, 8, 64, dtype=torch.bfloat16)
     mark_dynamic(prefix_sum, 0)
-    mark_dynamic(block_residuals, 1)
+    mark_dynamic(block_residuals, 0)
     torch._dynamo.reset()
     # The TPU platform switches to size-oblivious shapes when compile_sizes
     # has 1; that is the mode the bucket-1 trace runs under.
@@ -1899,13 +1899,13 @@ def test_dummy_router_is_fixed_random_and_layer_specific(monkeypatch, transposed
 def test_attention_residual_bridge_fake_shape():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from vllm_torchtpu.models.vllm.kimi_k3.layers import _build_attention_residual_bt_op
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import _build_attention_residual_op
 
-    op = _build_attention_residual_bt_op(1e-5)
-    assert op is _build_attention_residual_bt_op(1e-5)
+    op = _build_attention_residual_op(1e-5)
+    assert op is _build_attention_residual_op(1e-5)
     with FakeTensorMode():
         prefix = torch.empty(256, 7168, dtype=torch.bfloat16)
-        history = torch.empty(8, 256, 7168, dtype=torch.bfloat16)
+        history = torch.empty(256, 8, 7168, dtype=torch.bfloat16)
         weight = torch.empty(7168, dtype=torch.float32)
         output = op(prefix, history, weight)
         assert output.shape == prefix.shape
@@ -2145,40 +2145,35 @@ def test_attention_project_rs_preserves_linear_layout(flipped):
 
 def test_kda_prefill_packing_preserves_projection_and_reload():
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import FusedPrefillCollectives
 
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.prefix = "layers.0.self_attn"
+    layer.prefill_group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
     layer.use_full_rank_gate = True
-    layer.hidden_size = 7168
-    layer.num_heads, layer.head_dim, layer.local_projection_size = 3, 128, 384
+    layer.num_heads, layer.head_dim = 3, 128
     generator = torch.Generator().manual_seed(19)
-    widths = {"fused_qkvb_proj": 1155, "g_proj": 384, "f_a_proj": 128}
-    for name in widths:
+    for name, width in [("fused_qkvb_proj", 1155), ("g_proj", 384), ("f_a_proj", 128)]:
         projection = nn.Module()
+        projection.weight = nn.Parameter(
+            torch.randn((7168, width), generator=generator, dtype=torch.bfloat16) * 0.01
+        )
         setattr(projection, WEIGHT_FLIPPED_ATTR, True)
         setattr(layer, name, projection)
     x = torch.randn((2, 7168), generator=generator)
-    # Packing releases the per-projection weights, so a reload is the loader
-    # filling them again before the next packing.
-    for _reload in (False, True):
-        loaded = {}
-        for name, width in widths.items():
-            weight = (
-                torch.randn((7168, width), generator=generator, dtype=torch.bfloat16)
-                * 0.01
-            )
-            loaded[name] = weight.clone()
-            getattr(layer, name).weight = nn.Parameter(weight)
+    for reload in (False, True):
+        if reload:
+            with torch.no_grad():
+                layer.fused_qkvb_proj.weight.add_(0.02)
         layer._pack_prefill_projection()
         output = x @ layer.packed_prefill_weight.float()
-        torch.testing.assert_close(
-            output[:, :1155], x @ loaded["fused_qkvb_proj"].float()
-        )
+        qkvb = x @ layer.fused_qkvb_proj.weight.float()
+        torch.testing.assert_close(output[:, :1155], qkvb)
         assert torch.count_nonzero(output[:, 1155:1280]) == 0
-        torch.testing.assert_close(output[:, 1280:1664], x @ loaded["g_proj"].float())
-        torch.testing.assert_close(output[:, 1664:], x @ loaded["f_a_proj"].float())
-        assert all(getattr(layer, name).weight.numel() == 0 for name in widths)
+        torch.testing.assert_close(
+            output[:, 1280:1664], x @ layer.g_proj.weight.float()
+        )
+        torch.testing.assert_close(output[:, 1664:], x @ layer.f_a_proj.weight.float())
     layer.use_full_rank_gate = False
     layer._pack_prefill_projection()
     assert layer.packed_prefill_weight is None
@@ -2741,30 +2736,6 @@ def test_moe_gate_correction_bias_is_float32(monkeypatch: pytest.MonkeyPatch) ->
     assert layer.gate.e_score_correction_bias.shape == (8,)
 
 
-@pytest.mark.parametrize(
-    ("num_tokens", "expect_op"),
-    [(1, False), (15, False), (16, True), (32, True)],
-)
-def test_attention_residual_dispatches_prefill_bt_op_on_tile_multiples(
-    num_tokens: int, expect_op: bool
-) -> None:
-    """Blocks-first AttentionResidual calls `_prefill_bt_op` only on 16-token tiles."""
-    torch.manual_seed(3)
-    hidden, num_blocks, eps = 64, 4, 1e-5
-    module = _attention_residual_stub(hidden=hidden, eps=eps)
-    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    module._prefill_bt_op = lambda prefix, blocks, _w: (
-        calls.append((tuple(prefix.shape), tuple(blocks.shape))),
-        prefix + 1,
-    )[1]
-    prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
-    blocks_bt = torch.randn(num_blocks, num_tokens, hidden, dtype=torch.bfloat16)
-
-    out = module(prefix_sum, blocks_bt)
-    assert out.shape == (num_tokens, hidden)
-    assert bool(calls) is expect_op
-
-
 def test_aux_hidden_states_are_the_layer_outputs() -> None:
     """Tapped layers hand the drafter their output, before the next AttnRes mix."""
     torch.manual_seed(5)
@@ -2781,7 +2752,7 @@ def test_aux_hidden_states_are_the_layer_outputs() -> None:
             assert block_residuals is not None
             out = x * self.scale + 0.25
             self.outputs.append(out)
-            return out, torch.cat((block_residuals, x.unsqueeze(0)), dim=0)
+            return out, torch.cat((block_residuals, x.unsqueeze(-2)), dim=-2)
 
     l0, l1 = ToyDecoderLayer(0.8), ToyDecoderLayer(1.2)
     model = KimiModel.__new__(KimiModel)
@@ -2834,7 +2805,6 @@ def _overlap_config(**overrides) -> kimi_overlap_op.MoeOverlapConfig:
         topk=8,
         use_norm=True,
         rms_eps=1e-5,
-        shared_activation=kimi_overlap_op.SharedExpertActivation.SITU,
         situ_beta=4.0,
         situ_linear_beta=25.0,
         fused_decode_max_tokens=64,
@@ -2880,8 +2850,8 @@ def test_ep_overlap_op_is_built_once_per_layer_shape(registered_overlap_ops) -> 
 
     assert same is op and verify is not op
     assert [o.name for o in registered_overlap_ops] == [
-        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m64_cap64_dp8_tp16",
-        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m256_cap64_dp8_tp16",
+        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m64_dp8_tp16",
+        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m256_dp8_tp16",
     ]
     assert op.kwargs["mesh"] is mesh
     # 8 tensors, the norm weight, the first expert id and the TP rank.
@@ -2891,9 +2861,6 @@ def test_ep_overlap_op_is_built_once_per_layer_shape(registered_overlap_ops) -> 
         mesh, _overlap_config(rms_eps=1e-6)
     )
     assert distinct_eps is not op
-    assert distinct_eps.name == (
-        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m64_cap64_dp8_tp16_v1"
-    )
     assert (
         kimi_overlap_op.build_kimi_moe_ep_overlap_op(
             mesh, _overlap_config(rms_eps=1e-6)
@@ -2915,20 +2882,6 @@ def test_ep_overlap_op_without_routed_norm_drops_the_norm_operand(
     w_shared_gu = torch.empty(32, 2 * 12)
     (fake,) = op.fakes
     assert fake(hidden, rdown, None, w_shared_gu, *([None] * 6)).shape == (6, 12 + 8)
-
-
-@pytest.mark.parametrize(
-    ("dp", "tp", "axis_names"),
-    [(1, 16, ("dp", "tp")), (8, 1, ("dp", "tp")), (8, 16, ("tp", "dp"))],
-)
-def test_ep_overlap_op_rejects_other_meshes(
-    registered_overlap_ops, dp, tp, axis_names
-) -> None:
-    with pytest.raises(ValueError):
-        kimi_overlap_op.build_kimi_moe_ep_overlap_op(
-            _dp_tp_mesh_stub(dp, tp, axis_names), _overlap_config()
-        )
-    assert not registered_overlap_ops
 
 
 def _moe_layout_stub(
@@ -3212,7 +3165,7 @@ def test_kimi_moe_pack_ep_overlap_weights_and_forward_matches_unfused_reference(
     torch.testing.assert_close(summed, ref_shared + ref_routed, rtol=1e-2, atol=1e-2)
 
 
-def test_kimi_moe_warns_once_and_falls_back_when_overlap_weights_cannot_pack(
+def test_kimi_moe_rejects_overlap_weights_that_cannot_pack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(12)
@@ -3225,41 +3178,13 @@ def test_kimi_moe_warns_once_and_falls_back_when_overlap_weights_cannot_pack(
         full_w_sgu=torch.randn(24, 16, dtype=torch.bfloat16),
         full_w_sdown=torch.randn(12, 16, dtype=torch.bfloat16),
     )
-    # Bias on a projection disqualifies packing even though the layout matched.
+    # A bias on a projection cannot be packed once the layout selected the
+    # EP-overlap exit: loading fails instead of silently running unfused.
     layer.shared_experts.down_proj.bias = nn.Parameter(
         torch.zeros(16, dtype=torch.bfloat16)
     )
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        kimi_moe.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
-    )
-    unfused_calls = []
-
-    class _UnfusedExperts:
-        routed_experts = SimpleNamespace(
-            w13_weight=torch.zeros((1,), dtype=torch.uint8),
-            w2_weight=torch.zeros((1,), dtype=torch.uint8),
-            w13_weight_scale=torch.zeros((1,), dtype=torch.uint8),
-            w2_weight_scale=torch.zeros((1,), dtype=torch.uint8),
-        )
-
-        def __call__(self, *, hidden_states, router_logits):
-            unfused_calls.append(tuple(router_logits.shape))
-            return hidden_states + 1
-
-    layer.experts = _UnfusedExperts()
-
-    layer.process_weights_after_loading()
-
-    assert layer._ep_overlap_op is None
-    assert layer.packed_moe_out_weight is None
-    assert layer.shared_experts.down_proj.weight.numel() > 0
-    assert len(warnings) == 1
-    assert "unbiased bf16" in warnings[0]
-
-    x = torch.randn(2, 16, dtype=torch.bfloat16)
-    torch.testing.assert_close(layer.forward(x), x + 1)
-    assert unfused_calls == [(2, 4)]
+    with pytest.raises(ValueError, match="unbiased bf16"):
+        layer.process_weights_after_loading()
 
 
 def test_kda_layer_conforms_to_the_spec_state_commit_protocol() -> None:

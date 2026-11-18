@@ -40,21 +40,14 @@ The grid metadata is adapted from `make_group_metadata` in
 """
 
 import functools
-from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-import numpy.typing as npt
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import situ_and_mul
-
-# Nibble/scale stacks are handled on device (jax arrays and tracers) and on
-# the host (numpy) by the load-time layout helpers.
-_NibbleArray = jax.Array | np.ndarray
 
 # One e8m0 exponent per this many contraction elements (the MX block size).
 SCALE_GROUP = 32
@@ -83,10 +76,6 @@ def _round_up(x: int, multiple: int) -> int:
     """Smallest multiple of `multiple` that is >= `x`."""
     return ((x + multiple - 1) // multiple) * multiple
 
-
-# Per grid step VMEM to stay under. Half of the chip's VMEM, leaving
-# the rest for Mosaic's own scratch and any spill the scheduler needs.
-_VMEM_BUDGET = _V6E_INFO.vmem_capacity_bytes // 2
 
 # Mosaic's default per-kernel stack ("scoped vmem") limit, from
 # --xla_tpu_scoped_vmem_limit_kib=32768. A kernel whose live
@@ -135,17 +124,10 @@ def _vmem_bytes(
 
 # Bytes the Mosaic register allocator keeps live per `[tn, chunk]` element
 # of the dequant chain, calibrated against measured compiler output rather
-# than derived:
-#   * TPU v6e (`SCOPED_ELEM_BYTES_V6E`, the default): a two-pair
-#     (512, 512, 512) tile reported a 33.01M scoped allocation against the
-#     32M limit, i.e. ~56 bytes per element (~14 live 4-byte planes);
-#     rounded up so the model rejects everything the allocator would.
-#   * TPU7x (`SCOPED_ELEM_BYTES_TPU7X`): its Mosaic pipeline lowers the same
-#     chain thinner, measured at <= ~26.6 bytes per element; rounded up.
-# Both were measured on a wider dequant chain than the b11 fold.
-# `moe_gmm_v6e_planar_t_b11` passes the TPU7x value; that choice has not
-# been re-measured for the b11 chain on v6e.
-SCOPED_ELEM_BYTES_V6E = 56
+# than derived: TPU7x's Mosaic pipeline lowers the chain at <= ~26.6 bytes
+# per element, rounded up. It was measured on a wider dequant chain than
+# the b11 fold, and `moe_gmm_v6e_planar_t_b11` uses it on v6e too; that
+# choice has not been re-measured for the b11 chain on v6e.
 SCOPED_ELEM_BYTES_TPU7X = 28
 
 
@@ -177,11 +159,12 @@ def default_tiling(
     m: int,
     k: int,
     n: int,
-    lhs_bytes: int = 2,
-    rhs_pairs: int = 1,
-    expected_rows: int | None = None,
-    vmem_budget: int | None = None,
-    scoped_elem_bytes: int = SCOPED_ELEM_BYTES_V6E,
+    *,
+    lhs_bytes: int,
+    rhs_pairs: int,
+    expected_rows: int | None,
+    vmem_budget: int,
+    scoped_elem_bytes: int,
     force_chunk: int | None = None,
 ) -> tuple[int, int, int]:
     """The largest valid `(tm, k_chunk, tn)` that fits the VMEM budget.
@@ -210,9 +193,9 @@ def default_tiling(
         the plain kernel, 2 for the fused gate+up kernel).
       expected_rows: rows this caller expects to actually own (the EP shard's
         share of M), or None for the dense default.
-      vmem_budget: per-grid-step VMEM bound in bytes, or None for `_VMEM_BUDGET`.
-      scoped_elem_bytes: per-chip scoped-stack bytes per dequant element
-        (`SCOPED_ELEM_BYTES_V6E` / `SCOPED_ELEM_BYTES_TPU7X`).
+      vmem_budget: per-grid-step VMEM bound in bytes.
+      scoped_elem_bytes: scoped-stack bytes per dequant element
+        (`SCOPED_ELEM_BYTES_TPU7X`).
       force_chunk: pin the k chunk to this value when it is a valid candidate
         (planar weights require chunk == PLANAR_WINDOW). When the shape cannot
         serve it the normal search runs instead and `mxfp4_gmm` rejects the
@@ -224,7 +207,7 @@ def default_tiling(
     Raises:
       ValueError: if even the smallest valid tiling exceeds the budget.
     """
-    budget = _VMEM_BUDGET if vmem_budget is None else vmem_budget
+    budget = vmem_budget
     tms = [t for t in (512, 256, 128, 64, 32, 16, 8) if m % t == 0] or [m]
     tns = [t for t in (512, 256, 128) if n % t == 0] or [n]
     chunks = [c for c in (512, 256, 128, 64, SCALE_GROUP) if c <= k and k % c == 0] or [
@@ -259,20 +242,21 @@ def default_tiling(
     )
 
 
-# `_make_group_metadata` builds. Only the loop-free closed form is kept:
-# no while loop, no scatter and no gather, so it is cheap to build once per
-# layer and share between the gate+up and down kernels.
-METADATA_IMPLS = ("closed_form",)
-
-
-def _closed_form_group_metadata(
+def _make_group_metadata(
     group_sizes: jax.Array,
     *,
     m: int,
     tm: int,
     num_groups: int,
 ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]:
-    """`_make_group_metadata` as compare-and-sum arithmetic, loop free.
+    """Grid metadata for the grouped matmul, as loop-free arithmetic.
+
+    Adapted from `make_group_metadata` in
+    `jax.experimental.pallas.ops.tpu.megablox.gmm` (JAX, Apache-2.0),
+    specialized to a single unsharded group range and
+    `visit_empty_groups=False`, which is all this caller needs. No while
+    loop, no scatter and no gather, so it is cheap to build once per layer
+    and share between the gate+up and down kernels.
 
     The megablox build relies on three ragged primitives: `jnp.histogram`
     (a binary-search while loop) and two `jnp.repeat` chains (scatter,
@@ -298,7 +282,11 @@ def _closed_form_group_metadata(
       num_groups: number of groups.
 
     Returns:
-      As `_make_group_metadata`.
+      `((group_offsets, group_ids, m_tile_ids), num_active_tiles)` where
+      `group_offsets[i]` is the first row of group i, and `group_ids[j]` /
+      `m_tile_ids[j]` say which group and which m tile grid step j works
+      on. A tile straddling a group boundary appears once per group it
+      touches, which is why the grid is `tiles_m + num_groups - 1` long.
     """
     sizes = group_sizes.astype(jnp.int32)
     tiles_m = m // tm
@@ -336,101 +324,19 @@ def _closed_form_group_metadata(
     return (group_offsets, group_ids, m_tile_ids), tiles_through[-1]
 
 
-def _make_group_metadata(
-    group_sizes: jax.Array,
-    m: int,
-    tm: int,
-    num_groups: int,
-    impl: str = "closed_form",
-) -> tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]:
-    """Grid metadata for the grouped matmul.
-
-    Adapted from `make_group_metadata` in
-    `jax.experimental.pallas.ops.tpu.megablox.gmm` (JAX, Apache-2.0),
-    specialized to a single unsharded group range and
-    `visit_empty_groups=False`, which is all this caller needs.
-
-    Args:
-      group_sizes: `[num_groups]` int32 rows per group.
-      m: total rows in the lhs.
-      tm: m-dimension tile size.
-      num_groups: number of groups.
-      impl: one of `METADATA_IMPLS`.
-
-    Returns:
-      `((group_offsets, group_ids, m_tile_ids), num_active_tiles)` where
-      `group_offsets[i]` is the first row of group i, and `group_ids[j]` /
-      `m_tile_ids[j]` say which group and which m tile grid step j works
-      on. A tile straddling a group boundary appears once per group it
-      touches, which is why the grid is `tiles_m + num_groups - 1` long.
-    """
-    if impl not in METADATA_IMPLS:
-        raise ValueError(f"unknown metadata impl {impl!r} (want {METADATA_IMPLS}).")
-    return _closed_form_group_metadata(group_sizes, m=m, tm=tm, num_groups=num_groups)
-
-
 #: A precomputed `_make_group_metadata` result, as the kernels take it.
 GroupMetadata = tuple[tuple[jax.Array, jax.Array, jax.Array], jax.Array]
 
 
-def _check_group_metadata(
-    group_metadata: GroupMetadata, *, m: int, tm: int, num_groups: int
-) -> GroupMetadata:
-    """Refuses a precomputed build made for a different `(m, tm, num_groups)`.
-
-    The grid length `m // tm + num_groups - 1` identifies the row tile
-    (distinct dividing tiles give distinct lengths), so a triple built
-    for another tiling cannot pass.
-    """
-    (group_offsets, group_ids, m_tile_ids), num_active_tiles = group_metadata
-    grid_len = m // tm + num_groups - 1
-    want = ((num_groups + 1,), (grid_len,), (grid_len,), ())
-    got = (
-        tuple(group_offsets.shape),
-        tuple(group_ids.shape),
-        tuple(m_tile_ids.shape),
-        tuple(jnp.shape(num_active_tiles)),
-    )
-    if got != want:
-        raise ValueError(
-            "group_metadata was built for a different tiling: shapes"
-            f" {got}, this kernel (m={m}, tm={tm}, num_groups={num_groups})"
-            f" wants {want}. Build it with shared_group_metadata over the"
-            " tilings of every consuming kernel."
-        )
-    for name, arr in (
-        ("group_offsets", group_offsets),
-        ("group_ids", group_ids),
-        ("m_tile_ids", m_tile_ids),
-        ("num_active_tiles", num_active_tiles),
-    ):
-        if jnp.asarray(arr).dtype != jnp.int32:
-            raise ValueError(
-                f"group_metadata.{name} must be int32, got {jnp.asarray(arr).dtype}."
-            )
-    return group_metadata
-
-
-# Host bytes one slab of `repack_planar_stack`'s numpy walk covers. A host
-# memory bound chosen by hand, not a device quantity.
-_HOST_REPACK_SLAB_BYTES = 256 * 1024 * 1024
-
-
-def _planar_repack_windows(packed: _NibbleArray, window: int) -> _NibbleArray:
-    """`[..., K/2]` interleaved nibble pairs -> planar window bytes.
-
-    Shared by `repack_planar_stack` (whole array or one slab). Works on
-    numpy arrays, jax arrays, AND tracers alike (only `& >> | reshape
-    stack` are used, all trace-safe on the jnp side).
-    """
-    xp = jnp if isinstance(packed, (jax.Array, jax.core.Tracer)) else np
+def _planar_repack_windows(packed: jax.Array, window: int) -> jax.Array:
+    """`[..., K/2]` interleaved nibble pairs -> planar window bytes."""
     half_k = packed.shape[-1]
     k = 2 * half_k
     hw = window // 2
     lead = packed.shape[:-1]
     pairs = packed.reshape(lead + (k // window, hw))
     # Nibbles back into original contraction order, per window.
-    codes = xp.stack([pairs & 0x0F, pairs >> 4], axis=-1).reshape(
+    codes = jnp.stack([pairs & 0x0F, pairs >> 4], axis=-1).reshape(
         lead + (k // window, window)
     )
     lo = codes[..., :hw]
@@ -438,9 +344,7 @@ def _planar_repack_windows(packed: _NibbleArray, window: int) -> _NibbleArray:
     return (lo | (hi << 4)).astype(packed.dtype).reshape(lead + (half_k,))
 
 
-def repack_planar_stack(
-    packed: npt.ArrayLike | jax.Array, window: int = PLANAR_WINDOW
-) -> _NibbleArray:
+def repack_planar_stack(packed: jax.Array, window: int = PLANAR_WINDOW) -> jax.Array:
     """Reorders MXFP4 nibble pairs into the planar window layout.
 
     Interleaved storage puts contraction elements (2j, 2j+1) in byte j, so a
@@ -456,26 +360,19 @@ def repack_planar_stack(
     window's groups against the low plane and the second half against the
     high plane.
 
-    Must stay trace-safe: weight loading can apply this under `jax.jit`, so
-    jax values and tracers take the pure-jnp path (a deterministic byte
-    permutation) and never force a numpy conversion; only host-resident
-    arrays take the bounded numpy slab walk. Branches on shape/dtype only,
-    never on values.
+    Trace-safe (weight loading applies this to TPU tensors through
+    `pallas.jax_op`): a deterministic byte permutation that branches on
+    shape/dtype only, never on values.
 
     Args:
       packed: `[..., K/2]` uint8 nibble pairs in checkpoint (interleaved) order.
-        K must divide by `window`. jax array or tracer in -> jnp out; numpy (or
-        lazy host array-like) in -> numpy out (slab-wise, bounded transients).
+        K must divide by `window`.
       window: the planar window in contraction elements; must equal the kernel k
         chunk (`PLANAR_WINDOW`).
 
     Returns:
       The repacked array, same shape and dtype.
     """
-    if not isinstance(packed, (jax.Array, jax.core.Tracer, np.ndarray)):
-        # Lazy host array-likes (tensorstore / memmap views): materialize
-        # once, then the bounded slab walk below.
-        packed = np.asarray(packed)
     half_k = packed.shape[-1]
     k = 2 * half_k
     if window % (2 * SCALE_GROUP):
@@ -487,26 +384,10 @@ def repack_planar_stack(
         raise ValueError(
             f"contraction {k} must be a multiple of the planar window {window}."
         )
-    if isinstance(packed, (jax.Array, jax.core.Tracer)):
-        # jit/trace path: pure jnp; numpy here would raise
-        # TracerArrayConversionError under a trace.
-        return _planar_repack_windows(packed, window)
-    if packed.ndim < 2:
-        return _planar_repack_windows(packed, window)
-    # Host arrays are checkpoint-scale ([E, N, K/2] is ~5 GiB per real
-    # leaf and the repack holds ~4x that in transients); walk a flat row
-    # view in bounded slabs so the load projection's peak stays small.
-    flat = packed.reshape(-1, half_k)
-    out = np.empty_like(flat)
-    step = max(1, _HOST_REPACK_SLAB_BYTES // max(half_k, 1))
-    for s in range(0, flat.shape[0], step):
-        out[s : s + step] = _planar_repack_windows(flat[s : s + step], window)
-    return out.reshape(packed.shape)
+    return _planar_repack_windows(packed, window)
 
 
-def repack_planar_t_stack(
-    packed: npt.ArrayLike | jax.Array, window: int = PLANAR_WINDOW
-) -> _NibbleArray:
+def repack_planar_t_stack(packed: jax.Array, window: int = PLANAR_WINDOW) -> jax.Array:
     """Planar window bytes, transposed: `[..., N, K/2]` -> `[..., K/2, N]`.
 
     The planar_t layout is `repack_planar_stack` followed by a swap of the
@@ -516,18 +397,11 @@ def repack_planar_t_stack(
     changes. The decoded tile then comes out `[chunk, tn]` with the weight
     row on the lane dim, so the per-group scale varies along lanes and the
     decode table can be built per lane (`_dequantize_chunk_planar_t_b11`).
-
-    Trace-safe exactly like `repack_planar_stack` (jax values and tracers
-    stay on jnp; host arrays take the bounded slab walk, then a numpy
-    transpose materialized once).
     """
-    planar = repack_planar_stack(packed, window)
-    if isinstance(planar, (jax.Array, jax.core.Tracer)):
-        return jnp.swapaxes(planar, -1, -2)
-    return np.ascontiguousarray(np.swapaxes(planar, -1, -2))
+    return jnp.swapaxes(repack_planar_stack(packed, window), -1, -2)
 
 
-def transpose_scales_planar_t(scales: npt.ArrayLike | jax.Array) -> _NibbleArray:
+def transpose_scales_planar_t(scales: jax.Array) -> jax.Array:
     """`[..., N, K/32]` e8m0 codes -> `[..., K/32, N]`, the planar_t order.
 
     Scales carry no nibble structure, so their planar_t form is a plain
@@ -535,11 +409,7 @@ def transpose_scales_planar_t(scales: npt.ArrayLike | jax.Array) -> _NibbleArray
     elements [32g, 32g + 32)). Self-inverse modulo the axis swap: apply
     it again to get back. Trace-safe like the packed repack.
     """
-    if isinstance(scales, (jax.Array, jax.core.Tracer)):
-        return jnp.swapaxes(scales, -1, -2)
-    if not isinstance(scales, np.ndarray):
-        scales = np.asarray(scales)
-    return np.ascontiguousarray(np.swapaxes(scales, -1, -2))
+    return jnp.swapaxes(scales, -1, -2)
 
 
 # The e2m1 nibble -> float8_e4m3b11fnuz byte relabel, as the (sign,
@@ -663,60 +533,6 @@ def _dequantize_chunk_planar_t_b11(
     return codes, wscale
 
 
-# Rolled schedule: one BlockSpec-pipelined grid step per (column tile,
-# row-tile visit), the k walk a rolled loop over PLANAR_WINDOW chunks.
-DEQUANT_PLANAR_T_B11 = "planar_t_b11"
-# Deep schedule: the same chunk math inside a hand-rolled weight
-# pipeline (see `_deep_planar_t_b11_call`). Shapes the deep kernel cannot
-# take fall back to the rolled kernel; the two are bitwise identical.
-DEQUANT_PLANAR_T_B11_DEEP = "planar_t_b11_deep"
-# Both modes read the transposed planar layout (`[E, K/2, N]` nibbles
-# plus `[E, K/32, N]` scales from `repack_planar_t_stack` /
-# `transpose_scales_planar_t`) with the kernel k chunk pinned to
-# PLANAR_WINDOW.
-DEQUANT_MODES = (DEQUANT_PLANAR_T_B11, DEQUANT_PLANAR_T_B11_DEEP)
-
-
-def _planar_t_fold_chunk(
-    dequant: str,
-) -> Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
-    """The `(packed, scales) -> (codes, wscale)` step for a fold mode."""
-    if dequant == DEQUANT_PLANAR_T_B11:
-        return _dequantize_chunk_planar_t_b11
-    raise ValueError(f"{dequant!r} is not a planar_t fold mode.")
-
-
-# Deep mode -> the rolled mode whose chunk step it wraps (and falls back
-# to for shapes the deep kernel cannot take).
-DEEP_DEQUANT_BODIES = {DEQUANT_PLANAR_T_B11_DEEP: DEQUANT_PLANAR_T_B11}
-
-# Deep-schedule pipeline depth: outstanding `[K, tn]` weight slab copies
-# per stack. Decode is bound by the weight stream serialized behind the
-# chunk decode, not by VPU work or bytes, so keeping several slab copies
-# in flight (instead of the BlockSpec pipeline's one) overlaps the
-# stream with the decode.
-DEEP_STREAM_DEPTH = 4
-# Per-tile f32 accumulator bound of the deep kernel, per stack. Empirical,
-# from TPU v6e with hidden=3584, inter=3072 experts; not derived.
-DEEP_MAX_ACC_BYTES = 2 * 1024 * 1024
-# Row tile slots of the deep kernel: the visited `[tm, K]` lhs tile is
-# double buffered so visit j + 1's rows land while visit j computes.
-DEEP_ROW_TILE_SLOTS = 2
-
-
-def _use_k_loop(k: int, chunk: int) -> bool:
-    """Whether the k walk runs as a real (rolled) loop for this tiling.
-
-    The rolled walk needs every per-iteration ref slice lane-aligned: the
-    packed nibble plane advances `chunk/2` u8 lanes per step, so `chunk`
-    must be a multiple of 256. Below that (toy shapes) the walk stays a
-    static python unroll, whose text is small at those sizes anyway. Rolling
-    the real serving shapes keeps one kernel's program text small, so every
-    per-layer call site shares one copy and Mosaic compiles faster.
-    """
-    return chunk % 256 == 0 and k > chunk
-
-
 def _situ_f32(
     gate: jax.Array,
     up: jax.Array,
@@ -727,16 +543,13 @@ def _situ_f32(
     """SiTU-GLU in f32.
 
     `[beta * tanh(gate / beta) * sigmoid(gate)] * [linear_beta * tanh(up /
-    linear_beta)]` (up stays linear when `linear_beta` is None). `beta == 0.0`
-    selects plain SiLU-and-multiply (`parse_situ_activation` maps 'silu' to
-    it). Shared by the kernels and the fused reference so on-TPU and off-TPU
-    paths run the same arithmetic.
+    linear_beta)]` (up stays linear when `linear_beta` is None). Shared by the
+    kernels and the fused reference so on-TPU and off-TPU paths run the same
+    arithmetic.
     """
-    g = gate.astype(jnp.float32)
-    u = up.astype(jnp.float32)
-    if beta == 0.0:
-        return jax.nn.silu(g) * u
-    return situ_and_mul(g, u, beta, linear_beta)
+    return situ_and_mul(
+        gate.astype(jnp.float32), up.astype(jnp.float32), beta, linear_beta
+    )
 
 
 def _group_row_mask(
@@ -818,345 +631,12 @@ def _validate(
         )
 
 
-def _deep_eligible(m: int, k: int, n: int, tm: int, chunk: int, tn: int) -> bool:
-    """Whether the deep-stream kernel serves these static shapes.
-
-    Divisibility plus the per-tile f32 accumulator bound
-    (DEEP_MAX_ACC_BYTES per stack). There is deliberately no bound on `m`:
-    choosing the deep schedule for decode-sized batches is the caller's
-    job. Ineligible shapes fall back to the bitwise-identical rolled
-    `planar_t_b11` kernel; only the schedule differs.
-    """
-    return (
-        m % tm == 0
-        and k % chunk == 0
-        and n % tn == 0
-        and tm * tn * 4 <= DEEP_MAX_ACC_BYTES
-    )
-
-
-def _deep_fit_tn(
-    *,
-    k: int,
-    n: int,
-    tm: int,
-    chunk: int,
-    tn: int,
-    num_stacks: int,
-    budget: int,
-    lhs_bytes: int,
-    out_bytes: int,
-) -> int | None:
-    """Largest column tile whose deep-kernel VMEM footprint fits `budget`.
-
-    The deep kernel's VMEM working set is not the rolled kernel's: each
-    stack keeps DEEP_STREAM_DEPTH outstanding `[k, tn']` slab copies of
-    nibbles plus scale codes, and the operands stream through
-    DEEP_ROW_TILE_SLOTS `[tm, k]` lhs tiles and one `[tm, n]` out tile.
-    `default_tiling` models the rolled kernel, so a tiling it admits can
-    overflow the deep kernel. Shrinking only the deep kernel's column tile
-    is value-exact: tn' regroups the output columns and the DMA slabs, and
-    every element's chunk-ordered accumulation and per-column window scale
-    are unchanged. Returns the largest lane-divisible tn' <= tn that
-    divides n and fits, or None (the caller falls back to the rolled
-    kernel).
-    """
-    steps = max(k // chunk, 1)
-    slab_bytes = steps * (chunk // 2 + chunk // SCALE_GROUP)
-    operands = DEEP_ROW_TILE_SLOTS * tm * k * lhs_bytes + tm * n * out_bytes
-    cand = tn
-    while cand >= _LANES:
-        if n % cand == 0:
-            scratch = num_stacks * DEEP_STREAM_DEPTH * slab_bytes * cand
-            accs = num_stacks * tm * cand * 4
-            total = operands + scratch + accs
-            if total <= budget:
-                return cand
-        cand //= 2
-    return None
-
-
-def _deep_planar_t_b11_call(
-    lhs: jax.Array,
-    stacks: tuple[tuple[jax.Array, jax.Array], ...],
-    group_metadata: tuple[jax.Array, jax.Array, jax.Array],
-    num_active_tiles: jax.Array,
-    *,
-    tm: int,
-    chunk: int,
-    tn: int,
-    situ: tuple[float, float | None] | None,
-    preferred_element_type: jax.typing.DTypeLike,
-    interpret: bool,
-) -> jax.Array:
-    """Deep-stream grouped matmul shared by the plain and fused entry points.
-
-    Runs `planar_t_b11`'s chunk math (same codes, same window scale, same
-    accumulation order, so bitwise the same outputs) inside a hand-rolled
-    weight pipeline:
-
-      * Weights: per active (row tile, group) visit, the expert's `[k, tn]`
-        slab tiles stream HBM->VMEM through DEEP_STREAM_DEPTH outstanding
-        copies per stack while the unrolled k walk decodes and multiplies
-        the previously landed tile. The (visit, column tile) sequence is
-        one flat stream: the copy for global tile q + depth is issued after
-        tile q computes, so the last `depth` tiles of visit j already pull
-        visit j + 1's first tiles and the pipeline is primed once per call.
-      * Rows: the visit's `[tm, k]` lhs tile is copied from HBM into one of
-        DEEP_ROW_TILE_SLOTS VMEM slots (visit j + 1's tile lands while visit
-        j computes). The visit's `[tm, n]` out tile is assembled in one VMEM
-        buffer across its column tiles and copied out when the next visit
-        moves to another row tile (or at the last visit), so a tile
-        straddling two groups is merged in VMEM. Rows the kernel never
-        visits, and rows of a visited tile outside every group, are
-        unspecified (the callers' contract).
-
-    Args:
-      lhs: `[m, k]` activations, rows grouped by expert.
-      stacks: the chunk-major planar_t weights: one `(packed, scales)` pair of
-        `[E, steps, chunk/2, n]` / `[E, steps, chunk/32, n]` arrays for the plain
-        matmul, or the fused gate+up form where both pairs are the same
-        `[E, 2, steps, chunk/2, n]` / `[E, 2, steps, chunk/32, n]` arrays and
-        stack `s` reads index `s` of axis 1.
-      group_metadata: `(group_offsets, group_ids, m_tile_ids)` from
-        `_make_group_metadata`.
-      num_active_tiles: number of valid entries of the metadata grid.
-      tm: row tile.
-      chunk: k chunk (PLANAR_WINDOW).
-      tn: column tile.
-      situ: `(beta, linear_beta)` for the fused gate+up epilogue (`_situ_f32` on
-        the two accumulators), or None for the plain matmul.
-      preferred_element_type: output dtype.
-      interpret: run the Pallas kernel in interpret mode.
-
-    Returns:
-      `[m, n]` products (SiTU-gated when `situ` is set).
-    """
-    m, k = lhs.shape
-    num_stacks = len(stacks)
-    if stacks[0][0].ndim == 5:
-        _, _, steps, plane_rows, n = stacks[0][0].shape
-        scale_rows = stacks[0][1].shape[3]
-    else:
-        _, steps, plane_rows, n = stacks[0][0].shape
-        scale_rows = stacks[0][1].shape[2]
-    tiles_n = n // tn
-    depth = min(DEEP_STREAM_DEPTH, tiles_n)
-    group_offsets, group_ids, m_tile_ids = group_metadata
-    grid_len = m_tile_ids.shape[0]
-    fold_chunk = _dequantize_chunk_planar_t_b11
-
-    def kernel(off_ref, ids_ref, mtid_ref, nat_ref, lhs_ref, *rest):
-        stack_refs = rest[: 2 * num_stacks]
-        out_ref = rest[2 * num_stacks]
-        scratch = rest[2 * num_stacks + 1 :]
-        bufs = scratch[: 2 * num_stacks]
-        acc_refs = scratch[2 * num_stacks : 3 * num_stacks]
-        sems = scratch[3 * num_stacks : 5 * num_stacks]
-        lhs_slots, out_buf, lhs_sems, out_sem = scratch[5 * num_stacks :]
-
-        def lhs_copy(row0, slot):
-            return pltpu.make_async_copy(
-                lhs_ref.at[pl.ds(row0, tm), :],
-                lhs_slots.at[slot],
-                lhs_sems.at[slot],
-            )
-
-        def copies(g, t, slot):
-            out = []
-            for s in range(num_stacks):
-                packed_ref, scales_ref = stack_refs[2 * s], stack_refs[2 * s + 1]
-                pbuf, sbuf = bufs[2 * s], bufs[2 * s + 1]
-                psem, ssem = sems[2 * s], sems[2 * s + 1]
-                if packed_ref.ndim == 5:
-                    packed_src = packed_ref.at[g, s, :, :, pl.ds(t * tn, tn)]
-                    scales_src = scales_ref.at[g, s, :, :, pl.ds(t * tn, tn)]
-                else:
-                    packed_src = packed_ref.at[g, :, :, pl.ds(t * tn, tn)]
-                    scales_src = scales_ref.at[g, :, :, pl.ds(t * tn, tn)]
-                out.append(
-                    pltpu.make_async_copy(
-                        packed_src,
-                        pbuf.at[slot],
-                        psem.at[slot],
-                    )
-                )
-                out.append(
-                    pltpu.make_async_copy(scales_src, sbuf.at[slot], ssem.at[slot])
-                )
-            return out
-
-        def visit(j, carry):
-            g = ids_ref[j]
-            mt = mtid_ref[j]
-            row0 = mt * tm
-            start = off_ref[g]
-            end = off_ref[g + 1]
-            lslot = lax.rem(j, DEEP_ROW_TILE_SLOTS)
-            # This visit's rows were issued by the previous visit (or the
-            # prime below for visit 0); the other slot's reader, visit
-            # j - 1, is done, so visit j + 1's rows can land in it now.
-            lhs_copy(row0, lslot).wait()
-
-            @pl.when(j + 1 < nat_ref[0])
-            def _():
-                lhs_copy(
-                    mtid_ref[j + 1] * tm, lax.rem(j + 1, DEEP_ROW_TILE_SLOTS)
-                ).start()
-
-            # The out tile is flushed by the last visit of its row tile;
-            # visits of one row tile are consecutive (m_tile_ids is
-            # nondecreasing), so "last" is "the next visit is on another
-            # tile, or there is none". The clamp keeps the lookahead read in
-            # bounds at the padded tail.
-            next_mt = mtid_ref[jnp.minimum(j + 1, grid_len - 1)]
-            last_of_tile = jnp.logical_or(j + 1 >= nat_ref[0], next_mt != mt)
-            # Slot of tile t in the flattened (visit, tile) stream; the
-            # copies for this visit's first `depth` tiles were issued by
-            # the previous visit (or the prime below for visit 0).
-            base = lax.rem(j * tiles_n, depth)
-            for t in range(tiles_n):
-                slot = lax.rem(base + t, depth)
-                for c in copies(g, t, slot):
-                    c.wait()
-                # Accumulate through a scratch ref, not a carried value: each
-                # `+=` then materializes exactly like the rolled kernel's, so
-                # no backend can fuse the window-scale multiply into the add
-                # (an FMA there is a 1-ulp reassociation and breaks bitwise
-                # equality with the rolled kernel).
-                accs = []
-                for s in range(num_stacks):
-                    pbuf, sbuf = bufs[2 * s], bufs[2 * s + 1]
-                    acc_ref = acc_refs[s]
-                    acc_ref[...] = jnp.zeros_like(acc_ref)
-                    for cs in range(steps):
-                        lhs_chunk = lhs_slots[lslot, :, cs * chunk : (cs + 1) * chunk]
-                        dims = (((1,), (0,)), ((), ()))
-                        codes, wscale = fold_chunk(pbuf[slot, cs], sbuf[slot, cs])
-                        acc_ref[...] += (
-                            lax.dot_general(
-                                lhs_chunk,
-                                codes,
-                                dimension_numbers=dims,
-                                preferred_element_type=jnp.float32,
-                            )
-                            * wscale
-                        )
-                    accs.append(acc_ref[...])
-                if situ is not None:
-                    value = _situ_f32(
-                        accs[0].astype(preferred_element_type),
-                        accs[1].astype(preferred_element_type),
-                        beta=situ[0],
-                        linear_beta=situ[1],
-                    )
-                else:
-                    value = accs[0]
-                mask = _group_row_mask((tm, tn), row0=row0, start=start, end=end)
-                first_of_tile = start <= row0
-                old = jnp.where(
-                    first_of_tile,
-                    0.0,
-                    out_buf[:, pl.ds(t * tn, tn)].astype(jnp.float32),
-                )
-                out_buf[:, pl.ds(t * tn, tn)] = jnp.where(mask, value, old).astype(
-                    preferred_element_type
-                )
-                nxt = t + depth
-                if nxt < tiles_n:
-                    for c in copies(g, nxt, slot):
-                        c.start()
-                else:
-                    # This slot is free and, in the flattened stream, next holds
-                    # tile nxt - tiles_n of the NEXT visit: pull it now so the
-                    # visit boundary never drains the pipeline. Every copy issued
-                    # here is waited by visit j + 1, which exists by the guard.
-                    @pl.when(j + 1 < nat_ref[0])
-                    def _(nxt=nxt, slot=slot):
-                        g_next = ids_ref[j + 1]
-                        for c in copies(g_next, nxt - tiles_n, slot):
-                            c.start()
-
-            @pl.when(last_of_tile)
-            def _():
-                flush = pltpu.make_async_copy(
-                    out_buf, out_ref.at[pl.ds(row0, tm), :], out_sem
-                )
-                flush.start()
-                flush.wait()
-
-            return carry
-
-        @pl.when(nat_ref[0] > 0)
-        def _():
-            lhs_copy(mtid_ref[0] * tm, 0).start()
-
-        @pl.when(nat_ref[0] > 0)
-        def _():
-            g_first = ids_ref[0]
-            for s in range(depth):
-                for c in copies(g_first, s, s):
-                    c.start()
-
-        lax.fori_loop(0, nat_ref[0], visit, 0)
-
-    flops = 2 * m * k * n * num_stacks
-    bytes_accessed = (
-        lhs.size * lhs.itemsize
-        + sum(p.size + s.size for p, s in stacks)
-        + m * n * jnp.dtype(preferred_element_type).itemsize
-    )
-    scratch_shapes = []
-    for _ in range(num_stacks):
-        scratch_shapes.append(pltpu.VMEM((depth, steps, plane_rows, tn), jnp.uint8))
-        scratch_shapes.append(pltpu.VMEM((depth, steps, scale_rows, tn), jnp.uint8))
-    for _ in range(num_stacks):
-        scratch_shapes.append(pltpu.VMEM((tm, tn), jnp.float32))
-    for _ in range(num_stacks):
-        scratch_shapes.append(pltpu.SemaphoreType.DMA((depth,)))
-        scratch_shapes.append(pltpu.SemaphoreType.DMA((depth,)))
-    scratch_shapes.append(pltpu.VMEM((DEEP_ROW_TILE_SLOTS, tm, k), lhs.dtype))
-    scratch_shapes.append(pltpu.VMEM((tm, n), preferred_element_type))
-    scratch_shapes.append(pltpu.SemaphoreType.DMA((DEEP_ROW_TILE_SLOTS,)))
-    scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-    # The operands stay wherever XLA puts them; the kernel moves row tiles
-    # itself. No `vmem_limit_bytes`: the kernel fits the default scoped
-    # VMEM limit.
-    call = pl.pallas_call(
-        kernel,
-        grid=(),
-        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] * 4
-        + [pl.BlockSpec(memory_space=pl.ANY)]
-        + [pl.BlockSpec(memory_space=pl.ANY)] * (2 * num_stacks),
-        out_specs=pl.BlockSpec(memory_space=pl.ANY),
-        out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
-        scratch_shapes=scratch_shapes,
-        interpret=interpret,
-        cost_estimate=pl.CostEstimate(
-            flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
-        ),
-    )
-    stack_args = []
-    for p, s in stacks:
-        stack_args.extend((p, s))
-    return call(
-        group_offsets.astype(jnp.int32),
-        group_ids.astype(jnp.int32),
-        m_tile_ids.astype(jnp.int32),
-        jnp.reshape(num_active_tiles, (1,)).astype(jnp.int32),
-        lhs,
-        *stack_args,
-    )
-
-
 @functools.partial(
     jax.jit,
     static_argnames=[
         "preferred_element_type",
         "tiling",
         "interpret",
-        "dequant",
-        "deep_vmem_budget",
     ],
 )
 def mxfp4_gmm(
@@ -1165,12 +645,10 @@ def mxfp4_gmm(
     scales: jax.Array,
     group_sizes: jax.Array,
     *,
+    tiling: tuple[int, int, int],
+    group_metadata: GroupMetadata,
     preferred_element_type: jax.typing.DTypeLike = jnp.bfloat16,
-    tiling: tuple[int, int, int] | None = None,
     interpret: bool = False,
-    dequant: str = DEQUANT_PLANAR_T_B11,
-    deep_vmem_budget: int | None = None,
-    group_metadata: GroupMetadata | None = None,
 ) -> jax.Array:
     """`lhs[rows of group i, :] @ dequant(packed[i], scales[i])` per group.
 
@@ -1186,30 +664,21 @@ def mxfp4_gmm(
       preferred_element_type: output dtype.
       tiling: `(tm, k_chunk, tn)`. Blocks always span the whole contraction;
         `k_chunk` is how much of it the kernel decodes at a time and must equal
-        PLANAR_WINDOW. `tm` must divide M. None derives them from the problem.
+        PLANAR_WINDOW. `tm` must divide M.
+      group_metadata: grid metadata (`_make_group_metadata` with the same
+        `(m, tm, num_groups)`), so the gate+up and down kernels of one layer
+        share one build.
       interpret: run the Pallas kernel in interpret mode (used off TPU).
-      dequant: `DEQUANT_PLANAR_T_B11` (rolled schedule) or
-        `DEQUANT_PLANAR_T_B11_DEEP` (deep schedule, falling back to the rolled
-        kernel for shapes it cannot take). Both are bitwise identical.
-      deep_vmem_budget: VMEM bound for the deep kernel's column tile search
-        (`_deep_fit_tn`); None keeps the rolled tiling's column tile.
-      group_metadata: optional precomputed grid metadata (`_make_group_metadata`
-        with the same `(m, tm, num_groups)`), so the gate+up and down kernels of
-        one layer share one build. Checked by shape; built here when None.
 
     Returns:
       `[M, N]` products.
     """
     m, k = lhs.shape
-    if dequant not in DEQUANT_MODES:
-        raise ValueError(
-            f"unknown dequant mode {dequant!r}, want one of {DEQUANT_MODES}"
-        )
     num_groups = packed.shape[0]
     n = packed.shape[2]
     # Clamp before validating: a tile larger than the array is just the
     # whole array, which toy shapes rely on.
-    tm, chunk, tn = tiling or default_tiling(m, k, n, force_chunk=PLANAR_WINDOW)
+    tm, chunk, tn = tiling
     tm, chunk, tn = min(tm, m), min(chunk, k), min(tn, n)
     if chunk != PLANAR_WINDOW:
         raise ValueError(
@@ -1233,53 +702,7 @@ def mxfp4_gmm(
     scales = scales.reshape(num_groups, steps, chunk // SCALE_GROUP, n)
     tiles_n = (n + tn - 1) // tn
 
-    if group_metadata is not None:
-        grid_metadata, num_active_tiles = _check_group_metadata(
-            group_metadata, m=m, tm=tm, num_groups=num_groups
-        )
-    else:
-        grid_metadata, num_active_tiles = _make_group_metadata(
-            group_sizes, m=m, tm=tm, num_groups=num_groups
-        )
-
-    if dequant in DEEP_DEQUANT_BODIES:
-        deep_body = DEEP_DEQUANT_BODIES[dequant]
-        deep_tn = (
-            _deep_fit_tn(
-                k=k,
-                n=n,
-                tm=tm,
-                chunk=chunk,
-                tn=tn,
-                num_stacks=1,
-                budget=deep_vmem_budget,
-                lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
-                out_bytes=jnp.dtype(preferred_element_type).itemsize,
-            )
-            if deep_vmem_budget is not None
-            else tn
-        )
-        if deep_tn is not None and _deep_eligible(
-            m=m, k=k, n=n, tm=tm, chunk=chunk, tn=deep_tn
-        ):
-            return _deep_planar_t_b11_call(
-                lhs,
-                ((packed, scales),),
-                grid_metadata,
-                num_active_tiles,
-                tm=tm,
-                chunk=chunk,
-                tn=deep_tn,
-                situ=None,
-                preferred_element_type=preferred_element_type,
-                interpret=interpret,
-            )
-        # Shapes the deep pipeline does not serve (prefill widths) take the
-        # bitwise-identical rolled kernel; only the schedule differs.
-        dequant = deep_body
-
-    use_k_loop = _use_k_loop(k, chunk)
-    fold_chunk = _planar_t_fold_chunk(dequant)
+    grid_metadata, num_active_tiles = group_metadata
 
     def kernel(
         group_metadata,
@@ -1309,7 +732,7 @@ def mxfp4_gmm(
             lhs_chunk = lhs_ref[:, pl.ds(i * chunk, chunk)]
             # Hand f8 codes to the MXU and apply the window scale once, on the
             # f32 accumulator.
-            codes, wscale = fold_chunk(packed_ref[i], scales_ref[i])
+            codes, wscale = _dequantize_chunk_planar_t_b11(packed_ref[i], scales_ref[i])
             acc[...] += (
                 lax.dot_general(
                     lhs_chunk,
@@ -1321,11 +744,7 @@ def mxfp4_gmm(
             )
             return carry
 
-        if use_k_loop:
-            lax.fori_loop(0, k // chunk, chunk_body_t, 0)
-        else:
-            for c in range(0, k, chunk):
-                chunk_body_t(c // chunk, 0)
+        lax.fori_loop(0, k // chunk, chunk_body_t, 0)
 
         # Only the rows of the tile that belong to THIS group may be
         # written; a tile straddling a group boundary is visited once per
@@ -1397,20 +816,11 @@ def mxfp4_gmm(
 # Served entry points (TPU v6e)
 # ============================================================================
 
-# Per-grid-step VMEM budgets of the served entry point, sized under the
-# 32 MiB default scoped VMEM limit: half of it for the rolled kernel and
-# three quarters for the deep pipeline.
+# Per-grid-step VMEM budget of the served entry point: half of the 32 MiB
+# default scoped VMEM limit.
 V6E_ROLLED_VMEM_BUDGET = _SCOPED_VMEM_LIMIT // 2
-V6E_DEEP_VMEM_BUDGET = 3 * _SCOPED_VMEM_LIMIT // 4
-# Routed row count up to which `moe_gmm_v6e_planar_t_b11` uses the deep
-# schedule and 32-row alignment; larger (prefill) batches use the rolled
-# schedule and 128-row alignment. Empirical decode / prefill boundary from
-# TPU v6e with hidden=3584, inter=3072 experts; not derived.
-_MOE_GMM_DEEP_MAX_ROWS = 2048
-# Routed-row padding of `moe_gmm_v6e_planar_t_b11`: decode-sized batches
-# pad to a multiple of 32 rows, prefill-sized ones to 128.
-_MOE_GMM_DECODE_ROW_ALIGN = 32
-_MOE_GMM_PREFILL_ROW_ALIGN = 128
+# Routed-row padding of `moe_gmm_v6e_planar_t_b11`.
+_MOE_GMM_ROW_ALIGN = 128
 # Expert-parallel shard count assumed when sizing the row tile: each
 # shard expects to own about `padded_m / _MOE_GMM_EP_SHARDS` of the routed
 # rows (`default_tiling(expected_rows=...)`). A fixed assumption, not read
@@ -1490,7 +900,7 @@ def is_supported_by_planar_t_b11(
 
     Returns:
       True for TPU v6e, PLANAR_WINDOW-aligned widths that fit the grouped
-      kernel's smallest tiling, and a SiTU or SiLU activation.
+      kernel's smallest tiling, and a SiTU activation.
     """
     return (
         chip_version == pltpu.ChipVersion.TPU_V6E
@@ -1498,7 +908,7 @@ def is_supported_by_planar_t_b11(
         and inter % PLANAR_WINDOW == 0
         and _smallest_tiling_fits(hidden, rhs_pairs=2)
         and _smallest_tiling_fits(inter, rhs_pairs=1)
-        and (activation == "silu" or activation.startswith("situ:"))
+        and activation.startswith("situ:")
     )
 
 
@@ -1581,12 +991,10 @@ def parse_situ_activation(activation: str) -> tuple[float, float | None]:
     """Parses the expert activation string into SiTU clamp parameters.
 
     Args:
-      activation: `'situ:<beta>:<linear_beta>'` (`linear_beta` may be `none`) or
-        `'silu'`.
+      activation: `'situ:<beta>:<linear_beta>'` (`linear_beta` may be `none`).
 
     Returns:
-      `(beta, linear_beta)`; `'silu'` maps to `(0.0, None)`, which `_situ_f32`
-      evaluates as plain SiLU-and-multiply.
+      `(beta, linear_beta)`.
 
     Raises:
       NotImplementedError: for any other activation.
@@ -1594,8 +1002,6 @@ def parse_situ_activation(activation: str) -> tuple[float, float | None]:
     if activation.startswith("situ:"):
         _, beta, linear_beta = activation.split(":")
         return float(beta), None if linear_beta == "none" else float(linear_beta)
-    if activation == "silu":
-        return 0.0, None
     raise NotImplementedError(
         f"Unsupported activation {activation!r} for v6e planar_t_b11 MoE kernel."
     )
@@ -1609,9 +1015,7 @@ def _run_fused_gate_up_5d(
     situ_beta: float,
     situ_linear_beta: float | None,
     tiling: tuple[int, int, int],
-    dequant: str,
     group_metadata: GroupMetadata,
-    deep_vmem_budget: int = V6E_DEEP_VMEM_BUDGET,
 ) -> jax.Array:
     """Fused gate+up grouped matmul with the SiTU epilogue.
 
@@ -1627,9 +1031,7 @@ def _run_fused_gate_up_5d(
       situ_beta: SiTU gate clamp (`parse_situ_activation`).
       situ_linear_beta: SiTU linear clamp, or None.
       tiling: `(tm, k_chunk, tn)`.
-      dequant: one of `DEQUANT_MODES`.
       group_metadata: `_make_group_metadata` result for `(M, tm, E)`.
-      deep_vmem_budget: VMEM bound for the deep kernel's column tile.
 
     Returns:
       `[M, N]` SiTU-gated activations in `lhs.dtype`.
@@ -1645,46 +1047,12 @@ def _run_fused_gate_up_5d(
     w13_packed_5d = w13_pt.reshape(num_groups, 2, steps, plane_rows, n)
     w13_scales_5d = w13_sc_3d.reshape(num_groups, 2, steps, scale_rows, n)
 
-    grid_metadata, num_active_tiles = _check_group_metadata(
-        group_metadata, m=m, tm=tm, num_groups=num_groups
-    )
+    grid_metadata, num_active_tiles = group_metadata
     preferred_element_type = lhs.dtype
     interpret = jax.default_backend() != "tpu"
 
-    if dequant in DEEP_DEQUANT_BODIES:
-        deep_body = DEEP_DEQUANT_BODIES[dequant]
-        deep_tn = _deep_fit_tn(
-            k=k,
-            n=n,
-            tm=tm,
-            chunk=chunk,
-            tn=tn,
-            num_stacks=2,
-            budget=deep_vmem_budget,
-            lhs_bytes=jnp.dtype(lhs.dtype).itemsize,
-            out_bytes=jnp.dtype(preferred_element_type).itemsize,
-        )
-        if deep_tn is not None and _deep_eligible(
-            m=m, k=k, n=n, tm=tm, chunk=chunk, tn=deep_tn
-        ):
-            return _deep_planar_t_b11_call(
-                lhs,
-                ((w13_packed_5d, w13_scales_5d), (w13_packed_5d, w13_scales_5d)),
-                grid_metadata,
-                num_active_tiles,
-                tm=tm,
-                chunk=chunk,
-                tn=deep_tn,
-                situ=(situ_beta, situ_linear_beta),
-                preferred_element_type=preferred_element_type,
-                interpret=interpret,
-            )
-        dequant = deep_body
-
     # Rolled planar_t_b11 kernel with 5D BlockSpec indexing (0 for gate, 1 for up)
     tiles_n = (n + tn - 1) // tn
-    use_k_loop = _use_k_loop(k, chunk)
-    fold_chunk = _planar_t_fold_chunk(dequant)
     dims_t = (((1,), (0,)), ((), ()))
 
     def kernel(
@@ -1711,7 +1079,7 @@ def _run_fused_gate_up_5d(
                 (gate_packed_ref[i], gate_scales_ref[i], gate_acc),
                 (up_packed_ref[i], up_scales_ref[i], up_acc),
             ):
-                codes, wscale = fold_chunk(packed_c, scales_c)
+                codes, wscale = _dequantize_chunk_planar_t_b11(packed_c, scales_c)
                 target[...] += (
                     lax.dot_general(
                         lhs_chunk,
@@ -1723,11 +1091,7 @@ def _run_fused_gate_up_5d(
                 )
             return carry
 
-        if use_k_loop:
-            lax.fori_loop(0, k // chunk, chunk_body_t, 0)
-        else:
-            for c in range(0, k, chunk):
-                chunk_body_t(c // chunk, 0)
+        lax.fori_loop(0, k // chunk, chunk_body_t, 0)
 
         h = _situ_f32(
             gate_acc[...].astype(preferred_element_type),
@@ -1820,9 +1184,7 @@ def moe_gmm_v6e_planar_t_b11(
     Runs the fused gate+up grouped matmul with the SiTU epilogue, then the
     down grouped matmul, decoding the weights in VMEM to float8_e4m3b11fnuz
     (see the module docstring). Both kernels share one row tile and one
-    group-metadata build. Routed batches of up to `_MOE_GMM_DEEP_MAX_ROWS`
-    rows use the deep schedule; larger (prefill) batches use the rolled one
-    (bitwise identical).
+    group-metadata build.
 
     Args:
       lhs: `[M, K]` sorted routed activations (bf16).
@@ -1831,7 +1193,7 @@ def moe_gmm_v6e_planar_t_b11(
       w2_pt: `[E, N/2, K]` uint8 from `repack_w2_planar_t`.
       w2_scale_pt: `[E, N/32, 1, K]` or `[E, N/32, K]` uint8.
       group_sizes: `[E]` int32 local expert row counts.
-      activation: expert activation (`'situ:<beta>:<linear_beta>'` or `'silu'`).
+      activation: expert activation (`'situ:<beta>:<linear_beta>'`).
       preferred_element_type: output dtype (defaults to `lhs.dtype`).
 
     Returns:
@@ -1852,21 +1214,11 @@ def moe_gmm_v6e_planar_t_b11(
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
     # Pad M to the row alignment so the row tile divides it.
-    align_m = (
-        _MOE_GMM_DECODE_ROW_ALIGN
-        if orig_m <= _MOE_GMM_DEEP_MAX_ROWS
-        else _MOE_GMM_PREFILL_ROW_ALIGN
-    )
-    padded_m = _round_up(orig_m, align_m)
+    padded_m = _round_up(orig_m, _MOE_GMM_ROW_ALIGN)
     if padded_m != orig_m:
         lhs = jnp.pad(lhs, ((0, padded_m - orig_m), (0, 0)))
 
     expected_rows = max(_MIN_EXPECTED_TM, -(-padded_m // _MOE_GMM_EP_SHARDS))
-    dequant = (
-        DEQUANT_PLANAR_T_B11_DEEP
-        if padded_m <= _MOE_GMM_DEEP_MAX_ROWS
-        else DEQUANT_PLANAR_T_B11
-    )
 
     tiling_13 = default_tiling(
         padded_m,
@@ -1876,7 +1228,7 @@ def moe_gmm_v6e_planar_t_b11(
         rhs_pairs=2,
         expected_rows=expected_rows,
         vmem_budget=V6E_ROLLED_VMEM_BUDGET,
-        # Not the v6e value: see the calibration note at the constants.
+        # Not measured on v6e: see the calibration note at the constant.
         scoped_elem_bytes=SCOPED_ELEM_BYTES_TPU7X,
         force_chunk=PLANAR_WINDOW,
     )
@@ -1901,7 +1253,6 @@ def moe_gmm_v6e_planar_t_b11(
         m=padded_m,
         tm=tm_common,
         num_groups=num_groups,
-        impl="closed_form",
     )
 
     h = _run_fused_gate_up_5d(
@@ -1911,9 +1262,7 @@ def moe_gmm_v6e_planar_t_b11(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         tiling=tiling_13,
-        dequant=dequant,
         group_metadata=group_metadata,
-        deep_vmem_budget=V6E_DEEP_VMEM_BUDGET,
     )
 
     out = mxfp4_gmm(
@@ -1924,8 +1273,6 @@ def moe_gmm_v6e_planar_t_b11(
         preferred_element_type=out_dtype,
         tiling=tiling_2,
         interpret=jax.default_backend() != "tpu",
-        dequant=dequant,
-        deep_vmem_budget=V6E_DEEP_VMEM_BUDGET,
         group_metadata=group_metadata,
     )
     return out[:orig_m]
@@ -2158,7 +1505,7 @@ def fused_decode_moe_v6e_planar_t_b11(
       topk_weights: `[M, topk]` routing weights.
       topk_ids: `[M, topk]` int32 local expert ids (-1 or out of range for
         assignments this shard does not own).
-      activation: expert activation (`'situ:<beta>:<linear_beta>'` or `'silu'`).
+      activation: expert activation (`'situ:<beta>:<linear_beta>'`).
       preferred_element_type: output dtype (defaults to the activation dtype).
 
     Returns:
@@ -2204,7 +1551,6 @@ def fused_decode_moe_v6e_planar_t_b11(
     w2_packed_4d = w2_pt.reshape(num_groups, steps_2, plane_rows, k)
     w2_scales_in = w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
 
-    fold_chunk = _planar_t_fold_chunk(DEQUANT_PLANAR_T_B11)
     dims = (((1,), (0,)), ((), ()))
 
     def kernel(
@@ -2309,7 +1655,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                     for cs in range(steps_13):
                         k_sl = pl.ds(cs * chunk, chunk)
                         # One weight unpack per chunk, shared by all trays.
-                        g_codes, g_wscale = fold_chunk(
+                        g_codes, g_wscale = _dequantize_chunk_planar_t_b11(
                             w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
                         )
                         for tr in range(num_trays):
@@ -2324,7 +1670,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                                 )
                                 * g_wscale
                             )
-                        u_codes, u_wscale = fold_chunk(
+                        u_codes, u_wscale = _dequantize_chunk_planar_t_b11(
                             w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
                         )
                         for tr in range(num_trays):
@@ -2360,7 +1706,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                     for cs in range(steps_2):
                         n_sl = pl.ds(cs * chunk, chunk)
                         # One weight unpack per chunk, shared by all trays.
-                        codes2, wscale2 = fold_chunk(
+                        codes2, wscale2 = _dequantize_chunk_planar_t_b11(
                             w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
                         )
                         for tr in range(num_trays):
@@ -2394,7 +1740,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                     up_acc[...] = jnp.zeros_like(up_acc)
                     for cs in range(steps_13):
                         lhs_chunk = tile[:, cs * chunk : (cs + 1) * chunk]
-                        g_codes, g_wscale = fold_chunk(
+                        g_codes, g_wscale = _dequantize_chunk_planar_t_b11(
                             w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
                         )
                         gate_acc[...] += (
@@ -2406,7 +1752,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                             )
                             * g_wscale
                         )
-                        u_codes, u_wscale = fold_chunk(
+                        u_codes, u_wscale = _dequantize_chunk_planar_t_b11(
                             w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
                         )
                         up_acc[...] += (
@@ -2436,7 +1782,7 @@ def fused_decode_moe_v6e_planar_t_b11(
                     w2_acc[...] = jnp.zeros_like(w2_acc)
                     for cs in range(steps_2):
                         h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
-                        codes2, wscale2 = fold_chunk(
+                        codes2, wscale2 = _dequantize_chunk_planar_t_b11(
                             w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
                         )
                         w2_acc[...] += (

@@ -16,7 +16,7 @@
 import dataclasses
 import math
 from collections.abc import Callable
-from typing import NamedTuple, TypeVar
+from typing import TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -535,17 +535,392 @@ def build_kimi_dispatched_kda_op(
     return dispatched_impl
 
 
+def _pooled_kda_core(
+    mixed_qkv: jax.Array,
+    raw_gate: jax.Array,
+    beta: jax.Array,
+    output_gate: jax.Array,
+    pool: jax.Array,  # (num_blocks, block_size, *payload, lanes)
+    conv_weight: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    norm_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    window_distribution: jax.Array | None = None,
+    slot_read_offsets: jax.Array | None = None,
+    ckpt_indices: jax.Array | None = None,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    pool_block_tokens: int,
+    conv_shard_heads: int | None = None,
+    num_spec_tokens: int = 0,
+) -> tuple[jax.Array, jax.Array]:
+    num_reqs = state_indices.shape[0]
+    window = num_spec_tokens + 1
+    dense_offsets = None
+    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
+    if num_spec_tokens:
+        if slot_read_offsets is None or ckpt_indices is None:
+            raise ValueError(
+                "Pooled KDA verify requires read offsets and checkpoint indices"
+            )
+        if ckpt_indices.shape != (num_reqs, window):
+            raise ValueError(
+                "Pooled KDA checkpoint indices must match the verify window"
+            )
+        # Manager blocks need not be contiguous. Keep every checkpoint in a
+        # contiguous scratch window, including untouched ragged/prefill tails.
+        # TODO: follow #889's is_shared=True path and access the unified pool
+        # directly via ckpt_indices[s, offset], avoiding per-step gather/scatter
+        # and dense checkpoint temporaries.
+        num_reqs *= window
+        dense_offsets = jnp.zeros(num_reqs + 1, dtype=jnp.int32)
+        dense_offsets = dense_offsets.at[identity].set(slot_read_offsets[state_indices])
+        state_indices = ckpt_indices.reshape(-1)
+    num_heads = a_log.shape[0]
+    head_dim = norm_weight.shape[0]
+    kernel_size = conv_weight.shape[0]
+    # The pool dtype is the attention KV dtype. The state regions keep the
+    # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
+    # sizing, the Raiden manifest), so an fp8 pool still holds fp32 conv rows,
+    # the only conv dtype the fused kernel accepts.
+    conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
+    conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
+    tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=pooled_gdn_ssm_state_bytes(
+            num_v_heads=num_heads, head_k_dim=head_dim, head_v_dim=head_dim
+        ),
+        conv_bytes=pooled_gdn_conv_state_bytes(
+            kernel_size=kernel_size, conv_dim=3 * num_heads * head_dim
+        ),
+        token_bytes=tok_bytes,
+    )
+    # state_indices are MANAGER block ids, and the region offsets are
+    # manager-block-relative. The pool's shape[1] unit is a packed token
+    # row (an MLA pool packs `pool.shape[2]` tokens per row), and a backend
+    # with a fixed kernel block size splits each manager block into `split`
+    # consecutive pool blocks — so measure the regions against the manager
+    # block and let gather_region/scatter_region remap the ids
+    # (`state_indices * split + kb`) through their split branch.
+    tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    if pool_block_tokens % tokens_per_row != 0:
+        raise ValueError(
+            "Manager block size is not a whole number of pool "
+            f"rows: {pool_block_tokens} tokens at "
+            f"{tokens_per_row} tokens/row"
+        )
+    manager_rows = pool_block_tokens // tokens_per_row
+    if manager_rows % pool.shape[1] != 0:
+        raise ValueError(
+            "Manager block does not split into whole pool "
+            f"blocks: {manager_rows} rows vs pool block of "
+            f"{pool.shape[1]}"
+        )
+    split = manager_rows // pool.shape[1]
+    if layout.required_tokens > manager_rows:
+        raise ValueError(
+            "KDA state regions exceed the pool block: "
+            f"{layout.required_tokens} > {manager_rows}"
+        )
+
+    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
+    # per typed row, so the leading H * D rows are exactly the state.
+    ssm_gathered = pool_adapters.gather_region(
+        pool,
+        state_indices,
+        tok0=0,
+        ntok=layout.ssm_tokens,
+        out_dtype=jnp.float32,
+        out_lanes=head_dim,
+        split=split,
+    )
+    ssm_rows = num_heads * head_dim
+    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
+        num_reqs, num_heads, head_dim, head_dim
+    )
+
+    # Stage-3 stores whole, padded prefill-head shards in rank order. Each
+    # shard occupies whole pool rows, so Raiden can concatenate
+    # aligned byte ranges without half-word scatter/gather. Restore logical
+    # (taps, qkv, heads, dim) order in the existing pooled adapter, just as
+    # Qwen's pair-blocked layout does. Ordinary serving has one shard.
+    shard_heads = num_heads if conv_shard_heads is None else conv_shard_heads
+    if shard_heads <= 0 or num_heads % shard_heads:
+        raise ValueError("KDA conv layout requires whole source head shards")
+    conv_shards = num_heads // shard_heads
+    if layout.conv_tokens % conv_shards:
+        raise ValueError("KDA conv shards must occupy whole packed pool rows")
+    shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
+    padded_shard_elems = (
+        layout.conv_tokens // conv_shards * tok_bytes // conv_elem_bytes
+    )
+    if shard_elems > padded_shard_elems:
+        raise ValueError("KDA conv shard exceeds its padded pool region")
+    conv_gathered = pool_adapters.gather_region(
+        pool,
+        state_indices,
+        tok0=layout.ssm_tokens,
+        ntok=layout.conv_tokens,
+        out_dtype=conv_dtype,
+        split=split,
+    )
+    conv_local = conv_gathered.reshape(num_reqs, conv_shards, padded_shard_elems)[
+        :, :, :shard_elems
+    ]
+    conv_local = conv_local.reshape(
+        num_reqs, conv_shards, kernel_size - 1, 3, shard_heads, head_dim
+    )
+    conv_local = conv_local.transpose(0, 2, 3, 1, 4, 5).reshape(
+        num_reqs, kernel_size - 1, 3, num_heads, head_dim
+    )
+
+    # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
+    conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local], axis=0)
+    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local], axis=0)
+
+    # The fused conv1d + GDN v3 kernel takes the conv state flat
+    # [slots, K - 1, 3*H*D]; the buffers here lay their channels out as
+    # (K - 1, 3, H, D) in row-major order, so both reshapes are free. Padded
+    # and zero-length sequences are safe under identity indices because the
+    # kernel gates their state DMAs to zero size rather than redirecting them
+    # to the null slot.
+    fused_core = _build_fused_core(lower_bound, eps, num_spec_tokens)
+    output, new_conv_buf, new_ssm_buf = fused_core(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
+        ssm_buf,
+        conv_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        query_start_loc,
+        identity,
+        seq_lens,
+        distribution,
+        window_distribution,
+        dense_offsets,
+    )
+    new_conv_buf = new_conv_buf.reshape(
+        num_reqs + 1, kernel_size - 1, 3, num_heads, head_dim
+    )
+
+    # Scatter the real slots back; the padding rows/elems of each region are
+    # zero-filled so the pool bytes stay deterministic.
+    ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
+    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
+    new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
+    pool = pool_adapters.scatter_region(
+        pool, new_ssm, state_indices, tok0=0, ntok=layout.ssm_tokens, split=split
+    )
+
+    new_conv = new_conv_buf[1:].reshape(
+        num_reqs, kernel_size - 1, 3, conv_shards, shard_heads, head_dim
+    )
+    new_conv = new_conv.transpose(0, 3, 1, 2, 4, 5).reshape(
+        num_reqs, conv_shards, shard_elems
+    )
+    new_conv = jnp.pad(
+        new_conv, ((0, 0), (0, 0), (0, padded_shard_elems - shard_elems))
+    )
+    new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
+    pool = pool_adapters.scatter_region(
+        pool,
+        new_conv,
+        state_indices,
+        tok0=layout.ssm_tokens,
+        ntok=layout.conv_tokens,
+        split=split,
+    )
+
+    return output, pool
+
+
+def _pooled_conv_shard_heads(vllm_config: VllmConfig) -> int | None:
+    """Heads per stored conv-state shard, or None for an unsharded conv state."""
+    if not (
+        tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+        and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION
+    ):
+        return None
+    total_heads = int(
+        vllm_config.model_config.hf_text_config.linear_attn_config["num_heads"]
+    )
+    source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
+    if source_tp <= 0 or total_heads % source_tp:
+        raise ValueError("KDA conv source TP must divide num_heads")
+    return total_heads // source_tp
+
+
+def build_kimi_pooled_kda_op(
+    prefix: str,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    vllm_config: VllmConfig,
+    num_spec_tokens: int = 0,
+):
+    """Build the KDA op that reads and writes its state through the pool.
+
+    Same torch-level contract as the dense dispatched op, except the two
+    state caches are replaced by the single attention-shaped pool buffer.
+    The state regions are gathered out of the pool, run through the fused
+    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
+    unfused core is not available here), and scattered back.
+
+    The manager block size (``cache_config.block_size``) lets the op size
+    the state regions against the manager block and derive the
+    manager->pool-block split for the state-index remap. It is read PER
+    CALL, not at build time: the platform's block-size derivation for the
+    pool runs after model construction (hybrid layers are built before the
+    adjusted value exists), so a value captured at build time is the
+    pre-adjustment one (16) and the op would size its regions against the
+    wrong manager block.
+    """
+
+    conv_shard_heads = _pooled_conv_shard_heads(vllm_config)
+
+    def pooled_core(
+        mixed_qkv: jax.Array,
+        raw_gate: jax.Array,
+        beta: jax.Array,
+        output_gate: jax.Array,
+        pool: jax.Array,
+        conv_weight: jax.Array,
+        a_log: jax.Array,
+        dt_bias: jax.Array,
+        norm_weight: jax.Array,
+        query_start_loc: jax.Array,
+        state_indices: jax.Array,
+        seq_lens: jax.Array,
+        distribution: jax.Array,
+        window_distribution: jax.Array | None = None,
+        slot_read_offsets: jax.Array | None = None,
+        ckpt_indices: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        # Explicit annotated signature: pallas.jax_op's _verify_signature
+        # rejects unannotated *args.
+        return _pooled_kda_core(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
+            lower_bound=lower_bound,
+            eps=eps,
+            pool_block_tokens=vllm_config.cache_config.block_size,
+            conv_shard_heads=conv_shard_heads,
+            num_spec_tokens=num_spec_tokens,
+        )
+
+    # vLLM's compile cache is keyed on the model config and not on the op
+    # body, so the kernel variant goes in the op name (see
+    # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
+    # era would otherwise be served stale.
+    op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
+    op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+    if num_spec_tokens:
+        op_name += f"_window{num_spec_tokens + 1}"
+    if conv_shard_heads is not None:
+        # Stored state order is part of the compiled program, including for
+        # decode-local requests and prefix-cache seeds, not just PD loads.
+        op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
+    pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
+
+    def _fake_pooled(
+        mixed_qkv,
+        _raw_gate,
+        _beta,
+        _output_gate,
+        pool,
+        _conv_weight,
+        a_log,
+        _dt_bias,
+        norm_weight,
+        *args,
+        **kwargs,
+    ):
+        output = torch.empty(
+            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
+            dtype=mixed_qkv.dtype,
+            device=mixed_qkv.device,
+        )
+        return output, torch.empty_like(pool)
+
+    pooled_op.register_fake(_fake_pooled)
+
+    def pooled_impl(
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        pool: torch.Tensor,
+        conv_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        window_distribution: torch.Tensor | None = None,
+        slot_read_offsets: torch.Tensor | None = None,
+        ckpt_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output, new_pool = pooled_op(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution,
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
+        )
+        pool.copy_(new_pool)
+        return output
+
+    return pooled_impl
+
+
 @dataclasses.dataclass(frozen=True)
 class _KdaPoolGeometry:
-    """Static byte geometry of the KDA state regions inside one pool block."""
+    """Static byte geometry of the unsharded KDA state regions in a pool block.
+
+    Read by the speculative verify and commit ops, which stream the state
+    straight from the unified pool (`supports_deferred_spec_commit`).
+    `_pooled_kda_core` derives the same geometry inline, with conv shards.
+    """
 
     layout: PooledGDNStateLayout
     tok_bytes: int
     split: int
-    conv_shards: int
-    shard_heads: int
-    shard_elems: int
-    padded_shard_elems: int
     conv_dtype: jnp.dtype
 
 
@@ -556,7 +931,6 @@ def _kda_pool_geometry(
     head_dim: int,
     kernel_size: int,
     pool_block_tokens: int,
-    conv_shard_heads: int | None,
 ) -> _KdaPoolGeometry:
     """Derive (statically, from shapes only) where a request's KDA conv and
     recurrent states live inside its manager block of the unified pool."""
@@ -565,7 +939,6 @@ def _kda_pool_geometry(
     # sizing, the Raiden manifest), so an fp8 pool still holds fp32 conv rows,
     # the only conv dtype the fused kernel accepts.
     conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
-    conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
     tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=pooled_gdn_ssm_state_bytes(
@@ -596,28 +969,8 @@ def _kda_pool_geometry(
             "KDA state regions exceed the pool block: "
             f"{layout.required_tokens} > {manager_rows}"
         )
-
-    shard_heads = num_heads if conv_shard_heads is None else conv_shard_heads
-    if shard_heads <= 0 or num_heads % shard_heads:
-        raise ValueError("KDA conv layout requires whole source head shards")
-    conv_shards = num_heads // shard_heads
-    if layout.conv_tokens % conv_shards:
-        raise ValueError("KDA conv shards must occupy whole packed pool rows")
-    shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
-    padded_shard_elems = (
-        layout.conv_tokens // conv_shards * tok_bytes // conv_elem_bytes
-    )
-    if shard_elems > padded_shard_elems:
-        raise ValueError("KDA conv shard exceeds its padded pool region")
     return _KdaPoolGeometry(
-        layout=layout,
-        tok_bytes=tok_bytes,
-        split=split,
-        conv_shards=conv_shards,
-        shard_heads=shard_heads,
-        shard_elems=shard_elems,
-        padded_shard_elems=padded_shard_elems,
-        conv_dtype=conv_dtype,
+        layout=layout, tok_bytes=tok_bytes, split=split, conv_dtype=conv_dtype
     )
 
 
@@ -701,336 +1054,6 @@ def _run_kda_window_kernel(
     return new_pool, out
 
 
-class _ActiveRequests(NamedTuple):
-    """Per-request metadata clamped to the requests that can hold tokens."""
-
-    query_start_loc: jax.Array
-    state_indices: jax.Array
-    seq_lens: jax.Array
-    distribution: jax.Array
-    window_distribution: jax.Array | None
-    slot_read_offsets: jax.Array | None
-    ckpt_indices: jax.Array | None
-
-
-def _clamp_active_requests(
-    num_tokens: int,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    seq_lens: jax.Array,
-    distribution: jax.Array,
-    window_distribution: jax.Array | None,
-    slot_read_offsets: jax.Array | None = None,
-    ckpt_indices: jax.Array | None = None,
-) -> _ActiveRequests:
-    """Bound the static per-request width to the padded token bucket.
-
-    `slot_read_offsets` is indexed by state block id (not by request row), so
-    it is passed through unclamped.
-    """
-    num_reqs = state_indices.shape[0]
-    active_reqs = max(1, min(num_reqs, num_tokens))
-    if active_reqs < num_reqs:
-        state_indices = state_indices[:active_reqs]
-        seq_lens = seq_lens[:active_reqs]
-        query_start_loc = query_start_loc[: active_reqs + 1]
-        if ckpt_indices is not None:
-            ckpt_indices = ckpt_indices[:active_reqs]
-        distribution = jnp.minimum(distribution, active_reqs)
-        if window_distribution is not None:
-            window_distribution = jnp.minimum(window_distribution, active_reqs)
-    return _ActiveRequests(
-        query_start_loc=query_start_loc,
-        state_indices=state_indices,
-        seq_lens=seq_lens,
-        distribution=distribution,
-        window_distribution=window_distribution,
-        slot_read_offsets=slot_read_offsets,
-        ckpt_indices=ckpt_indices,
-    )
-
-
-def _pooled_kda_core(
-    mixed_qkv: jax.Array,
-    raw_gate: jax.Array,
-    beta: jax.Array,
-    output_gate: jax.Array,
-    pool: jax.Array,  # (num_blocks, block_size, *payload, lanes)
-    conv_weight: jax.Array,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    norm_weight: jax.Array,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    seq_lens: jax.Array,
-    distribution: jax.Array,
-    window_distribution: jax.Array | None = None,
-    slot_read_offsets: jax.Array | None = None,
-    ckpt_indices: jax.Array | None = None,
-    *,
-    lower_bound: float | None,
-    eps: float,
-    pool_block_tokens: int,
-    conv_shard_heads: int | None = None,
-    num_spec_tokens: int = 0,
-) -> tuple[jax.Array, jax.Array]:
-    """One pooled KDA step: state read from and written back to `pool`."""
-    num_reqs = state_indices.shape[0]
-    window = num_spec_tokens + 1
-    if num_spec_tokens:
-        if slot_read_offsets is None or ckpt_indices is None:
-            raise ValueError(
-                "Pooled KDA verify requires read offsets and checkpoint indices"
-            )
-        if ckpt_indices.shape != (num_reqs, window):
-            raise ValueError(
-                "Pooled KDA checkpoint indices must match the verify window"
-            )
-    reqs = _clamp_active_requests(
-        mixed_qkv.shape[0],
-        query_start_loc,
-        state_indices,
-        seq_lens,
-        distribution,
-        window_distribution,
-        slot_read_offsets,
-        ckpt_indices,
-    )
-    num_heads = a_log.shape[0]
-    head_dim = norm_weight.shape[0]
-    kernel_size = conv_weight.shape[0]
-    geom = _kda_pool_geometry(
-        pool,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        kernel_size=kernel_size,
-        pool_block_tokens=pool_block_tokens,
-        conv_shard_heads=conv_shard_heads,
-    )
-
-    if geom.conv_shards == 1 and num_spec_tokens == 0:
-        return _pooled_kda_direct(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            pool,
-            conv_weight,
-            a_log,
-            dt_bias,
-            norm_weight,
-            reqs.query_start_loc,
-            reqs.state_indices,
-            reqs.seq_lens,
-            reqs.distribution
-            if reqs.window_distribution is None
-            else reqs.window_distribution,
-            geom=geom,
-            lower_bound=lower_bound,
-            eps=eps,
-        )
-    return _pooled_kda_gather_scatter(
-        mixed_qkv,
-        raw_gate,
-        beta,
-        output_gate,
-        pool,
-        conv_weight,
-        a_log,
-        dt_bias,
-        norm_weight,
-        reqs,
-        geom=geom,
-        lower_bound=lower_bound,
-        eps=eps,
-        num_spec_tokens=num_spec_tokens,
-    )
-
-
-def _pooled_kda_direct(
-    mixed_qkv: jax.Array,
-    raw_gate: jax.Array,
-    beta: jax.Array,
-    output_gate: jax.Array,
-    pool: jax.Array,
-    conv_weight: jax.Array,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    norm_weight: jax.Array,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    seq_lens: jax.Array,
-    distribution: jax.Array,
-    *,
-    geom: _KdaPoolGeometry,
-    lower_bound: float | None,
-    eps: float,
-) -> tuple[jax.Array, jax.Array]:
-    """K = 0 pooled KDA with in-kernel shared-pool granule streaming."""
-    num_tokens = mixed_qkv.shape[0]
-    num_heads = a_log.shape[0]
-    head_dim = norm_weight.shape[0]
-    new_pool, out = _run_kda_window_kernel(
-        mixed_qkv,
-        raw_gate,
-        beta,
-        pool,
-        conv_weight,
-        a_log,
-        dt_bias,
-        query_start_loc,
-        state_indices,
-        seq_lens,
-        distribution,
-        geom=geom,
-        lower_bound=lower_bound,
-        num_spec_tokens=0,
-    )
-    output = out.reshape(num_tokens, num_heads, head_dim)
-    output = _gated_output_norm(output, output_gate, norm_weight, eps, mixed_qkv.dtype)
-    return output, new_pool
-
-
-def _pooled_kda_gather_scatter(
-    mixed_qkv: jax.Array,
-    raw_gate: jax.Array,
-    beta: jax.Array,
-    output_gate: jax.Array,
-    pool: jax.Array,
-    conv_weight: jax.Array,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    norm_weight: jax.Array,
-    reqs: _ActiveRequests,
-    *,
-    geom: _KdaPoolGeometry,
-    lower_bound: float | None,
-    eps: float,
-    num_spec_tokens: int,
-) -> tuple[jax.Array, jax.Array]:
-    state_indices = reqs.state_indices
-    num_reqs = state_indices.shape[0]
-    window = num_spec_tokens + 1
-    dense_offsets = None
-    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
-    if num_spec_tokens:
-        assert reqs.slot_read_offsets is not None and reqs.ckpt_indices is not None
-        num_reqs *= window
-        dense_offsets = jnp.zeros(num_reqs + 1, dtype=jnp.int32)
-        dense_offsets = dense_offsets.at[identity].set(
-            reqs.slot_read_offsets[state_indices]
-        )
-        state_indices = reqs.ckpt_indices.reshape(-1)
-    num_heads = a_log.shape[0]
-    head_dim = norm_weight.shape[0]
-    kernel_size = conv_weight.shape[0]
-    layout = geom.layout
-    split = geom.split
-
-    ssm_gathered = pool_adapters.gather_region(
-        pool,
-        state_indices,
-        tok0=0,
-        ntok=layout.ssm_tokens,
-        out_dtype=jnp.float32,
-        out_lanes=head_dim,
-        split=split,
-    )
-    ssm_rows = num_heads * head_dim
-    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
-        num_reqs, num_heads, head_dim, head_dim
-    )
-
-    conv_gathered = pool_adapters.gather_region(
-        pool,
-        state_indices,
-        tok0=layout.ssm_tokens,
-        ntok=layout.conv_tokens,
-        out_dtype=geom.conv_dtype,
-        split=split,
-    )
-    conv_local = conv_gathered.reshape(
-        num_reqs, geom.conv_shards, geom.padded_shard_elems
-    )[:, :, : geom.shard_elems]
-    conv_local = conv_local.reshape(
-        num_reqs, geom.conv_shards, kernel_size - 1, 3, geom.shard_heads, head_dim
-    )
-    conv_local = conv_local.transpose(0, 2, 3, 1, 4, 5).reshape(
-        num_reqs, kernel_size - 1, 3, num_heads, head_dim
-    )
-
-    conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local], axis=0)
-    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local], axis=0)
-
-    fused_core = _build_fused_core(lower_bound, eps, num_spec_tokens)
-    output, new_conv_buf, new_ssm_buf = fused_core(
-        mixed_qkv,
-        raw_gate,
-        beta,
-        output_gate,
-        conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
-        ssm_buf,
-        conv_weight,
-        a_log,
-        dt_bias,
-        norm_weight,
-        reqs.query_start_loc,
-        identity,
-        reqs.seq_lens,
-        reqs.distribution,
-        reqs.window_distribution,
-        dense_offsets,
-    )
-    new_conv_buf = new_conv_buf.reshape(
-        num_reqs + 1, kernel_size - 1, 3, num_heads, head_dim
-    )
-
-    ssm_region_rows = layout.ssm_tokens * geom.tok_bytes // (4 * head_dim)
-    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
-    new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
-    pool = pool_adapters.scatter_region(
-        pool, new_ssm, state_indices, tok0=0, ntok=layout.ssm_tokens, split=split
-    )
-
-    new_conv = new_conv_buf[1:].reshape(
-        num_reqs, kernel_size - 1, 3, geom.conv_shards, geom.shard_heads, head_dim
-    )
-    new_conv = new_conv.transpose(0, 3, 1, 2, 4, 5).reshape(
-        num_reqs, geom.conv_shards, geom.shard_elems
-    )
-    new_conv = jnp.pad(
-        new_conv,
-        ((0, 0), (0, 0), (0, geom.padded_shard_elems - geom.shard_elems)),
-    )
-    new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
-    pool = pool_adapters.scatter_region(
-        pool,
-        new_conv,
-        state_indices,
-        tok0=layout.ssm_tokens,
-        ntok=layout.conv_tokens,
-        split=split,
-    )
-
-    return output, pool
-
-
-def _pooled_conv_shard_heads(vllm_config: VllmConfig) -> int | None:
-    """Heads per stored conv-state shard, or None for an unsharded conv state."""
-    if not (
-        tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
-        and tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION
-    ):
-        return None
-    total_heads = int(
-        vllm_config.model_config.hf_text_config.linear_attn_config["num_heads"]
-    )
-    source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
-    if source_tp <= 0 or total_heads % source_tp:
-        raise ValueError("KDA conv source TP must divide num_heads")
-    return total_heads // source_tp
-
-
 def supports_deferred_spec_commit(vllm_config: VllmConfig) -> bool:
     """Whether pooled KDA can verify without state writes and commit afterwards."""
     return (
@@ -1039,132 +1062,6 @@ def supports_deferred_spec_commit(vllm_config: VllmConfig) -> bool:
         )
         and _pooled_conv_shard_heads(vllm_config) is None
     )
-
-
-def build_kimi_pooled_kda_op(
-    prefix: str,
-    *,
-    lower_bound: float | None,
-    eps: float,
-    vllm_config: VllmConfig,
-    num_spec_tokens: int = 0,
-):
-    """Build the KDA op that reads and writes its state through the pool."""
-    conv_shard_heads = _pooled_conv_shard_heads(vllm_config)
-
-    def pooled_core(
-        mixed_qkv: jax.Array,
-        raw_gate: jax.Array,
-        beta: jax.Array,
-        output_gate: jax.Array,
-        pool: jax.Array,
-        conv_weight: jax.Array,
-        a_log: jax.Array,
-        dt_bias: jax.Array,
-        norm_weight: jax.Array,
-        query_start_loc: jax.Array,
-        state_indices: jax.Array,
-        seq_lens: jax.Array,
-        distribution: jax.Array,
-        window_distribution: jax.Array | None = None,
-        slot_read_offsets: jax.Array | None = None,
-        ckpt_indices: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
-        return _pooled_kda_core(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            pool,
-            conv_weight,
-            a_log,
-            dt_bias,
-            norm_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            distribution,
-            window_distribution,
-            slot_read_offsets,
-            ckpt_indices,
-            lower_bound=lower_bound,
-            eps=eps,
-            pool_block_tokens=vllm_config.cache_config.block_size,
-            conv_shard_heads=conv_shard_heads,
-            num_spec_tokens=num_spec_tokens,
-        )
-
-    op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
-    op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
-    op_name += "_direct_pool"
-    if num_spec_tokens:
-        op_name += f"_window{num_spec_tokens + 1}"
-    if conv_shard_heads is not None:
-        op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
-    pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
-
-    def _fake_pooled(
-        mixed_qkv,
-        _raw_gate,
-        _beta,
-        _output_gate,
-        pool,
-        _conv_weight,
-        a_log,
-        _dt_bias,
-        norm_weight,
-        *args,
-        **kwargs,
-    ):
-        output = torch.empty(
-            (mixed_qkv.size(0), a_log.shape[0], norm_weight.shape[0]),
-            dtype=mixed_qkv.dtype,
-            device=mixed_qkv.device,
-        )
-        return output, torch.empty_like(pool)
-
-    pooled_op.register_fake(_fake_pooled)
-
-    def pooled_impl(
-        mixed_qkv: torch.Tensor,
-        raw_gate: torch.Tensor,
-        beta: torch.Tensor,
-        output_gate: torch.Tensor,
-        pool: torch.Tensor,
-        conv_weight: torch.Tensor,
-        a_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        norm_weight: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        state_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        distribution: torch.Tensor,
-        window_distribution: torch.Tensor | None = None,
-        slot_read_offsets: torch.Tensor | None = None,
-        ckpt_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        output, new_pool = pooled_op(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            pool,
-            conv_weight,
-            a_log,
-            dt_bias,
-            norm_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            distribution,
-            window_distribution,
-            slot_read_offsets,
-            ckpt_indices,
-        )
-        pool.copy_(new_pool)
-        return output
-
-    return pooled_impl
 
 
 def pooled_kda_verify(
@@ -1195,14 +1092,6 @@ def pooled_kda_verify(
     if not num_spec_tokens:
         raise ValueError("Pooled KDA speculative verify requires num_spec_tokens > 0")
     num_tokens = mixed_qkv.shape[0]
-    reqs = _clamp_active_requests(
-        num_tokens,
-        query_start_loc,
-        state_indices,
-        seq_lens,
-        distribution,
-        window_distribution,
-    )
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
     kernel_size = conv_weight.shape[0]
@@ -1212,9 +1101,7 @@ def pooled_kda_verify(
         head_dim=head_dim,
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
-        conv_shard_heads=None,
     )
-    assert geom.conv_shards == 1, geom.conv_shards
     new_pool, out = _run_kda_window_kernel(
         mixed_qkv,
         raw_gate,
@@ -1223,12 +1110,10 @@ def pooled_kda_verify(
         conv_weight,
         a_log,
         dt_bias,
-        reqs.query_start_loc,
-        reqs.state_indices,
-        reqs.seq_lens,
-        reqs.distribution
-        if reqs.window_distribution is None
-        else reqs.window_distribution,
+        query_start_loc,
+        state_indices,
+        seq_lens,
+        window_distribution,
         geom=geom,
         lower_bound=lower_bound,
         num_spec_tokens=num_spec_tokens,
@@ -1281,9 +1166,10 @@ def pooled_kda_commit(
         head_dim=head_dim,
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
-        conv_shard_heads=None,
     )
-    assert geom.conv_shards == 1, geom.conv_shards
+    # The runner pads the request metadata to `MIN_NUM_SEQS` rows, which can
+    # exceed the `max_num_seqs` windows the verify caches hold: bound the
+    # requests to the cached windows so the kernel never reads past them.
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     active_reqs = max(1, min(num_reqs, cache_qkv.shape[0] // window))

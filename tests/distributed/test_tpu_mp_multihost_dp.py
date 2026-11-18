@@ -51,10 +51,10 @@ def _is_torch_tpu_env(key: str) -> bool:
     return key.startswith(("TORCH_TPU_", "_TORCH_TPU_"))
 
 
-# (nnodes, chips per host, dp, tp): DP8xTP16 on v6e-128, DP2xTP16 on v6e-32, and
-# the 4 "hosts" x 2 chips v6e-8 emulation.
-SHAPES = [(32, 4, 8, 16), (8, 4, 2, 16), (4, 2, 2, 4)]
-SHAPE_IDS = ["v6e128_dp8_tp16", "v6e32_dp2_tp16", "v6e8emul_dp2_tp4"]
+# (nnodes, chips per host, dp, tp): DP8xTP16 on v6e-128 and the 4 "hosts" x 2
+# chips v6e-8 emulation.
+SHAPES = [(32, 4, 8, 16), (4, 2, 2, 4)]
+SHAPE_IDS = ["v6e128_dp8_tp16", "v6e8emul_dp2_tp4"]
 
 
 @pytest.fixture(autouse=True)
@@ -71,7 +71,7 @@ def isolated_environment(monkeypatch):
     os.environ.update(saved)
 
 
-def _nnodes_dp_config(nnodes, chips, dp, tp, node_rank, ep=True):
+def _nnodes_dp_config(nnodes, chips, dp, tp, node_rank):
     # Fields as EngineArgs.create_engine_config infers them for --nnodes with
     # internal DP load balancing (vllm/engine/arg_utils.py, --nnodes block).
     local_world_size = dp * tp // nnodes
@@ -88,7 +88,7 @@ def _nnodes_dp_config(nnodes, chips, dp, tp, node_rank, ep=True):
         data_parallel_master_ip=MASTER_ADDR,
         data_parallel_backend="mp",
         is_moe_model=True,
-        enable_expert_parallel=ep,
+        enable_expert_parallel=True,
     )
     host_ips = [f"10.0.{i // 250}.{i % 250 + 1}" for i in range(nnodes)]
     with (
@@ -112,7 +112,8 @@ def _clear_bootstrap_env():
 
 @pytest.mark.parametrize("nnodes,chips,dp,tp", SHAPES, ids=SHAPE_IDS)
 def test_nnodes_dp_exports_torch_tpu_dp_env(nnodes, chips, dp, tp):
-    """Every host (DP leaders and headless TP-worker hosts) gets the same DP env."""
+    """Every host (DP leaders and headless TP-worker hosts) gets the same DP env,
+    and a user-exported DP master is kept."""
     nnodes_within_dp = nnodes // dp
     # Node 0 (head, DP0 leader), node 1 (headless TP workers of DP0) and the
     # last DP rank's leader host.
@@ -138,29 +139,12 @@ def test_nnodes_dp_exports_torch_tpu_dp_env(nnodes, chips, dp, tp):
     # Hosts cannot coordinate a random pick, so the port must be deterministic.
     assert len(set(seen)) == 1, seen
 
-
-def test_nnodes_dp_keeps_user_exported_dp_master():
+    _clear_bootstrap_env()
     os.environ["TORCH_TPU_DP_MASTER_ADDR"] = "10.9.9.9"
     os.environ["TORCH_TPU_DP_MASTER_PORT"] = "31000"
-    _nnodes_dp_config(4, 2, 2, 4, node_rank=1)
-    assert os.environ["TORCH_TPU_DP_SIZE"] == "2"
+    _nnodes_dp_config(nnodes, chips, dp, tp, node_rank=1)
     assert os.environ["TORCH_TPU_DP_MASTER_ADDR"] == "10.9.9.9"
     assert os.environ["TORCH_TPU_DP_MASTER_PORT"] == "31000"
-
-
-def test_nnodes_dense_dp_keeps_device_control_env_var():
-    _nnodes_dp_config(4, 2, 2, 4, node_rank=1, ep=False)
-    assert os.environ["TORCH_TPU_DP_SIZE"] == "2"
-    assert TpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
-
-
-def test_nnodes_without_dp_leaves_dp_env_unset():
-    vllm_config = _nnodes_dp_config(4, 2, 1, 8, node_rank=1)
-    assert vllm_config.parallel_config.distributed_executor_backend.__name__ == (
-        "TpuMultiprocExecutor"
-    )
-    assert not [k for k in DP_ENV if k in os.environ]
-    assert TpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
 
 
 class _ReachedDistInit(Exception):

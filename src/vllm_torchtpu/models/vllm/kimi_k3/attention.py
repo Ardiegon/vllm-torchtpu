@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import cast
 
 import torch
-from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -65,17 +64,11 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 
 logger = init_logger(__name__)
-
-# Row alignment applied when trimming the shared RoPE cos/sin table to the
-# served sequence length (+ any speculative draft window) so SparseCore gathers
-# stay lane-tile aligned without materializing unused positions.
-_ROPE_ROW_ALIGN = 128
 
 
 def kda_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
@@ -360,26 +353,6 @@ class MultiHeadLatentAttention(nn.Module):
                 is_neox_style=False,
                 dtype=torch.float32,
             )
-            # YaRN builds the cos/sin table for `original_max * factor`, while
-            # positions never exceed `max_model_len` plus any speculative draft
-            # block. Each row depends on its position alone, and `get_rope`
-            # caches one shared instance across layers, so trimming once to a
-            # tile-aligned bound keeps a single compact graph input.
-            spec_cfg = vllm_config.speculative_config
-            draft_rows = (
-                int(spec_cfg.num_speculative_tokens) + 1 if spec_cfg is not None else 0
-            )
-            min_rows = int(vllm_config.model_config.max_model_len) + max(
-                draft_rows, _ROPE_ROW_ALIGN
-            )
-            max_rows = (
-                (min_rows + _ROPE_ROW_ALIGN - 1) // _ROPE_ROW_ALIGN * _ROPE_ROW_ALIGN
-            )
-            assert rotary_emb is not None
-            cache = rotary_emb.cos_sin_cache
-            assert isinstance(cache, torch.Tensor)
-            if cache.shape[0] > max_rows:
-                rotary_emb.cos_sin_cache = cache[:max_rows].contiguous()
 
         self.prefill_group = (
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
@@ -511,7 +484,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         self.prefix = prefix
         self.vllm_config = vllm_config
-        self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.head_dim = int(kda_config["head_dim"])
         self.total_heads = int(kda_config["num_heads"])
@@ -743,63 +715,36 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
-    def _pack_prefill_projection(self) -> None:
-        """Concatenate the three BF16 KDA input projections and free the originals."""
+    def _pack_prefill_projection(self):
+        """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
-        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
-        if not (self.use_full_rank_gate and self.head_dim == num_lanes):
+        if not (
+            isinstance(getattr(self, "prefill_group", None), FusedPrefillCollectives)
+            and self.use_full_rank_gate
+            and self.num_heads == 3
+            and self.head_dim == 128
+        ):
             return
-        if self.g_proj is None or self.f_a_proj is None:
-            return
-        local_proj = self.local_projection_size
-        qkv_cols = 3 * local_proj
-        # The beta columns are padded up to a lane tile boundary.
-        beta_pad_cols = (self.num_heads + num_lanes - 1) // num_lanes * num_lanes
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
-        expected = (
-            (self.hidden_size, qkv_cols + self.num_heads),
-            (self.hidden_size, local_proj),
-            (self.hidden_size, self.head_dim),
-        )
-        weights: list[torch.Tensor] = []
+        expected = ((7168, 1155), (7168, 384), (7168, 128))
+        weights = []
         for projection, shape in zip(projections, expected):
             weight = getattr(projection, "weight", None)
-            if weight is None or not isinstance(weight, torch.Tensor):
-                logger.warning_once(
-                    "KimiDeltaAttention[%s]: packed prefill projection disabled "
-                    "(missing weight on %s)",
-                    self.prefix,
-                    type(projection).__name__,
-                )
-                return
             if (
-                weight.dtype != torch.bfloat16
+                weight is None
+                or weight.dtype != torch.bfloat16
                 or weight.shape != shape
                 or not getattr(projection, WEIGHT_FLIPPED_ATTR, False)
             ):
-                logger.warning_once(
-                    "KimiDeltaAttention[%s]: packed prefill projection disabled "
-                    "(expected flipped bfloat16 %s, got shape=%s dtype=%s)",
-                    self.prefix,
-                    shape,
-                    tuple(weight.shape),
-                    weight.dtype,
-                )
                 return
             weights.append(weight)
+        # q/k/v occupy 1152 columns; pad the 3 beta columns to an MXU tile.
         qkvb, gate, fa = weights
-        pad_cols = beta_pad_cols - self.num_heads
-        empty_dtype = qkvb.dtype
-        empty_device = qkvb.device
         with torch.no_grad():
-            packed = torch.cat(
-                (qkvb, qkvb.new_zeros((self.hidden_size, pad_cols)), gate, fa), dim=-1
-            )
+            packed = torch.cat((qkvb, qkvb.new_zeros((7168, 125)), gate, fa), dim=-1)
             # Materialize the layout once, avoiding a lazy cat at every call.
-            self.packed_prefill_weight = fresh_buffer(packed)
-            del packed
-            for weight in weights:
-                weight.data = torch.empty(0, dtype=empty_dtype, device=empty_device)
+            self.packed_prefill_weight = torch.empty_like(packed)
+            self.packed_prefill_weight.copy_(packed)
 
     def forward(
         self,
@@ -813,7 +758,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         output_gate: torch.Tensor | None = None
         # Set and read only on the low-rank gate path.
         gate_input: torch.Tensor | None = None
-        local_proj = self.local_projection_size
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
@@ -823,13 +767,11 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)
                 packed = hidden_states @ self.packed_prefill_weight
-            qkv_cols = 3 * local_proj
-            beta_pad_cols = packed.shape[-1] - qkv_cols - local_proj - self.head_dim
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
-                [qkv_cols, beta_pad_cols, local_proj, self.head_dim], dim=-1
+                [1152, 128, 384, 128], dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, :local_proj]
+            query = mixed_qkv[:, : self.local_projection_size]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)

@@ -357,13 +357,6 @@ def _check_single_chunk_spec_commit(
         )
 
 
-def _dp_zero_tokens_across_dp(vllm_config: "VllmConfig") -> torch.Tensor | None:
-    dp_size = vllm_config.parallel_config.data_parallel_size
-    if dp_size <= 1:
-        return None
-    return torch.zeros(dp_size, dtype=torch.int32)
-
-
 def _commit_spec_state_and_offsets(
     runner: "TPUModelRunner",
     spec_commit_metadata: dict[str, Any] | None,
@@ -6733,7 +6726,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens if dp_lockstep else 0,
                 num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
                 if dp_lockstep
-                else _dp_zero_tokens_across_dp(self.vllm_config),
+                else None,
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,

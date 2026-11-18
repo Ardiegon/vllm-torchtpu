@@ -84,17 +84,7 @@ def test_duplicate_context_kv_weights():
     assert torch.equal(out[4][1], weights[2][1])
 
 
-@pytest.mark.parametrize(
-    ("spec_tokens", "max_model_len", "expected_rows"),
-    [
-        (None, 8192, 8320),
-        (7, 8192, 8320),
-        (200, 8192, 8448),
-    ],
-)
-def test_mla_deepseek_yarn_applies_mscale_squared_and_trims_rope_cache(
-    monkeypatch, spec_tokens, max_model_len, expected_rows
-):
+def test_mla_deepseek_yarn_applies_mscale_squared(monkeypatch):
     from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
         yarn_get_mscale,
     )
@@ -123,8 +113,7 @@ def test_mla_deepseek_yarn_applies_mscale_squared_and_trims_rope_cache(
             captured["softmax_scale"] = args[2]
             captured["mla_modules"] = args[8]
 
-    full_table = torch.arange(32768 * 64, dtype=torch.float32).reshape(32768, 64)
-    rope_obj = SimpleNamespace(cos_sin_cache=full_table.clone())
+    rope_obj = SimpleNamespace()
 
     monkeypatch.setattr(
         kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
@@ -158,14 +147,10 @@ def test_mla_deepseek_yarn_applies_mscale_squared_and_trims_rope_cache(
         },
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=max_model_len),
+        model_config=SimpleNamespace(max_model_len=8192),
         cache_config=SimpleNamespace(),
         quant_config=None,
-        speculative_config=(
-            SimpleNamespace(num_speculative_tokens=spec_tokens)
-            if spec_tokens is not None
-            else None
-        ),
+        speculative_config=None,
     )
 
     kimi_attention.MultiHeadLatentAttention(
@@ -178,6 +163,3 @@ def test_mla_deepseek_yarn_applies_mscale_squared_and_trims_rope_cache(
     mscale = float(yarn_get_mscale(32.0, 1.0))
     expected_scale = ((64 + 64) ** -0.5) * mscale * mscale
     assert captured["softmax_scale"] == pytest.approx(expected_scale)
-    trimmed = captured["mla_modules"].rotary_emb.cos_sin_cache
-    assert trimmed.shape == (expected_rows, 64)
-    assert torch.equal(trimmed, full_table[:expected_rows])

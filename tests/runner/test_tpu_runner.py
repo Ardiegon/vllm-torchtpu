@@ -4412,22 +4412,3 @@ class TestSpecStateCommit:
             tpu_runner._check_single_chunk_spec_commit((layer,), 2)
         tpu_runner._check_single_chunk_spec_commit((layer,), 1)
         tpu_runner._check_single_chunk_spec_commit((), 2)
-
-
-class TestDpZeroTokensAcrossDp:
-    """A non-lockstep DP dummy forward hands vLLM all-zero token counts."""
-
-    @staticmethod
-    def _cfg(dp_size: int) -> SimpleNamespace:
-        return SimpleNamespace(
-            parallel_config=SimpleNamespace(data_parallel_size=dp_size)
-        )
-
-    def test_single_dp_rank_returns_none(self):
-        assert tpu_runner._dp_zero_tokens_across_dp(self._cfg(1)) is None
-
-    def test_multi_dp_ranks_return_int32_zeros(self):
-        counts = tpu_runner._dp_zero_tokens_across_dp(self._cfg(4))
-        assert counts is not None
-        assert counts.dtype == torch.int32
-        assert counts.tolist() == [0, 0, 0, 0]

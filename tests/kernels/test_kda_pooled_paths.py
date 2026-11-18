@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pooled KDA op layer on CPU: direct granule-view path selection & verify/commit."""
+"""Pooled KDA speculative verify/commit ops on CPU."""
 
 import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -107,119 +106,15 @@ def _batch(rng, query_lens, pad_rows, num_tokens):
     )
 
 
-def _core(b, **kw):
-    return kop._pooled_kda_core(
-        b["mixed_qkv"],
-        b["raw_gate"],
-        b["beta"],
-        b["output_gate"],
-        b["pool"],
-        b["conv_weight"],
-        b["a_log"],
-        b["dt_bias"],
-        b["norm_weight"],
-        b["query_start_loc"],
-        b["state_indices"],
-        b["seq_lens"],
-        kw.pop("distribution"),
-        lower_bound=LOWER_BOUND,
-        eps=EPS,
-        pool_block_tokens=b["pool_block_tokens"],
-        **kw,
+def test_kimi_k3_tp16_conv_granule_offset_is_770():
+    # Kimi K3 at TP=16: h=6, d=128 -> ssm_tokens=154, conv_tokens=16, 770 granules.
+    pool = jnp.zeros((2, 170, PACK, LANES), jnp.bfloat16)
+    geom = kop._kda_pool_geometry(
+        pool, num_heads=6, head_dim=128, kernel_size=4, pool_block_tokens=340
     )
-
-
-class TestPooledCorePathSelection:
-    def _decode_batch(self):
-        b = _batch(np.random.default_rng(1), [1, 1, 1, 9], pad_rows=2, num_tokens=16)
-        return b, jnp.asarray([3, 4, 4], jnp.int32)
-
-    def test_single_conv_shard_streams_from_the_pool(self, kernel):
-        b, dist = self._decode_batch()
-        out, pool = _core(b, distribution=dist)
-        (call,) = kernel.calls
-        assert call["states"] is b["pool"]
-        assert call["shared_conv_granule_offset"] == b["layout"].ssm_tokens * 5
-        assert call["recurrent_dtype"] == jnp.dtype(jnp.float32)
-        assert call["conv_dtype"] == jnp.dtype(jnp.float32)
-        assert call["read_offsets"] is None
-        assert call["num_spec_tokens"] == 0
-        assert call["batched_state_write"] == gdn_config.StateWrite.ALL
-        assert call["conv_weight"].shape == (3 * H * D, 1, KS)
-        assert out.shape == (16, H, D)
-        assert pool is b["pool"]
-
-    def test_sharded_conv_state_gathers_and_scatters(self, kernel, monkeypatch):
-        b, dist = self._decode_batch()
-        seen = {}
-
-        def fake_gather_scatter(*args, **kwargs):
-            seen["reqs"] = args[9]
-            seen["num_spec_tokens"] = kwargs["num_spec_tokens"]
-            return "gathered"
-
-        monkeypatch.setattr(kop, "_pooled_kda_gather_scatter", fake_gather_scatter)
-        assert _core(b, distribution=dist, conv_shard_heads=1) == "gathered"
-        assert not kernel.calls
-        assert seen["num_spec_tokens"] == 0
-        assert seen["reqs"].state_indices.shape == (6,)
-
-    def test_raiden_admission_from_one_source_rank_is_the_unsharded_layout(
-        self, kernel, monkeypatch
-    ):
-        monkeypatch.setattr(kop.tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", True)
-        monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_KIMIK3_ADMISSION", True)
-        monkeypatch.setattr(kop.tpu_envs, "TPU_RAIDEN_TRANSFER_PARALLELISM", 1)
-        vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_text_config=SimpleNamespace(linear_attn_config={"num_heads": H})
-            )
-        )
-        shard_heads = kop._pooled_conv_shard_heads(vllm_config)
-        assert shard_heads == H
-
-        b, dist = self._decode_batch()
-        unsharded, one_shard = (
-            kop._kda_pool_geometry(
-                b["pool"],
-                num_heads=H,
-                head_dim=D,
-                kernel_size=KS,
-                pool_block_tokens=b["pool_block_tokens"],
-                conv_shard_heads=heads,
-            )
-            for heads in (None, shard_heads)
-        )
-        assert one_shard == unsharded
-        assert one_shard.conv_shards == 1
-
-        _core(b, distribution=dist, conv_shard_heads=shard_heads)
-        (call,) = kernel.calls
-        assert call["states"] is b["pool"]
-        assert call["shared_conv_granule_offset"] == b["layout"].ssm_tokens * 5
-
-    def test_kimi_k3_tp16_conv_granule_offset_is_770(self):
-        # Kimi K3 at TP=16: h=6, d=128 -> ssm_tokens=154, conv_tokens=16, 770 granules.
-        pool = jnp.zeros((2, 170, PACK, LANES), jnp.bfloat16)
-        geom = kop._kda_pool_geometry(
-            pool,
-            num_heads=6,
-            head_dim=128,
-            kernel_size=4,
-            pool_block_tokens=340,
-            conv_shard_heads=None,
-        )
-        assert geom.layout.ssm_tokens == 154
-        assert geom.layout.conv_tokens == 16
-        assert kop._shared_conv_granule_offset(geom) == 770
-
-    def test_request_rows_are_clamped_to_the_token_bucket(self, kernel):
-        b = _batch(np.random.default_rng(6), [1, 1], pad_rows=4, num_tokens=2)
-        _core(b, distribution=jnp.asarray([2, 6, 6], jnp.int32))
-        (call,) = kernel.calls
-        assert call["state_indices"].shape == (2,)
-        assert call["query_start_loc"].shape == (3,)
-        np.testing.assert_array_equal(np.asarray(call["distribution"]), [2, 2, 2])
+    assert geom.layout.ssm_tokens == 154
+    assert geom.layout.conv_tokens == 16
+    assert kop._shared_conv_granule_offset(geom) == 770
 
 
 class TestVerifyAndCommit:
@@ -340,7 +235,9 @@ class TestVerifyAndCommit:
         assert call["batched_state_write"] == gdn_config.StateWrite.LAST
         assert call["batched_only"]
         assert call["qkv"] is caches[0]
+        # The padded fourth request row is clamped to the 3 cached windows.
         assert call["state_indices"].shape == (3,)
+        assert call["query_start_loc"].shape == (4,)
         np.testing.assert_array_equal(np.asarray(call["window_lens"]), [3, 1, 8])
         np.testing.assert_array_equal(np.asarray(call["read_offsets"]), 0)
 
@@ -371,10 +268,3 @@ class TestVerifyCommitBuilder:
                 vllm_config=vllm_config,
                 num_spec_tokens=K_SPEC,
             )
-
-
-def test_jit_traces_the_direct_path(kernel):
-    b = _batch(np.random.default_rng(5), [1, 1], pad_rows=0, num_tokens=2)
-    dist = jnp.asarray([2, 2, 2], jnp.int32)
-    out, _ = jax.jit(lambda: _core(b, distribution=dist))()
-    assert out.shape == (2, H, D)
