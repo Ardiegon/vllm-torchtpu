@@ -329,6 +329,8 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "batched_state_write",
+        "shared_conv_granule_offset",
     ),
 )
 def fused_conv1d_gdn(
@@ -336,7 +338,7 @@ def fused_conv1d_gdn(
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     states: jax.Array | tuple[jax.Array, jax.Array],
-    conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
+    conv_weight: jax.Array,  # [dim_size, 1, kernel_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
     dt_bias: jax.Array,  # [n_v] for GDN, [n_v, d_k] for KDA
@@ -368,6 +370,9 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    batched_state_write: config.StateWrite = config.StateWrite.ALL,
+    window_lens: jax.Array | None = None,  # [num_seqs]
+    shared_conv_granule_offset: int | None = None,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -457,6 +462,11 @@ def fused_conv1d_gdn(
         )
 
     act_out_dtype = qkv.dtype
+    batched_state_write = config.StateWrite(batched_state_write)
+    if batched_only and prefill_only:
+        raise ValueError("batched_only and prefill_only are mutually exclusive")
+    if window_lens is not None and batched_state_write != config.StateWrite.LAST:
+        raise ValueError("window_lens is only meaningful for a masked commit")
 
     is_shared = isinstance(states, jax.Array)
     if is_shared:
@@ -465,8 +475,19 @@ def fused_conv1d_gdn(
         assert states.shape[-2] == state_packing
         assert conv_dtype is not None
         assert recurrent_dtype is not None
+        assert (
+            num_spec_tokens == 0
+            or ckpt_indices is not None
+            or batched_state_write != config.StateWrite.ALL
+        ), "num_spec_tokens > 0 with batched_state_write=ALL requires ckpt_indices"
     else:
         assert len(states) == 2
+        assert batched_state_write == config.StateWrite.ALL, (
+            "batched_state_write requires a shared state pool"
+        )
+        assert shared_conv_granule_offset is None, (
+            "shared_conv_granule_offset requires a shared state pool"
+        )
         recurrent_dtype = states[1].dtype
         conv_dtype = states[0].dtype
     # Conv1D reads the compact layout, which needs fp32. The recurrent state
@@ -523,7 +544,7 @@ def fused_conv1d_gdn(
         # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
         # the pool block only ever has to hold a single state.
         assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1)
-    else:
+    elif batched_state_write == config.StateWrite.ALL:
         # Iniitalize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
@@ -682,6 +703,12 @@ def fused_conv1d_gdn(
                 conv_state=conv_dtype,
             ),
             is_shared=is_shared,
+            state_write=(
+                config.StateWrite.ALL
+                if mode == config.GDNMode.PER_SEQ
+                else batched_state_write
+            ),
+            shared_conv_granule_offset=shared_conv_granule_offset,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -695,6 +722,7 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
+                window_lens=window_lens,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -764,11 +792,6 @@ def fused_conv1d_gdn(
             in_act,
             weights,
         )
-
-    # The first segment holds verify windows of up to `num_spec_tokens + 1`
-    # tokens, or plain 1-token decodes without speculative decoding.
-    if batched_only and prefill_only:
-        raise ValueError("batched_only and prefill_only are mutually exclusive")
 
     out_act, out_states = None, states
     if not prefill_only:
