@@ -56,6 +56,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
+    build_pooled_kda_verify_commit_ops,
+    supports_deferred_spec_commit,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -639,6 +641,49 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             vllm_config=vllm_config,
             num_spec_tokens=self.num_spec_tokens,
         )
+        # Under speculative decoding the unified-pool KDA runs a
+        # side-effect-free W = 1 + K verify that caches its kernel inputs, and
+        # the runner commits each request's accepted prefix after rejection
+        # sampling (`commit_spec`): one state write per request instead of
+        # W. The caches hold the leading `max_num_seqs * W` token rows, which
+        # cover every windowed row ([decode][verify][prefill] batch order).
+        self.defers_spec_state_commit = (
+            self.num_spec_tokens > 0 and supports_deferred_spec_commit(vllm_config)
+        )
+        self.pooled_kda_verify_op = None
+        self.pooled_kda_commit_op = None
+        self.verify_cache_qkv: torch.Tensor | None
+        self.verify_cache_gate: torch.Tensor | None
+        self.verify_cache_beta: torch.Tensor | None
+        if self.defers_spec_state_commit:
+            self.pooled_kda_verify_op, self.pooled_kda_commit_op = (
+                build_pooled_kda_verify_commit_ops(
+                    prefix,
+                    lower_bound=self.gate_lower_bound,
+                    eps=config.rms_norm_eps,
+                    vllm_config=vllm_config,
+                    num_spec_tokens=self.num_spec_tokens,
+                )
+            )
+            cache_rows = vllm_config.scheduler_config.max_num_seqs * (
+                self.num_spec_tokens + 1
+            )
+            act_dtype = vllm_config.model_config.dtype
+            assert isinstance(act_dtype, torch.dtype)
+            for name, width in (
+                ("verify_cache_qkv", 3 * self.local_projection_size),
+                ("verify_cache_gate", self.local_projection_size),
+                ("verify_cache_beta", self.num_heads),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.zeros(cache_rows, width, dtype=act_dtype),
+                    persistent=False,
+                )
+        else:
+            for name in ("verify_cache_qkv", "verify_cache_gate", "verify_cache_beta"):
+                self.register_buffer(name, None, persistent=False)
+
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -892,13 +937,40 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         )
         slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
         ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
+        conv_weight = self.conv_weight_fused
+        if self.defers_spec_state_commit:
+            assert self.pooled_kda_verify_op is not None
+            return self.pooled_kda_verify_op(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                pool,
+                conv_weight,
+                self.A_log,
+                self.dt_bias,
+                self.o_norm.weight,
+                cast(torch.Tensor, metadata.query_start_loc),
+                cast(torch.Tensor, state_indices),
+                cast(torch.Tensor, metadata.seq_lens),
+                cast(torch.Tensor, metadata.request_distribution),
+                cast(
+                    torch.Tensor,
+                    window_distribution
+                    if window_distribution is not None
+                    else metadata.request_distribution,
+                ),
+                cast(torch.Tensor, self.verify_cache_qkv),
+                cast(torch.Tensor, self.verify_cache_gate),
+                cast(torch.Tensor, self.verify_cache_beta),
+            )
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
             beta,
             output_gate,
             pool,
-            self.conv_weight_fused,
+            conv_weight,
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
@@ -909,4 +981,44 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             window_distribution,
             slot_read_offsets,
             ckpt_indices,
+        )
+
+    def commit_spec(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_distribution: torch.Tensor,
+        accepted_lens: torch.Tensor,
+    ) -> None:
+        """Commit each windowed request's accepted verify prefix.
+
+        The metadata tensors are this layer's (mamba group's) attention
+        metadata of the verify step; `accepted_lens[r]` is the number of
+        window tokens of batch row `r` whose inputs became context
+        (`num_accepted_drafts + 1`; the whole window on non-verify steps).
+        Advances the KDA conv + recurrent state in the unified pool exactly
+        as that many sequential 1-token decode steps would.
+        """
+        assert self.defers_spec_state_commit and self.pooled_kda_commit_op is not None
+        assert self.verify_cache_qkv is not None
+        assert self.verify_cache_gate is not None
+        assert self.verify_cache_beta is not None
+        if self.kv_cache is None or len(self.kv_cache) != 1:
+            raise NotImplementedError(
+                "Speculative KDA commit requires the unified KV pool"
+            )
+        self.pooled_kda_commit_op(
+            self.kv_cache[0],
+            self.verify_cache_qkv,
+            self.verify_cache_gate,
+            self.verify_cache_beta,
+            self.conv_weight_fused,
+            self.A_log,
+            self.dt_bias,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            window_distribution,
+            accepted_lens,
         )

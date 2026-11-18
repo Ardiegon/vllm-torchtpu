@@ -920,6 +920,7 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_naive_kda = False
+    layer.defers_spec_state_commit = False
 
     pool = torch.zeros(2, 4, 2, 8)
     layer.kv_cache = [pool]
@@ -1036,6 +1037,71 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
         "build_kimi_pooled_kda_op",
         lambda *a, **k: lambda *args, **kwargs: None,
     )
+    # The checkpoint-window ops above; tests of the deferred commit opt in.
+    monkeypatch.setattr(
+        kimi_attention, "supports_deferred_spec_commit", lambda vllm_config: False
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_spec_tokens", "pool_streams_directly", "defers"),
+    [(0, True, False), (7, False, False), (7, True, True)],
+)
+def test_kda_defers_spec_commit_on_the_direct_pool_path(
+    monkeypatch: pytest.MonkeyPatch,
+    num_spec_tokens: int,
+    pool_streams_directly: bool,
+    defers: bool,
+) -> None:
+    """Speculative decoding defers the state commit where the pool allows it."""
+    _patch_kda_construction_deps(monkeypatch)
+
+    class FakeNorm(nn.Module):
+        def __init__(self, hidden_size, eps=1e-5) -> None:
+            super().__init__()
+            del eps
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    monkeypatch.setattr(kimi_attention, "RMSNorm", FakeNorm)
+    monkeypatch.setattr(
+        kimi_attention,
+        "supports_deferred_spec_commit",
+        lambda vllm_config: pool_streams_directly,
+    )
+    built = []
+
+    def build_verify_commit(prefix, **kwargs):
+        built.append(kwargs["num_spec_tokens"])
+        return (lambda *args: None), (lambda *args: None)
+
+    monkeypatch.setattr(
+        kimi_attention, "build_pooled_kda_verify_commit_ops", build_verify_commit
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(mamba_cache_dtype="auto"),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        quant_config=None,
+        speculative_config=(
+            SimpleNamespace(num_speculative_tokens=num_spec_tokens)
+            if num_spec_tokens
+            else None
+        ),
+    )
+
+    layer = kimi_attention.KimiDeltaAttention(
+        _kda_config(), vllm_config, prefix="model.layers.0.kda"
+    )
+
+    assert layer.defers_spec_state_commit is defers
+    assert built == ([num_spec_tokens] if defers else [])
+    if defers:
+        rows = vllm_config.scheduler_config.max_num_seqs * (num_spec_tokens + 1)
+        assert layer.verify_cache_qkv is not None
+        assert layer.verify_cache_qkv.shape[0] == rows
+    else:
+        assert layer.verify_cache_qkv is None
 
 
 @pytest.mark.tpu_test
@@ -1236,6 +1302,7 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
+    layer.defers_spec_state_commit = False
     if use_full_rank_gate:
         layer.f_a_proj = _Projection(2)
         layer.g_proj = _ConstantProjection(7.0, 4)
@@ -3193,3 +3260,15 @@ def test_kimi_moe_warns_once_and_falls_back_when_overlap_weights_cannot_pack(
     x = torch.randn(2, 16, dtype=torch.bfloat16)
     torch.testing.assert_close(layer.forward(x), x + 1)
     assert unfused_calls == [(2, 4)]
+
+
+def test_kda_layer_conforms_to_the_spec_state_commit_protocol() -> None:
+    from vllm_torchtpu.runner.tpu_runner import SpecStateCommitLayer
+
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefix = "model.layers.0.self_attn"
+    layer.num_spec_tokens = 7
+    layer.defers_spec_state_commit = True
+
+    assert isinstance(layer, SpecStateCommitLayer)

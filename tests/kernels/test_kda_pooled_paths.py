@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pooled KDA op layer on CPU: direct granule-view path selection."""
+"""Pooled KDA op layer on CPU: direct granule-view path selection & verify/commit."""
 
 import inspect
 from types import SimpleNamespace
@@ -220,6 +220,157 @@ class TestPooledCorePathSelection:
         assert call["state_indices"].shape == (2,)
         assert call["query_start_loc"].shape == (3,)
         np.testing.assert_array_equal(np.asarray(call["distribution"]), [2, 2, 2])
+
+
+class TestVerifyAndCommit:
+    def _verify(self, kernel, query_lens, pad_rows, num_tokens, cache_rows):
+        b = _batch(np.random.default_rng(2), query_lens, pad_rows, num_tokens)
+        n = len(query_lens)
+        wdist = jnp.asarray([n, n, n], jnp.int32)
+        caches = (
+            jnp.zeros((cache_rows, 3 * H * D), jnp.bfloat16),
+            jnp.zeros((cache_rows, H * D), jnp.bfloat16),
+            jnp.zeros((cache_rows, H), jnp.bfloat16),
+        )
+        result = kop.pooled_kda_verify(
+            b["mixed_qkv"],
+            b["raw_gate"],
+            b["beta"],
+            b["output_gate"],
+            b["pool"],
+            b["conv_weight"],
+            b["a_log"],
+            b["dt_bias"],
+            b["norm_weight"],
+            b["query_start_loc"],
+            b["state_indices"],
+            b["seq_lens"],
+            wdist,
+            wdist,
+            *caches,
+            lower_bound=LOWER_BOUND,
+            eps=EPS,
+            pool_block_tokens=b["pool_block_tokens"],
+            num_spec_tokens=K_SPEC,
+        )
+        return b, wdist, result
+
+    def test_verify_is_side_effect_free_and_caches_inputs(self, kernel):
+        b, _, (out, pool, cq, cg, cb) = self._verify(
+            kernel, [8, 5, 8], pad_rows=2, num_tokens=32, cache_rows=4 * W
+        )
+        (call,) = kernel.calls
+        assert call["batched_state_write"] == gdn_config.StateWrite.NONE
+        assert call["num_spec_tokens"] == K_SPEC
+        np.testing.assert_array_equal(np.asarray(call["read_offsets"]), 0)
+        assert call["ckpt_indices"] is None
+        assert call["b"] is b["beta"]
+        assert call["conv_weight"].shape == (3 * H * D, 1, KS)
+        assert pool is b["pool"]
+        assert out.shape == (32, H, D)
+        np.testing.assert_array_equal(np.asarray(cq), np.asarray(b["mixed_qkv"]))
+        np.testing.assert_array_equal(np.asarray(cg), np.asarray(b["raw_gate"]))
+        np.testing.assert_array_equal(np.asarray(cb), np.asarray(b["beta"]))
+
+    def test_verify_output_is_the_gated_norm_of_the_kernel_output(self, kernel):
+        b, _, (out, *_rest) = self._verify(
+            kernel, [8, 8], pad_rows=0, num_tokens=16, cache_rows=2 * W
+        )
+        (call,) = kernel.calls
+        v = call["qkv"][:, -H * D :].astype(jnp.float32)
+        raw = (v + 0.25 * call["a"][:, : H * D].astype(jnp.float32)).astype(
+            jnp.bfloat16
+        )
+        want = kop._gated_output_norm(
+            raw.reshape(16, H, D), b["output_gate"], b["norm_weight"], EPS, jnp.bfloat16
+        )
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(want))
+
+    def test_verify_requires_spec_tokens(self, kernel):
+        b = _batch(np.random.default_rng(3), [1], pad_rows=0, num_tokens=1)
+        z = jnp.zeros((1, 1), jnp.bfloat16)
+        with pytest.raises(ValueError, match="num_spec_tokens"):
+            kop.pooled_kda_verify(
+                *(
+                    b[k]
+                    for k in ("mixed_qkv", "raw_gate", "beta", "output_gate", "pool")
+                ),
+                *(b[k] for k in ("conv_weight", "a_log", "dt_bias", "norm_weight")),
+                b["query_start_loc"],
+                b["state_indices"],
+                b["seq_lens"],
+                jnp.zeros((3,), jnp.int32),
+                jnp.zeros((3,), jnp.int32),
+                z,
+                z,
+                z,
+                lower_bound=LOWER_BOUND,
+                eps=EPS,
+                pool_block_tokens=b["pool_block_tokens"],
+                num_spec_tokens=0,
+            )
+
+    def test_commit_writes_the_last_accepted_position(self, kernel):
+        rng = np.random.default_rng(4)
+        b = _batch(rng, [8, 8, 8], pad_rows=1, num_tokens=32)
+        cache_rows = 3 * W
+        caches = (
+            _bf16(rng, (cache_rows, 3 * H * D)),
+            _bf16(rng, (cache_rows, H * D)),
+            _bf16(rng, (cache_rows, H)),
+        )
+        accepted = jnp.asarray([3, 1, 8, 0], jnp.int32)
+        pool = kop.pooled_kda_commit(
+            b["pool"],
+            *caches,
+            b["conv_weight"],
+            b["a_log"],
+            b["dt_bias"],
+            b["query_start_loc"],
+            b["state_indices"],
+            b["seq_lens"],
+            jnp.asarray([3, 3, 3], jnp.int32),
+            accepted,
+            lower_bound=LOWER_BOUND,
+            pool_block_tokens=b["pool_block_tokens"],
+            num_spec_tokens=K_SPEC,
+        )
+        (call,) = kernel.calls
+        assert pool is b["pool"]
+        assert call["batched_state_write"] == gdn_config.StateWrite.LAST
+        assert call["batched_only"]
+        assert call["qkv"] is caches[0]
+        assert call["state_indices"].shape == (3,)
+        np.testing.assert_array_equal(np.asarray(call["window_lens"]), [3, 1, 8])
+        np.testing.assert_array_equal(np.asarray(call["read_offsets"]), 0)
+
+
+class TestVerifyCommitBuilder:
+    def test_requires_spec_tokens(self):
+        with pytest.raises(ValueError, match="num_spec_tokens"):
+            kop.build_pooled_kda_verify_commit_ops(
+                "layer",
+                lower_bound=LOWER_BOUND,
+                eps=EPS,
+                vllm_config=None,
+                num_spec_tokens=0,
+            )
+
+    def test_requires_the_unified_pool(self, monkeypatch):
+        monkeypatch.setattr(kop.tpu_envs, "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", False)
+        monkeypatch.setattr(kop.tpu_envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(architecture="AnyHybridModel")
+        )
+        assert not kop.supports_deferred_spec_commit(vllm_config)
+        with pytest.raises(NotImplementedError, match="unified"):
+            kop.build_pooled_kda_verify_commit_ops(
+                "layer",
+                lower_bound=LOWER_BOUND,
+                eps=EPS,
+                vllm_config=vllm_config,
+                num_spec_tokens=K_SPEC,
+            )
 
 
 def test_jit_traces_the_direct_path(kernel):
