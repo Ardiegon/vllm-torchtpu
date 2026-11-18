@@ -670,3 +670,166 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     torch.testing.assert_close(selected["topk_weights"], regular["topk_weights"])
     torch.testing.assert_close(selected["topk_ids"], regular["topk_ids"])
     assert selected["topk_weights"][-1].count_nonzero() == 0
+
+
+def test_planar_t_load_ops_register_matching_fakes(monkeypatch):
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe_w4an_mxfp4 as module,
+    )
+
+    class _FakeJaxOp:
+        def __init__(self, name, fn):
+            self.name = name
+            self.fn = fn
+            self.fakes = []
+
+        def register_fake(self, fake_fn):
+            self.fakes.append(fake_fn)
+            return fake_fn
+
+        def __call__(self, *args):
+            return self.fakes[0](*args)
+
+    recorded: dict[str, _FakeJaxOp] = {}
+
+    def fake_jax_op(name, fn):
+        op = _FakeJaxOp(name, fn)
+        recorded[name] = op
+        return op
+
+    monkeypatch.setattr(module, "_planar_t_load_ops", {})
+    monkeypatch.setattr(module.pallas, "jax_op", fake_jax_op)
+
+    w13 = torch.zeros((3, 1024, 256), dtype=torch.uint8)
+    s13 = torch.zeros((3, 1024, 16), dtype=torch.uint8)
+    w13_pt, s13_pt = module.load_w13_planar_t_mxfp4(w13, s13)
+    ref_w13, ref_s13 = module.repack_w13_planar_t(
+        jnp.zeros(w13.shape, jnp.uint8), jnp.zeros(s13.shape, jnp.uint8)
+    )
+    assert w13_pt.shape == ref_w13.shape and w13_pt.dtype == torch.uint8
+    assert s13_pt.shape == ref_s13.shape and s13_pt.dtype == torch.uint8
+    assert len(recorded["pallas::mxfp4_load_w13_planar_t"].fakes) == 1
+
+    w2 = torch.zeros((3, 512, 256), dtype=torch.uint8)
+    s2 = torch.zeros((3, 512, 16), dtype=torch.uint8)
+    w2_pt, s2_pt = module.load_w2_planar_t_mxfp4(w2, s2)
+    ref_w2, ref_s2 = module.repack_w2_planar_t(
+        jnp.zeros(w2.shape, jnp.uint8), jnp.zeros(s2.shape, jnp.uint8)
+    )
+    assert w2_pt.shape == ref_w2.shape and w2_pt.dtype == torch.uint8
+    assert s2_pt.shape == ref_s2.shape and s2_pt.dtype == torch.uint8
+    assert len(recorded["pallas::mxfp4_load_w2_planar_t"].fakes) == 1
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+@pytest.mark.parametrize(
+    ("chip_name", "requant_block", "expect_planar_t"),
+    [
+        ("TPU_V6E", None, True),
+        ("TPU_7X", None, False),
+        ("TPU_V6E", "64", False),
+    ],
+)
+def test_process_weights_after_loading_dispatches_planar_t_on_v6e_cpu(
+    monkeypatch, activation, chip_name, requant_block, expect_planar_t
+):
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe_w4an_mxfp4 as module,
+    )
+
+    moe_config = MagicMock(w13_num_shards=2)
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.ep_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 512
+    moe_config.intermediate_size_per_partition_unpadded = 512
+    moe_config.activation_situ_beta = 4.0
+    moe_config.activation_situ_linear_beta = 25.0
+
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer.activation = activation
+    layer.moe_config.activation_situ_beta = 4.0
+    layer.moe_config.activation_situ_linear_beta = 25.0
+    layer._expert_routing_tables = lambda: (None, None)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=512,
+        intermediate_size_per_partition=512,
+        params_dtype=torch.bfloat16,
+    )
+    for param in (
+        layer.w13_weight_packed,
+        layer.w13_weight_scale,
+        layer.w2_weight_packed,
+        layer.w2_weight_scale,
+    ):
+        param.data.fill_(125)
+
+    # Keep `.to("tpu")` on CPU so the full hook runs without TPU hardware.
+    orig_to = torch.Tensor.to
+    monkeypatch.setattr(
+        torch.Tensor,
+        "to",
+        lambda self, *args, **kwargs: (
+            self if args and args[0] == "tpu" else orig_to(self, *args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        module, "get_chip_version", lambda: getattr(pltpu.ChipVersion, chip_name)
+    )
+    monkeypatch.setattr(module.envs, "MOE_REQUANTIZE_BLOCK_SIZE", requant_block)
+    monkeypatch.setattr(module, "fresh_buffer", lambda t: t.contiguous())
+    monkeypatch.setattr(module, "prebuild_fused_moe_kernel", lambda **_kw: None)
+
+    planar_calls: list[str] = []
+
+    def cpu_w13(w, s):
+        planar_calls.append("w13")
+        wp, sp = module.repack_w13_planar_t(
+            jnp.asarray(w.numpy()), jnp.asarray(s.numpy())
+        )
+        return torch.from_numpy(np.asarray(wp)), torch.from_numpy(np.asarray(sp))
+
+    def cpu_w2(w, s):
+        planar_calls.append("w2")
+        wp, sp = module.repack_w2_planar_t(
+            jnp.asarray(w.numpy()), jnp.asarray(s.numpy())
+        )
+        return torch.from_numpy(np.asarray(wp)), torch.from_numpy(np.asarray(sp))
+
+    monkeypatch.setattr(module, "load_w13_planar_t_mxfp4", cpu_w13)
+    monkeypatch.setattr(module, "load_w2_planar_t_mxfp4", cpu_w2)
+    monkeypatch.setattr(
+        module,
+        "load_kmajor_fp4",
+        lambda w: w.transpose(-1, -2).contiguous(),
+    )
+    monkeypatch.setattr(
+        module,
+        "requant_load_kmajor_fp4",
+        lambda w, s, _b: (
+            w.transpose(-1, -2).contiguous(),
+            s.movedim(-1, 1).unsqueeze(-2),
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    if expect_planar_t:
+        assert planar_calls == ["w13", "w2"]
+        assert layer.w13_weight.shape == (2, 512, 512)
+        assert layer.w2_weight.shape == (2, 256, 512)
+        assert layer.w13_weight_scale.shape == (2, 32, 1, 512)
+        assert layer.w2_weight_scale.shape == (2, 16, 1, 512)
+        assert layer.w13_weight_scale.dtype == torch.uint8
+    else:
+        assert planar_calls == []

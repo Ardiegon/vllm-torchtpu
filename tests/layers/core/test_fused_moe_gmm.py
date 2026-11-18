@@ -1427,3 +1427,88 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
     assert num_sorts == expected_sorts, (
         f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
     )
+
+
+def _planar_t_test_weights(rng, num_experts=2, hidden=512, inter=512):
+    from vllm_torchtpu.kernels.megablox import gmm_v6e_planar_t_b11 as gmm
+
+    w13 = rng.integers(0, 256, (num_experts, 2 * inter, hidden // 2), dtype=np.uint8)
+    s13 = rng.integers(125, 129, (num_experts, 2 * inter, hidden // 32), dtype=np.uint8)
+    w2 = rng.integers(0, 256, (num_experts, hidden, inter // 2), dtype=np.uint8)
+    s2 = rng.integers(125, 129, (num_experts, hidden, inter // 32), dtype=np.uint8)
+    w13_pt, w13_sc = gmm.repack_w13_planar_t(jnp.asarray(w13), jnp.asarray(s13))
+    w2_pt, w2_sc = gmm.repack_w2_planar_t(jnp.asarray(w2), jnp.asarray(s2))
+    return (w13, s13, w2, s2), (w13_pt, w13_sc, w2_pt, w2_sc)
+
+
+def test_moe_gmm_dispatches_planar_t_and_rejects_biases(monkeypatch):
+    rng = np.random.default_rng(17)
+    _, (w13_pt, w13_sc, w2_pt, w2_sc) = _planar_t_test_weights(rng)
+    num_tokens, topk, hidden = 4, 2, 512
+    # Sorted routed assignments: 5 for expert 0, 3 for expert 1.
+    x = jnp.asarray(
+        rng.standard_normal((num_tokens * topk, hidden)) * 0.25, jnp.bfloat16
+    )
+    group_sizes = jnp.asarray([5, 3], jnp.int32)
+    argsort_revert_indices = jnp.arange(num_tokens * topk, dtype=jnp.int32)
+    token_indices_sorted = jnp.arange(num_tokens * topk, dtype=jnp.int32) // topk
+    topk_weights_flat = jnp.full((num_tokens * topk,), 0.5, jnp.bfloat16)
+    valid_mask_flat = jnp.ones((num_tokens * topk,), jnp.bool_)
+
+    # Ensure `gmm_wrapper` is NOT called when weights are in planar_t layout.
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "gmm_wrapper",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("gmm_wrapper must not run on planar_t weights")
+        ),
+    )
+
+    with pltpu.force_tpu_interpret_mode():
+        out = moe_gmm(
+            x,
+            w13_pt,
+            w13_sc,
+            None,
+            w2_pt,
+            w2_sc,
+            None,
+            group_sizes,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask_flat,
+            token_indices_sorted,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=False,
+            use_sparse_core=False,
+            onehot_moe_permute_threshold=0,
+            rhs_quant_dtype=None,
+        )
+    assert out.shape == (num_tokens, hidden)
+    assert jnp.all(jnp.isfinite(out)) and int(jnp.count_nonzero(out)) > 0
+
+    bias = jnp.zeros((2, 512), jnp.bfloat16)
+    with pytest.raises(NotImplementedError, match="expert biases"):
+        moe_gmm(
+            x,
+            w13_pt,
+            w13_sc,
+            bias,
+            w2_pt,
+            w2_sc,
+            None,
+            group_sizes,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask_flat,
+            token_indices_sorted,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=False,
+            use_sparse_core=False,
+            onehot_moe_permute_threshold=0,
+            rhs_quant_dtype=None,
+        )

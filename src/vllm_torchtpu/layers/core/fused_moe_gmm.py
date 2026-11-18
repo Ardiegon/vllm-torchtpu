@@ -24,6 +24,10 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    is_planar_t_b11_layout,
+    moe_gmm_v6e_planar_t_b11,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -522,36 +526,55 @@ def moe_gmm(
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
-    group_offset = jnp.array([0], dtype=jnp.int32)
-
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
+    if is_planar_t_b11_layout(w1, w1_scale, rhs_quant_dtype=rhs_quant_dtype):
+        # No other kernel can read the planar_t layout, so unsupported
+        # operands must fail here rather than fall back.
+        assert w1_scale is not None and w2_scale is not None
+        if w1_bias is not None or w2_bias is not None:
+            raise NotImplementedError(
+                "The planar_t MXFP4 MoE kernel does not support expert biases."
+            )
+        gmm2_res = moe_gmm_v6e_planar_t_b11(
+            x,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            group_sizes,
+            activation=activation,
+            preferred_element_type=x.dtype,
+        )
+    else:
+        group_offset = jnp.array([0], dtype=jnp.int32)
+
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+
+        gmm2_res = gmm_wrapper(
+            gmm1_res,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
