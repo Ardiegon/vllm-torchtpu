@@ -251,7 +251,11 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _is_async_drafter=False,
         _greedy_top_tokens_this_step=lambda: False,
         _min_tokens_batch_state=lambda: {},
-        vllm_config=SimpleNamespace(),
+        _spec_commit_layers_cache=None,
+        _spec_commit_fn=None,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={})
+        ),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(
             num_reqs=2,
@@ -332,6 +336,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     for name in (
         "_any_decode",
         "_readmit_trimmed_drafts",
+        "_spec_commit_layers",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
