@@ -33,6 +33,7 @@ from vllm.models.kimi_k3.common.mm_preprocess import navit_resize_image
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
+import vllm_torchtpu.layers.adapter.custom_ops.kimi_moe_ep_overlap_op as kimi_overlap_op
 import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
@@ -437,7 +438,8 @@ def test_expert_parallelism_keeps_native_intermediate_size(
         return FakeRunner()
 
     vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(enable_expert_parallel=True)
+        parallel_config=SimpleNamespace(enable_expert_parallel=True),
+        speculative_config=None,
     )
     monkeypatch.setattr(
         kimi_moe, "get_current_vllm_config_or_none", lambda: vllm_config
@@ -2864,6 +2866,537 @@ def test_moe_gate_correction_bias_is_float32(monkeypatch: pytest.MonkeyPatch) ->
         )
     out = layer(torch.ones(2, 16, dtype=torch.bfloat16))
     assert out[:, 0].tolist() == [1.0, 1.0]
+
+
+def test_pack_dispatch_metadata_signed_16_bit_range() -> None:
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.kimi_k3 import exit_fold
+
+    ids = torch.tensor([[-32768, -2, -1, 0, 1, 32767, 256, 895]], dtype=torch.int32)
+    weights = torch.linspace(0.125, 1.0, 8, dtype=torch.bfloat16).unsqueeze(0)
+    meta = kimi_moe.pack_dispatch_metadata(ids, weights)
+    assert meta.dtype == torch.bfloat16
+    assert meta.shape == (1, 24)
+    # Byte lanes stay exact small integers in bf16 (no subnormals, no NaNs).
+    assert float(meta[:, :16].min()) >= 0 and float(meta[:, :16].max()) <= 255
+    got_ids, got_weights = exit_fold.unpack_meta_columns(
+        jnp.asarray(meta.float().numpy(), dtype=jnp.bfloat16), topk=8
+    )
+    assert torch.equal(torch.tensor(got_ids.tolist(), dtype=torch.int32), ids)
+    torch.testing.assert_close(
+        torch.tensor(got_weights.astype(jnp.float32).tolist(), dtype=torch.bfloat16),
+        weights,
+        rtol=0,
+        atol=0,
+    )
+
+
+def _overlap_config(**overrides) -> kimi_overlap_op.MoeOverlapConfig:
+    fields = dict(
+        routed_activation="situ:4.0:25.0",
+        topk=8,
+        use_norm=True,
+        rms_eps=1e-5,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        fused_decode_max_tokens=64,
+    )
+    fields.update(overrides)
+    return kimi_overlap_op.MoeOverlapConfig(**fields)
+
+
+def _dp_tp_mesh_stub(dp: int, tp: int, axis_names=("dp", "tp")) -> SimpleNamespace:
+    import numpy as np
+
+    devices = np.array(
+        [SimpleNamespace(id=i) for i in range(dp * tp)], dtype=object
+    ).reshape(dp, tp)
+    return SimpleNamespace(axis_names=axis_names, devices=devices)
+
+
+@pytest.fixture
+def registered_overlap_ops(monkeypatch: pytest.MonkeyPatch) -> list[SimpleNamespace]:
+    """Record the custom ops the EP-overlap bridge registers."""
+    registered: list[SimpleNamespace] = []
+
+    def fake_jax_op(name, fn, **kwargs):
+        op = SimpleNamespace(name=name, fn=fn, kwargs=kwargs, fakes=[])
+        op.register_fake = op.fakes.append
+        registered.append(op)
+        return op
+
+    monkeypatch.setattr(kimi_overlap_op.pallas, "jax_op", fake_jax_op)
+    monkeypatch.setattr(kimi_overlap_op, "_OVERLAP_OPS", {})
+    monkeypatch.setattr(kimi_overlap_op.envs, "USE_MOE_SPARSE_CORE", False)
+    return registered
+
+
+def test_ep_overlap_op_is_built_once_per_layer_shape(registered_overlap_ops) -> None:
+    mesh = _dp_tp_mesh_stub(8, 16)
+
+    op = kimi_overlap_op.build_kimi_moe_ep_overlap_op(mesh, _overlap_config())
+    same = kimi_overlap_op.build_kimi_moe_ep_overlap_op(mesh, _overlap_config())
+    verify = kimi_overlap_op.build_kimi_moe_ep_overlap_op(
+        mesh, _overlap_config(fused_decode_max_tokens=256)
+    )
+
+    assert same is op and verify is not op
+    assert [o.name for o in registered_overlap_ops] == [
+        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m64_dp8_tp16",
+        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m256_dp8_tp16",
+    ]
+    assert op.kwargs["mesh"] is mesh
+    assert op.kwargs["output_partition_specs"] == (
+        kimi_overlap_op.PartitionSpec("dp", "tp"),
+    )
+    # 8 tensors, the norm weight, the first expert id and the TP rank.
+    assert len(op.kwargs["input_partition_specs"]) == 11
+
+    distinct_eps = kimi_overlap_op.build_kimi_moe_ep_overlap_op(
+        mesh, _overlap_config(rms_eps=1e-6)
+    )
+    assert distinct_eps is not op
+    assert (
+        kimi_overlap_op.build_kimi_moe_ep_overlap_op(
+            mesh, _overlap_config(rms_eps=1e-6)
+        )
+        is distinct_eps
+    )
+
+
+def test_ep_overlap_op_without_routed_norm_drops_the_norm_operand(
+    registered_overlap_ops,
+) -> None:
+    op = kimi_overlap_op.build_kimi_moe_ep_overlap_op(
+        _dp_tp_mesh_stub(2, 4), _overlap_config(use_norm=False)
+    )
+
+    assert len(op.kwargs["input_partition_specs"]) == 10
+    assert op.kwargs["output_partition_specs"] == (
+        kimi_overlap_op.PartitionSpec("dp", "tp"),
+    )
+    hidden = torch.empty(6, 32)
+    rdown = torch.empty(6, 8)
+    w_shared_gu = torch.empty(32, 2 * 12)
+    (fake,) = op.fakes
+    assert fake(hidden, rdown, None, w_shared_gu, *([None] * 6)).shape == (6, 12 + 8)
+
+
+def test_ep_overlap_op_call_sizes_outputs_per_shard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling the registered EP-overlap custom op returns per-shard `[B_dp, ...]`."""
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    dp_size, tp_size = 8, 16
+    devices = [
+        pallas_impl._PallasDevice(id=i, process_index=i, device_kind="TPU v6 lite")
+        for i in range(dp_size * tp_size)
+    ]
+    mesh = Mesh(
+        np.asarray(devices, dtype=object).reshape(dp_size, tp_size),
+        ("dp", "tp"),
+    )
+    cfg = _overlap_config(topk=2, use_norm=True, fused_decode_max_tokens=64)
+
+    orig_placeholder = pallas_impl.torch_placeholder
+    monkeypatch.setattr(
+        pallas_impl,
+        "torch_placeholder",
+        lambda aval, *, mesh=None, partition_spec=None, device="tpu": orig_placeholder(
+            aval,
+            mesh=mesh,
+            partition_spec=partition_spec,
+            device="cpu" if device == "tpu" else device,
+        ),
+    )
+    monkeypatch.setattr(
+        pallas_impl, "_validate_pallas_mesh_world_size", lambda *, mesh: None
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        pallas_impl,
+        "tpu_torch_pallas",
+        SimpleNamespace(
+            lookup_custom_kernel=lambda _name, _fp: False,
+            register_custom_kernel=lambda *_a, **_kw: None,
+            call_custom_kernel=lambda name,
+            fp,
+            *,
+            inputs,
+            output_shapes,
+            donate_argnums,
+            device_assignment: (
+                calls.append(
+                    {
+                        "name": name,
+                        "fp": fp,
+                        "n_inputs": len(inputs),
+                        "output_shapes": [tuple(t.shape) for t in output_shapes],
+                        "device_assignment": list(device_assignment),
+                    }
+                )
+                or [torch.zeros_like(t) for t in output_shapes]
+            ),
+        ),
+    )
+    monkeypatch.setattr(kimi_overlap_op, "_OVERLAP_OPS", {})
+    monkeypatch.setattr(kimi_overlap_op.envs, "USE_MOE_SPARSE_CORE", False)
+
+    b_dp, hidden, latent_local, s_inter_tp = 4, 512, 32, 24
+    latent_dim = tp_size * latent_local  # 512
+    inter_routed = 512
+    operands = [
+        torch.zeros((b_dp, hidden), dtype=torch.bfloat16),
+        torch.zeros((b_dp, latent_local), dtype=torch.bfloat16),
+        torch.zeros((b_dp, 3 * cfg.topk), dtype=torch.bfloat16),
+        torch.zeros((hidden, 2 * s_inter_tp), dtype=torch.bfloat16),
+        torch.zeros((1, 1, 2, latent_dim, inter_routed), dtype=torch.uint8),
+        torch.zeros((1, 1, 2, inter_routed // 2, latent_dim), dtype=torch.uint8),
+        torch.zeros(
+            (1, 1, 2, 2 * (latent_dim // 32), 1, inter_routed), dtype=torch.uint8
+        ),
+        torch.zeros((1, 1, 2, inter_routed // 32, 1, latent_dim), dtype=torch.uint8),
+        torch.ones((latent_dim,), dtype=torch.bfloat16),
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros((1, 1), dtype=torch.int32),
+    ]
+    packed_moe_out_weight = torch.zeros(
+        (s_inter_tp + latent_local, hidden), dtype=torch.bfloat16
+    )
+
+    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        op = kimi_overlap_op.build_kimi_moe_ep_overlap_op(mesh, cfg)
+        combined_in = op(*operands)
+
+    # Real custom-op `__call__` must return per-shard `(b_dp, s_inter_tp + d_local)`
+    # `(4, 56)` so `combined_in @ packed_moe_out_weight` multiplies cleanly, NOT
+    # global `(dp * b_dp, tp * 56)` `(32, 896)`.
+    assert len(calls) == 1
+    assert len(calls[0]["device_assignment"]) == dp_size * tp_size
+    assert combined_in.shape == (b_dp, s_inter_tp + latent_local)
+    assert combined_in.dtype == torch.bfloat16
+    assert (combined_in @ packed_moe_out_weight).shape == (b_dp, hidden)
+
+    # Also verify `register_fake` handles symbolic dynamic batch dimensions.
+    with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+        fake_ops = [
+            fake_mode.from_tensor(t, static_shapes=i >= 3)
+            for i, t in enumerate(operands)
+        ]
+        fake_out = op(*fake_ops)
+        assert fake_out.shape[0] == fake_ops[0].shape[0]
+        assert int(fake_out.shape[1]) == s_inter_tp + latent_local
+        assert fake_out.dtype == torch.bfloat16
+
+
+def _moe_layout_stub(
+    monkeypatch: pytest.MonkeyPatch, *, dp_size: int, tp_size: int, latent_tp_size: int
+) -> kimi_moe.KimiMoE:
+    """A KimiMoE with only the attributes `_resolve_ep_overlap_layout` reads."""
+    monkeypatch.setattr(
+        kimi_moe, "get_dp_group", lambda: SimpleNamespace(world_size=dp_size)
+    )
+    monkeypatch.setattr(kimi_moe, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(kimi_moe, "hierarchical_split_or_none", lambda: None)
+    projection = kimi_moe.IntraChipColumnParallelLinear.__new__(
+        kimi_moe.IntraChipColumnParallelLinear
+    )
+    nn.Module.__init__(projection)
+    projection.tp_size = latent_tp_size
+    layer = kimi_moe.KimiMoE.__new__(kimi_moe.KimiMoE)
+    nn.Module.__init__(layer)
+    layer.use_ep = True
+    layer.tp_size = tp_size
+    layer.shared_group = None
+    layer.shared_experts = nn.Module()
+    layer.routed_expert_down_proj = projection
+    layer.routed_expert_up_proj = projection
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "tp_size", "latent_tp_size", "expected"),
+    [
+        (8, 16, 16, True),
+        (1, 16, 16, False),  # no DP axis
+        (8, 1, 1, False),  # no TP axis
+        (8, 16, 2, False),  # latent sharded over a chip's cores, not over TP
+    ],
+)
+def test_ep_overlap_layout_needs_a_dp_tp_grid_and_tp_sharded_latent(
+    monkeypatch: pytest.MonkeyPatch, dp_size, tp_size, latent_tp_size, expected
+) -> None:
+    layer = _moe_layout_stub(
+        monkeypatch, dp_size=dp_size, tp_size=tp_size, latent_tp_size=latent_tp_size
+    )
+    assert layer._resolve_ep_overlap_layout() is expected
+
+
+def test_ep_overlap_layout_needs_expert_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = _moe_layout_stub(monkeypatch, dp_size=8, tp_size=16, latent_tp_size=16)
+    layer.use_ep = False
+    assert not layer._resolve_ep_overlap_layout()
+
+
+@pytest.mark.parametrize(
+    ("chip_name", "expect_overlap"),
+    [("TPU_V6E", True), ("TPU_7X", False)],
+)
+def test_kimi_moe_enables_ep_overlap_only_for_planar_t_layout(
+    monkeypatch: pytest.MonkeyPatch, chip_name: str, expect_overlap: bool
+) -> None:
+    """Only planar_t MXFP4 routed experts (TPU v6e) enable the EP-overlap exit."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    chip = getattr(pltpu.ChipVersion, chip_name)
+    monkeypatch.setattr(kimi_moe, "get_chip_version", lambda: chip)
+    monkeypatch.setattr(kimi_moe.envs, "MOE_REQUANTIZE_BLOCK_SIZE", None)
+
+    layer = _moe_layout_stub(monkeypatch, dp_size=8, tp_size=16, latent_tp_size=16)
+    method = kimi_moe.VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
+        kimi_moe.VllmCompressedTensorsW4ANMxfp4MoEMethod
+    )
+    monkeypatch.setattr(
+        method, "resolve_tpu_activation", lambda _routed: "situ:4.0:25.0"
+    )
+    routed = SimpleNamespace(
+        quant_method=method,
+        w13_weight_packed=torch.empty((2, 6144, 1792), dtype=torch.uint8),
+        w2_weight_packed=torch.empty((2, 3584, 1536), dtype=torch.uint8),
+    )
+    layer.experts = SimpleNamespace(routed_experts=routed)
+
+    assert layer._routed_experts_load_as_planar_t() is expect_overlap
+    assert (
+        layer._resolve_ep_overlap_layout() and layer._routed_experts_load_as_planar_t()
+    ) is expect_overlap
+
+
+def _ep_overlap_lifecycle_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tp_rank: int = 1,
+    tp_size: int = 2,
+    full_w_down: torch.Tensor,
+    full_w_up: torch.Tensor,
+    full_w_sgu: torch.Tensor,
+    full_w_sdown: torch.Tensor,
+) -> kimi_moe.KimiMoE:
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import SituAndMul
+
+    hidden_size, latent_dim = full_w_down.shape
+    shared_inter = full_w_sdown.shape[0]
+    latent_local = latent_dim // tp_size
+    s_inter_tp = shared_inter // tp_size
+
+    def _linear(weight_out_in: torch.Tensor) -> LinearBase:
+        lin = LinearBase.__new__(LinearBase)
+        nn.Module.__init__(lin)
+        lin.quant_method = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
+        lin.weight = nn.Parameter(weight_out_in.clone(), requires_grad=False)
+        lin.bias = None
+        return lin
+
+    def _intra_chip(
+        weight_out_in: torch.Tensor,
+    ) -> kimi_moe.IntraChipColumnParallelLinear:
+        proj = kimi_moe.IntraChipColumnParallelLinear.__new__(
+            kimi_moe.IntraChipColumnParallelLinear
+        )
+        nn.Module.__init__(proj)
+        proj.quant_method = UnquantizedLinearMethod.__new__(UnquantizedLinearMethod)
+        proj.weight = nn.Parameter(weight_out_in.clone(), requires_grad=False)
+        proj.bias = None
+        proj.tp_size = tp_size
+        proj.shard_group = SimpleNamespace(
+            rank_in_group=tp_rank,
+            world_size=tp_size,
+            # w_up is transposed to [n_in=latent_dim, n_out=hidden_size/tp];
+            # all_gather(dim=-1) reconstructs [latent_dim, hidden_size].
+            all_gather=lambda w, dim=-1: full_w_up,
+        )
+        return proj
+
+    sgu_slice = torch.cat(
+        (
+            full_w_sgu[tp_rank * s_inter_tp : (tp_rank + 1) * s_inter_tp],
+            full_w_sgu[
+                shared_inter + tp_rank * s_inter_tp : shared_inter
+                + (tp_rank + 1) * s_inter_tp
+            ],
+        ),
+        dim=0,
+    )
+    sdown_slice = full_w_sdown[tp_rank * s_inter_tp : (tp_rank + 1) * s_inter_tp]
+    down_slice = full_w_down[
+        :, tp_rank * latent_local : (tp_rank + 1) * latent_local
+    ].t()
+    up_slice = full_w_up[
+        :, tp_rank * (hidden_size // tp_size) : (tp_rank + 1) * (hidden_size // tp_size)
+    ].t()
+
+    layer = kimi_moe.KimiMoE.__new__(kimi_moe.KimiMoE)
+    nn.Module.__init__(layer)
+    layer.prefix = "model.layers.0.moe"
+    layer.use_ep = True
+    layer.tp_size = tp_size
+    layer.prefill_group = None
+    layer.shared_group = None
+    layer._uses_ep_overlap = True
+    layer._fused_decode_max_tokens = 256
+    layer._ep_overlap_op = None
+    layer.register_buffer("packed_moe_out_weight", None, persistent=False)
+    layer.register_buffer("w_routed_down_tp", None, persistent=False)
+    layer.register_buffer("w_shared_gu", None, persistent=False)
+    layer.register_buffer("_tp_rank", None, persistent=False)
+
+    layer.routed_expert_down_proj = _intra_chip(down_slice)
+    layer.routed_expert_up_proj = _intra_chip(up_slice)
+    layer.routed_expert_norm = SimpleNamespace(
+        variance_epsilon=1e-5,
+        weight=nn.Parameter(torch.ones(latent_dim, dtype=torch.bfloat16)),
+    )
+    layer.shared_experts = SimpleNamespace(
+        gate_up_proj=_linear(sgu_slice),
+        down_proj=_linear(sdown_slice.t()),
+        act_fn=SituAndMul(4.0, 25.0),
+    )
+    method = kimi_moe.VllmCompressedTensorsW4ANMxfp4MoEMethod.__new__(
+        kimi_moe.VllmCompressedTensorsW4ANMxfp4MoEMethod
+    )
+    method._tpu_activation_str = "situ:4.0:25.0"
+    routed = SimpleNamespace(
+        quant_method=method,
+        moe_config=SimpleNamespace(experts_per_token=2),
+        w13_weight=torch.zeros((2, 8, 8), dtype=torch.uint8),
+        w2_weight=torch.zeros((2, 4, 8), dtype=torch.uint8),
+        w13_weight_scale=torch.zeros((2, 2, 1, 8), dtype=torch.uint8),
+        w2_weight_scale=torch.zeros((2, 1, 1, 8), dtype=torch.uint8),
+        _experts_start=torch.tensor([0], dtype=torch.int32),
+    )
+    layer.gate = lambda h: (torch.zeros(h.shape[0], 4, dtype=torch.float32), None)
+    layer.experts = SimpleNamespace(routed_experts=routed)
+    monkeypatch.setattr(kimi_moe, "fresh_buffer", lambda t: t.clone())
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(
+        kimi_moe, "build_dp_tp_mesh", lambda: _dp_tp_mesh_stub(2, tp_size)
+    )
+    return layer
+
+
+def test_kimi_moe_pack_ep_overlap_weights_and_forward_matches_unfused_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(11)
+    hidden_size, latent_dim, shared_inter = 16, 8, 12
+    full_w_down = torch.randn(hidden_size, latent_dim, dtype=torch.bfloat16)
+    full_w_up = torch.randn(latent_dim, hidden_size, dtype=torch.bfloat16)
+    full_w_sgu = torch.randn(2 * shared_inter, hidden_size, dtype=torch.bfloat16)
+    full_w_sdown = torch.randn(shared_inter, hidden_size, dtype=torch.bfloat16)
+    routed_normed_full = torch.randn(3, latent_dim, dtype=torch.bfloat16)
+    hidden = torch.randn(3, hidden_size, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        kimi_moe.moe_routing,
+        "route",
+        lambda _r, h, _l: (
+            torch.full((h.shape[0], 2), 0.5, dtype=torch.bfloat16),
+            torch.zeros((h.shape[0], 2), dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        kimi_moe.token_padding,
+        "zero_routing_weights_for_padding",
+        lambda ids, w, *, is_local_tensor: (ids, w),
+    )
+
+    partials = []
+    for tp_rank in range(2):
+        layer = _ep_overlap_lifecycle_layer(
+            monkeypatch,
+            tp_rank=tp_rank,
+            tp_size=2,
+            full_w_down=full_w_down,
+            full_w_up=full_w_up,
+            full_w_sgu=full_w_sgu,
+            full_w_sdown=full_w_sdown,
+        )
+
+        def fake_build(_mesh, cfg, r=tp_rank, act=layer.shared_experts.act_fn):
+            assert cfg.fused_decode_max_tokens == 256
+
+            def run(h, rdown, _meta, w_sgu, *_rest):
+                assert rdown.shape == (3, latent_dim // 2)
+                s_act = act(h @ w_sgu)
+                r_slice = routed_normed_full[
+                    :, r * (latent_dim // 2) : (r + 1) * (latent_dim // 2)
+                ]
+                return torch.cat((s_act, r_slice), dim=-1)
+
+            return run
+
+        monkeypatch.setattr(kimi_moe, "build_kimi_moe_ep_overlap_op", fake_build)
+        monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce", lambda x: x)
+
+        layer.process_weights_after_loading()
+
+        assert layer._ep_overlap_op is not None
+        assert layer.w_routed_down_tp.shape == (hidden_size, latent_dim // 2)
+        assert layer.w_shared_gu.shape == (hidden_size, shared_inter)
+        assert layer.packed_moe_out_weight.shape == (
+            shared_inter // 2 + latent_dim // 2,
+            hidden_size,
+        )
+        # All four source projections were freed to 0-element buffers.
+        for src in (
+            layer.shared_experts.gate_up_proj,
+            layer.routed_expert_down_proj,
+            layer.shared_experts.down_proj,
+            layer.routed_expert_up_proj,
+        ):
+            assert src.weight.numel() == 0
+
+        partials.append(layer.forward(hidden))
+
+    summed = partials[0] + partials[1]
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import SituAndMul
+
+    ref_shared = SituAndMul(4.0, 25.0)(hidden @ full_w_sgu.t()) @ full_w_sdown
+    ref_routed = routed_normed_full @ full_w_up
+    torch.testing.assert_close(summed, ref_shared + ref_routed, rtol=1e-2, atol=1e-2)
+
+
+def test_kimi_moe_rejects_overlap_weights_that_cannot_pack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(12)
+    layer = _ep_overlap_lifecycle_layer(
+        monkeypatch,
+        tp_rank=0,
+        tp_size=2,
+        full_w_down=torch.randn(16, 8, dtype=torch.bfloat16),
+        full_w_up=torch.randn(8, 16, dtype=torch.bfloat16),
+        full_w_sgu=torch.randn(24, 16, dtype=torch.bfloat16),
+        full_w_sdown=torch.randn(12, 16, dtype=torch.bfloat16),
+    )
+    # A bias on a projection cannot be packed once the layout selected the
+    # EP-overlap exit: loading fails instead of silently running unfused.
+    layer.shared_experts.down_proj.bias = nn.Parameter(
+        torch.zeros(16, dtype=torch.bfloat16)
+    )
+    with pytest.raises(ValueError, match="unbiased bf16"):
+        layer.process_weights_after_loading()
 
 
 def test_kda_layer_conforms_to_the_spec_state_commit_protocol() -> None:

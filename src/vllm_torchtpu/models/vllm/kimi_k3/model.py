@@ -398,16 +398,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def process_weights_after_loading(self) -> None:
-        """Fold every AttentionResidual's norm and projection weights.
+        """Finalize the loaded weights of the modules the loader does not visit.
 
         The generic loader hook fires per module only for attention layers,
-        so the residuals are folded from here instead.
+        so the residuals, the MoE blocks and the MLA gate are handled from
+        here instead.
         """
         for module in self.modules():
-            if isinstance(module, AttentionResidual):
+            if isinstance(module, (AttentionResidual, KimiMoE)):
                 module.process_weights_after_loading()
-            elif isinstance(module, KimiMoE):
-                module.initialize_dummy_router()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
 
