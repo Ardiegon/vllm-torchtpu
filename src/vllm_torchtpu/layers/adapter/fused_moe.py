@@ -68,6 +68,15 @@ class TpuMoEActivationMixin:
 
     _tpu_activation_str: str | None = None
 
+    @property
+    def tpu_activation(self) -> str | None:
+        """The Pallas GMM kernel activation string resolved at weight load."""
+        return self._tpu_activation_str
+
+    def resolve_tpu_activation(self, layer) -> str:
+        """Encode this layer's activation for the kernel."""
+        return self._resolve_tpu_activation(layer)
+
     def _resolve_tpu_activation(self, layer) -> str:
         """Encode this layer's activation for the kernel.
 
@@ -78,7 +87,7 @@ class TpuMoEActivationMixin:
 
     def _set_tpu_activation(self, layer) -> str:
         """Resolve and store; returns it, since callers also use it locally."""
-        self._tpu_activation_str = self._resolve_tpu_activation(layer)
+        self._tpu_activation_str = self.resolve_tpu_activation(layer)
         return self._tpu_activation_str
 
 
