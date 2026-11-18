@@ -26,6 +26,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    FUSED_DECODE_MOE_MAX_TOKENS,
+    FUSED_VERIFY_MOE_MAX_TOKENS,
     is_supported_by_planar_t_b11,
     repack_w2_planar_t,
     repack_w13_planar_t,
@@ -112,6 +114,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     TPU compressed-tensors packed-weight W4AN MXFP4 MoE implementation.
     Accommodates both W4A4 and W4A16.
     """
+
+    _fused_decode_max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS
 
     @property
     def is_monolithic(self) -> bool:
@@ -342,11 +346,20 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        vllm_config = get_current_vllm_config_or_none()
+        self._fused_decode_max_tokens = (
+            FUSED_VERIFY_MOE_MAX_TOKENS
+            if is_v6e_planar_t_eligible
+            and vllm_config is not None
+            and vllm_config.speculative_config is not None
+            else FUSED_DECODE_MOE_MAX_TOKENS
+        )
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=use_ep,
             skip_padded_tokens=True,
+            fused_decode_max_tokens=self._fused_decode_max_tokens,
         )
 
     def apply_monolithic(
@@ -411,6 +424,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "activation": activation_str,
             "rhs_quant_dtype": None,
             "skip_padded_tokens": True,
+            "fused_decode_max_tokens": self._fused_decode_max_tokens,
         }
         if pipelined:
             return pipelined_fused_moe_gmm(**kwargs)

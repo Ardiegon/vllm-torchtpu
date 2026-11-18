@@ -133,7 +133,11 @@ def test_mxfp4_create_weights_and_process():
     ) as mock_prebuild:
         method.process_weights_after_loading(layer)
     mock_prebuild.assert_called_once_with(
-        topk=2, activation="silu", use_ep=False, skip_padded_tokens=True
+        topk=2,
+        activation="silu",
+        use_ep=False,
+        skip_padded_tokens=True,
+        fused_decode_max_tokens=64,
     )
 
     # Validate output
@@ -833,3 +837,111 @@ def test_process_weights_after_loading_dispatches_planar_t_on_v6e_cpu(
         assert layer.w13_weight_scale.dtype == torch.uint8
     else:
         assert planar_calls == []
+
+
+@pytest.mark.parametrize(
+    ("chip_name", "has_spec", "expected_max_tokens"),
+    [
+        ("TPU_V6E", True, 256),
+        ("TPU_V6E", False, 64),
+        ("TPU_7X", True, 64),
+    ],
+)
+def test_mxfp4_spec_decode_plumbs_fused_verify_max_tokens_on_v6e(
+    monkeypatch, chip_name, has_spec, expected_max_tokens
+):
+    from types import SimpleNamespace
+
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe_w4an_mxfp4 as module,
+    )
+
+    moe_config = MagicMock(w13_num_shards=2)
+    moe_config.tp_size = 1
+    moe_config.tp_rank = 0
+    moe_config.ep_rank = 0
+    moe_config.experts_per_token = 2
+    moe_config.intermediate_size_per_partition = 512
+    moe_config.intermediate_size_per_partition_unpadded = 512
+
+    method = VllmCompressedTensorsW4ANMxfp4MoEMethod(moe_config)
+    layer = FakeRoutedExperts(experts_per_token=2)
+    layer.activation = "silu"
+    layer._expert_routing_tables = lambda: (None, None)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=512,
+        intermediate_size_per_partition=512,
+        params_dtype=torch.bfloat16,
+    )
+
+    orig_to = torch.Tensor.to
+    monkeypatch.setattr(
+        torch.Tensor,
+        "to",
+        lambda self, *args, **kwargs: (
+            self if args and args[0] == "tpu" else orig_to(self, *args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        module, "get_chip_version", lambda: getattr(pltpu.ChipVersion, chip_name)
+    )
+    monkeypatch.setattr(module.envs, "MOE_REQUANTIZE_BLOCK_SIZE", None)
+    monkeypatch.setattr(module, "fresh_buffer", lambda t: t.contiguous())
+    monkeypatch.setattr(
+        module,
+        "load_w13_planar_t_mxfp4",
+        lambda w, s: (torch.zeros((2, 512, 512), dtype=torch.uint8), s),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_w2_planar_t_mxfp4",
+        lambda w, s: (torch.zeros((2, 256, 512), dtype=torch.uint8), s),
+    )
+    monkeypatch.setattr(
+        module, "load_kmajor_fp4", lambda w: w.transpose(-1, -2).contiguous()
+    )
+    vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="safetensors"),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7)
+        if has_spec
+        else None,
+    )
+    monkeypatch.setattr(module, "get_current_vllm_config_or_none", lambda: vllm_config)
+
+    prebuilt: list[int] = []
+    monkeypatch.setattr(
+        module,
+        "prebuild_fused_moe_kernel",
+        lambda **kw: prebuilt.append(kw["fused_decode_max_tokens"]),
+    )
+    method.process_weights_after_loading(layer)
+    assert prebuilt == [expected_max_tokens]
+
+    dispatched: list[int] = []
+    monkeypatch.setattr(
+        module, "enable_pipelined_collective_and_compute", lambda: False
+    )
+    monkeypatch.setattr(
+        module.token_padding,
+        "zero_routing_weights_for_padding",
+        lambda ids, w, **_kw: (ids, w),
+    )
+    monkeypatch.setattr(
+        module,
+        "fused_moe_gmm",
+        lambda **kw: (
+            dispatched.append(kw["fused_decode_max_tokens"])
+            or torch.zeros_like(kw["hidden_states"])
+        ),
+    )
+    method.apply_with_routing(
+        layer,
+        torch.ones(8, 512, dtype=torch.bfloat16),
+        torch.full((8, 2), 0.5, dtype=torch.bfloat16),
+        torch.zeros((8, 2), dtype=torch.int32),
+    )
+    assert dispatched == [expected_max_tokens]

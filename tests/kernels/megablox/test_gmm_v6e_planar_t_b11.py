@@ -343,3 +343,99 @@ def test_parse_situ_activation():
     assert gmm.parse_situ_activation("silu") == (0.0, None)
     with pytest.raises(NotImplementedError):
         gmm.parse_situ_activation("gelu")
+
+
+# ---------------------------------------------------------------------------
+# Fused small-batch kernel
+# ---------------------------------------------------------------------------
+def _routing(m, seed, topk=2, num_pad=0):
+    rng = np.random.default_rng(seed)
+    tw = np.abs(rng.standard_normal((m, topk))).astype(np.float32)
+    tw /= tw.sum(-1, keepdims=True)
+    ti = np.stack([rng.permutation(E)[:topk] for _ in range(m)]).astype(np.int32)
+    if num_pad:
+        ti[m - num_pad :] = -1
+        tw[m - num_pad :] = 0.0
+    return jnp.asarray(tw, jnp.bfloat16), jnp.asarray(ti)
+
+
+def _fused_reference(weights, x, tw, ti, activation=ACT):
+    beta, linear_beta = gmm.parse_situ_activation(activation)
+    w13, s13, w2, s2 = weights["ckpt"]
+    w13_d = jnp.asarray(_dequant(w13, s13)).astype(jnp.bfloat16)  # [E, 2N, K]
+    w2_d = jnp.asarray(_dequant(w2, s2)).astype(jnp.bfloat16)  # [E, K, N]
+    xf = x.astype(jnp.float32)
+    out = jnp.zeros((x.shape[0], K), jnp.float32)
+    for e in range(E):
+        gate = xf @ w13_d[e, :INTER].astype(jnp.float32).T
+        up = xf @ w13_d[e, INTER:].astype(jnp.float32).T
+        h = gmm._situ_f32(gate, up, beta=beta, linear_beta=linear_beta).astype(
+            jnp.bfloat16
+        )
+        down = h.astype(jnp.float32) @ w2_d[e].astype(jnp.float32).T
+        weight = jnp.sum(jnp.where(ti == e, tw.astype(jnp.float32), 0.0), axis=-1)
+        out = out + weight[:, None] * down
+    return out
+
+
+@pytest.mark.parametrize("activation", [ACT, "silu"])
+@pytest.mark.parametrize("m, num_pad", [(1, 0), (8, 2), (40, 0), (72, 4)])
+def test_fused_decode_matches_reference(weights, m, num_pad, activation):
+    x = _lhs(m, 400 + m)
+    tw, ti = _routing(m, 500 + m, num_pad=num_pad)
+    with pltpu.force_tpu_interpret_mode():
+        out = gmm.fused_decode_moe_v6e_planar_t_b11(
+            x,
+            *weights["planar_t"][:2],
+            *weights["planar_t"][2:],
+            tw,
+            ti,
+            activation=activation,
+            preferred_element_type=jnp.bfloat16,
+        )
+    assert out.shape == (m, K)
+    _assert_close(
+        out, _fused_reference(weights, x, tw, ti, activation=activation), rel=3e-2
+    )
+    if num_pad:
+        np.testing.assert_array_equal(np.asarray(out[m - num_pad :]), 0)
+
+
+def test_fused_decode_rejects_oversized_batches(weights):
+    m = gmm.FUSED_VERIFY_MOE_MAX_TOKENS + 1
+    tw, ti = _routing(m, 2)
+    with pytest.raises(ValueError, match="at most"):
+        gmm.fused_decode_moe_v6e_planar_t_b11(
+            _lhs(m, 2), *weights["planar_t"], tw, ti, activation=ACT
+        )
+
+
+def _decode_operands(m=8, k=K, n=INTER, e=E, w1_dtype=jnp.uint8):
+    s = jax.ShapeDtypeStruct
+    return (
+        s((m, k), jnp.bfloat16),
+        s((e, k, n), w1_dtype),
+        s((e, n // 2, k), jnp.uint8),
+        s((e, 2 * k // 32, 1, n), jnp.uint8),
+        s((e, n // 32, 1, k), jnp.uint8),
+    )
+
+
+def test_can_use_fused_decode_envelope():
+    hs, w1, w2, s1, s2 = _decode_operands()
+    ok = gmm.can_use_fused_decode_moe_v6e_planar_t_b11
+    assert ok(hs, w1, w2, s1, s2, None, None)
+    bias = jax.ShapeDtypeStruct((E, INTER), jnp.bfloat16)
+    assert not ok(hs, w1, w2, s1, s2, bias, None)
+    assert not ok(hs, w1, w2, None, s2, None, None)
+    assert not ok(hs, w1, w2, s1, s2, None, None, rhs_quant_dtype=jnp.int4)
+    assert not ok(*_decode_operands(w1_dtype=jnp.bfloat16), None, None)
+    assert not ok(*_decode_operands(k=384), None, None)
+    m_big = gmm.FUSED_DECODE_MOE_MAX_TOKENS + 1
+    assert not ok(*_decode_operands(m=m_big), None, None)
+    assert ok(
+        *_decode_operands(m=m_big),
+        None,
+        None,
+        max_tokens=gmm.FUSED_VERIFY_MOE_MAX_TOKENS,
+    )
