@@ -41,6 +41,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding.common import yarn_get_mscale
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -320,6 +321,7 @@ class MultiHeadLatentAttention(nn.Module):
             reduce_results=False,
         )
         rotary_emb = None
+        softmax_scale = qk_head_dim**-0.5
         if use_rope:
             rope_parameters = dict(
                 getattr(config, "rope_parameters", None)
@@ -334,6 +336,14 @@ class MultiHeadLatentAttention(nn.Module):
                     if rope_parameters.get("apply_yarn_scaling", True)
                     else "deepseek_llama_scaling"
                 )
+            if rope_parameters["rope_type"] == "deepseek_yarn":
+                # DeepSeek-style YaRN rescales the attention logits by
+                # mscale(factor, mscale_all_dim)^2 (matching upstream vLLM
+                # K3 MLA and DeepseekV2).
+                factor = float(rope_parameters["factor"])
+                mscale_all_dim = float(rope_parameters.get("mscale_all_dim", 0) or 0)
+                mscale = float(yarn_get_mscale(factor, mscale_all_dim))
+                softmax_scale *= mscale * mscale
             rotary_emb = get_rope(
                 self.qk_rope_head_dim,
                 max_position=config.max_position_embeddings,
@@ -363,7 +373,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
             num_heads,
-            qk_head_dim**-0.5,
+            softmax_scale,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
