@@ -2633,3 +2633,96 @@ def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> N
         KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
             stub, 1000, 1, 1, torch.device("cpu"), torch.float32
         )
+
+
+def test_mla_deepseek_yarn_applies_mscale_squared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeepSeek-YaRN MLA rescales `softmax_scale` by `mscale(factor, all_dim)^2`."""
+    from vllm.model_executor.layers.rotary_embedding.common import yarn_get_mscale
+
+    class FakeLinear(nn.Module):
+        def __init__(self, input_size, output_size, *args, **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            out = sum(output_size) if isinstance(output_size, list) else output_size
+            self.weight = nn.Parameter(torch.empty(out, input_size))
+
+    class FakeNorm(nn.Module):
+        def __init__(self, hidden_size, eps=1e-5) -> None:
+            super().__init__()
+            self.variance_epsilon = eps
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    captured: dict[str, object] = {}
+
+    class FakeMLAWrapper(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            del kwargs
+            self.softmax_scale = float(args[2])
+            captured["softmax_scale"] = self.softmax_scale
+            captured["mla_modules"] = args[8]
+
+        def forward(
+            self, positions: torch.Tensor, hidden_states: torch.Tensor
+        ) -> torch.Tensor:
+            del positions
+            return hidden_states * self.softmax_scale
+
+    rope_obj = SimpleNamespace()
+    monkeypatch.setattr(
+        kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        kimi_attention, "get_tp_group", lambda: SimpleNamespace(all_reduce=lambda x: x)
+    )
+    monkeypatch.setattr(kimi_attention, "ReplicatedLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "ColumnParallelLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "MergedColumnParallelLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "RowParallelLinear", FakeLinear)
+    monkeypatch.setattr(kimi_attention, "RMSNorm", FakeNorm)
+    monkeypatch.setattr(
+        kimi_attention, "MultiHeadLatentAttentionWrapper", FakeMLAWrapper
+    )
+    monkeypatch.setattr(kimi_attention, "get_rope", lambda *a, **k: rope_obj)
+    monkeypatch.setattr(kimi_attention.envs, "TPU_K3_SP_PREFILL", False)
+
+    config = KimiLinearConfig(
+        hidden_size=256,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        q_lora_rank=64,
+        kv_lora_rank=128,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=64,
+        v_head_dim=64,
+        max_position_embeddings=1048576,
+        rope_parameters={
+            "rope_type": "yarn",
+            "apply_yarn_scaling": True,
+            "factor": 32.0,
+            "mscale_all_dim": 1.0,
+        },
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8192),
+        cache_config=SimpleNamespace(),
+        quant_config=None,
+        speculative_config=None,
+    )
+
+    attn = kimi_attention.MultiHeadLatentAttention(
+        config=config,
+        vllm_config=vllm_config,
+        prefix="model.layers.0.self_attn",
+        use_rope=True,
+    )
+
+    mscale = float(yarn_get_mscale(32.0, 1.0))
+    expected_scale = ((64 + 64) ** -0.5) * mscale * mscale
+    assert captured["softmax_scale"] == pytest.approx(expected_scale)
+
+    hidden = torch.ones(2, 256, dtype=torch.float32)
+    out = attn(torch.arange(2), hidden)
+    torch.testing.assert_close(out, hidden * expected_scale)
