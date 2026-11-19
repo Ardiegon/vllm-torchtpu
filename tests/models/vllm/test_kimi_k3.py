@@ -853,11 +853,11 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    layer.use_full_rank_gate = False
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
-    layer.use_full_rank_gate = False
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -912,11 +912,11 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    layer.use_full_rank_gate = False
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
-    layer.use_full_rank_gate = False
     layer.use_naive_kda = False
 
     pool = torch.zeros(2, 4, 2, 8)
@@ -1229,11 +1229,11 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
+    layer.use_full_rank_gate = use_full_rank_gate
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
-    layer.use_full_rank_gate = use_full_rank_gate
     if use_full_rank_gate:
         layer.f_a_proj = _Projection(2)
         layer.g_proj = _ConstantProjection(7.0, 4)
@@ -1519,11 +1519,11 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    layer.use_full_rank_gate = False
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
-    layer.use_full_rank_gate = False
     layer.dispatched_kda_op = kimi_custom_ops.build_kimi_dispatched_kda_op(
         "test_compile",
         lower_bound=None,
@@ -2074,40 +2074,225 @@ def test_attention_project_rs_preserves_linear_layout(flipped):
     assert calls == ([] if flipped else ["linear", "scatter"])
 
 
-def test_kda_prefill_packing_preserves_projection_and_reload():
+@pytest.mark.parametrize("num_heads", [3, 6, 12, 130])
+def test_kda_prefill_packing_preserves_projection_and_reload(num_heads: int):
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import FusedPrefillCollectives
+
+    hidden_size, head_dim = 256, 128
+    local_proj = num_heads * head_dim
+    qkv_cols = 3 * local_proj
+    beta_pad_cols = (num_heads + 127) // 128 * 128
 
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.prefill_group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
+    layer.prefix = "layers.0.self_attn"
     layer.use_full_rank_gate = True
-    layer.num_heads, layer.head_dim = 3, 128
-    generator = torch.Generator().manual_seed(19)
-    for name, width in [("fused_qkvb_proj", 1155), ("g_proj", 384), ("f_a_proj", 128)]:
+    layer.hidden_size = hidden_size
+    layer.num_heads = num_heads
+    layer.head_dim = head_dim
+    layer.local_projection_size = local_proj
+    generator = torch.Generator().manual_seed(19 + num_heads)
+    widths = {
+        "fused_qkvb_proj": qkv_cols + num_heads,
+        "g_proj": local_proj,
+        "f_a_proj": head_dim,
+    }
+    for name in widths:
         projection = nn.Module()
-        projection.weight = nn.Parameter(
-            torch.randn((7168, width), generator=generator, dtype=torch.bfloat16) * 0.01
-        )
         setattr(projection, WEIGHT_FLIPPED_ATTR, True)
         setattr(layer, name, projection)
-    x = torch.randn((2, 7168), generator=generator)
-    for reload in (False, True):
-        if reload:
-            with torch.no_grad():
-                layer.fused_qkvb_proj.weight.add_(0.02)
+    x = torch.randn((2, hidden_size), generator=generator)
+    # Packing releases the per-projection weights, so a reload is the loader
+    # filling them again before the next packing.
+    for _reload in (False, True):
+        loaded = {}
+        for name, width in widths.items():
+            weight = (
+                torch.randn(
+                    (hidden_size, width), generator=generator, dtype=torch.bfloat16
+                )
+                * 0.01
+            )
+            loaded[name] = weight.clone()
+            getattr(layer, name).weight = nn.Parameter(weight)
         layer._pack_prefill_projection()
+        assert layer.packed_prefill_weight is not None
         output = x @ layer.packed_prefill_weight.float()
-        qkvb = x @ layer.fused_qkvb_proj.weight.float()
-        torch.testing.assert_close(output[:, :1155], qkvb)
-        assert torch.count_nonzero(output[:, 1155:1280]) == 0
         torch.testing.assert_close(
-            output[:, 1280:1664], x @ layer.g_proj.weight.float()
+            output[:, : qkv_cols + num_heads], x @ loaded["fused_qkvb_proj"].float()
         )
-        torch.testing.assert_close(output[:, 1664:], x @ layer.f_a_proj.weight.float())
+        assert (
+            torch.count_nonzero(
+                output[:, qkv_cols + num_heads : qkv_cols + beta_pad_cols]
+            )
+            == 0
+        )
+        gate_start = qkv_cols + beta_pad_cols
+        torch.testing.assert_close(
+            output[:, gate_start : gate_start + local_proj],
+            x @ loaded["g_proj"].float(),
+        )
+        torch.testing.assert_close(
+            output[:, gate_start + local_proj :], x @ loaded["f_a_proj"].float()
+        )
+        assert all(getattr(layer, name).weight.numel() == 0 for name in widths)
     layer.use_full_rank_gate = False
     layer._pack_prefill_projection()
     assert layer.packed_prefill_weight is None
+
+
+def test_kda_packed_projection_forward_matches_unpacked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Packed KDA input projection produces bit-exact `forward()` outputs at TP=16."""
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+    hidden_size, num_heads, head_dim = 256, 6, 128
+    local_proj = num_heads * head_dim
+
+    class _FlippedLinear(nn.Module):
+        def __init__(self, weight: torch.Tensor) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(weight.clone())
+            setattr(self, WEIGHT_FLIPPED_ATTR, True)
+
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+            return x @ self.weight, None
+
+    gen = torch.Generator().manual_seed(41)
+    w_qkvb = (
+        torch.randn(
+            (hidden_size, 3 * local_proj + num_heads),
+            generator=gen,
+            dtype=torch.bfloat16,
+        )
+        * 0.02
+    )
+    w_g = (
+        torch.randn((hidden_size, local_proj), generator=gen, dtype=torch.bfloat16)
+        * 0.02
+    )
+    w_fa = (
+        torch.randn((hidden_size, head_dim), generator=gen, dtype=torch.bfloat16) * 0.02
+    )
+    w_fb = (
+        torch.randn((head_dim, local_proj), generator=gen, dtype=torch.bfloat16) * 0.02
+    )
+    w_out = (
+        torch.randn((local_proj, hidden_size), generator=gen, dtype=torch.bfloat16)
+        * 0.02
+    )
+
+    monkeypatch.setattr(
+        kimi_attention,
+        "get_tp_group",
+        lambda: SimpleNamespace(all_reduce=lambda y: y),
+    )
+
+    def _run_layer(pack: bool) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+        nn.Module.__init__(layer)
+        layer.prefix = "layers.0.self_attn"
+        layer.hidden_size = hidden_size
+        layer.num_heads = num_heads
+        layer.head_dim = head_dim
+        layer.local_projection_size = local_proj
+        layer.conv_size = 4
+        layer.use_full_rank_gate = True
+        layer.prefill_group = None
+        layer.fused_qkvb_proj = _FlippedLinear(w_qkvb)
+        layer.g_proj = _FlippedLinear(w_g)
+        layer.f_a_proj = _FlippedLinear(w_fa)
+        layer.f_b_proj = _FlippedLinear(w_fb)
+        layer.g_b_proj = None
+        layer.o_proj = _FlippedLinear(w_out)
+        layer.q_conv1d = SimpleNamespace(
+            weight=torch.ones(local_proj, 1, 4, dtype=torch.bfloat16)
+        )
+        layer.k_conv1d = SimpleNamespace(
+            weight=torch.ones(local_proj, 1, 4, dtype=torch.bfloat16)
+        )
+        layer.v_conv1d = SimpleNamespace(
+            weight=torch.ones(local_proj, 1, 4, dtype=torch.bfloat16)
+        )
+        layer.o_norm = SimpleNamespace(
+            weight=torch.ones(head_dim, dtype=torch.bfloat16)
+        )
+        layer.A_log = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+        layer.dt_bias = nn.Parameter(torch.zeros(local_proj, dtype=torch.float32))
+        layer.packed_prefill_weight = None
+        if pack:
+            layer.process_weights_after_loading(act_dtype=torch.bfloat16)
+            assert layer.packed_prefill_weight is not None
+        else:
+            layer.conv_weight_fused = torch.ones(
+                4, 3, num_heads, head_dim, dtype=torch.bfloat16
+            )
+
+        layer.kv_cache = (
+            torch.zeros(1, 3 * local_proj, 4, dtype=torch.bfloat16),
+            torch.zeros(1, num_heads, head_dim, head_dim, dtype=torch.bfloat16),
+        )
+        metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+            mamba_state_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+            mamba_slot_read_offsets=None,
+            mamba_request_distribution=None,
+        )
+        layer._metadata = lambda: metadata
+        captured: list[tuple[torch.Tensor, ...]] = []
+
+        def fake_dispatched(mixed_qkv, raw_gate, beta, output_gate, *_rest):
+            captured.append((mixed_qkv, raw_gate, beta, output_gate))
+            return (mixed_qkv[:, :local_proj] + raw_gate + output_gate).view(
+                -1, num_heads, head_dim
+            )
+
+        layer.dispatched_kda_op = fake_dispatched
+        x = torch.randn((4, hidden_size), generator=torch.Generator().manual_seed(77))
+        out = layer(torch.arange(4), x.to(torch.bfloat16))
+        return out, captured[0]
+
+    out_packed, args_packed = _run_layer(pack=True)
+    out_unpacked, args_unpacked = _run_layer(pack=False)
+    for got, want in zip(args_packed, args_unpacked):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.testing.assert_close(out_packed, out_unpacked, rtol=0, atol=0)
+
+
+def test_kda_packing_warns_and_falls_back_on_unflipped_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefix = "layers.3.self_attn"
+    layer.use_full_rank_gate = True
+    layer.hidden_size = 256
+    layer.num_heads = 6
+    layer.head_dim = 128
+    layer.local_projection_size = 768
+    for name, width in (
+        ("fused_qkvb_proj", 2310),
+        ("g_proj", 768),
+        ("f_a_proj", 128),
+    ):
+        proj = nn.Module()
+        proj.weight = nn.Parameter(torch.zeros((256, width), dtype=torch.bfloat16))
+        setattr(layer, name, proj)
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        kimi_attention.logger,
+        "warning_once",
+        lambda msg, *args: warnings.append(msg % args),
+    )
+    layer._pack_prefill_projection()
+    assert layer.packed_prefill_weight is None
+    assert layer.fused_qkvb_proj.weight.numel() == 256 * 2310
+    assert len(warnings) == 1
+    assert "layers.3.self_attn" in warnings[0]
 
 
 def test_gather_projection_bridge_has_rank_local_output():
