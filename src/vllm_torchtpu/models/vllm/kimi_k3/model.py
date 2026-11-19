@@ -175,11 +175,11 @@ class KimiDecoderLayer(nn.Module):
 
         assert block_residuals is not None
         prefix_sum = hidden_states
-        if block_residuals.shape[-2] > 0:
+        if block_residuals.shape[0] > 0:
             hidden_states = self.self_attention_res(prefix_sum, block_residuals)
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residuals = torch.cat(
-                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
+                (block_residuals, prefix_sum.unsqueeze(0)), dim=0
             )
             prefix_sum = None
 
@@ -285,7 +285,7 @@ class KimiModel(nn.Module):
         # A view avoids passing a symbolic local token count to TorchTPU's
         # concrete-size allocation kernel during the dynamic trace.
         block_residuals = (
-            hidden_states.unsqueeze(1)[:, :0, :]
+            hidden_states.unsqueeze(0)[:0, :, :]
             if self.attn_res_block_size is not None
             else None
         )

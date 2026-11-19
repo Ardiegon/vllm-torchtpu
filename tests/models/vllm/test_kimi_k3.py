@@ -1608,13 +1608,13 @@ def test_attention_residual_matches_reference(num_blocks: int) -> None:
     module.process_weights_after_loading()
 
     prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
-    block_residuals = torch.randn(num_tokens, num_blocks, hidden, dtype=torch.bfloat16)
+    block_residuals = torch.randn(num_blocks, num_tokens, hidden, dtype=torch.bfloat16)
 
-    values = torch.cat((block_residuals, prefix_sum.unsqueeze(-2)), dim=-2).float()
+    values = torch.cat((block_residuals, prefix_sum.unsqueeze(0)), dim=0).float()
     normed = values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + eps)
     scores = normed @ (module.norm.weight.float() * module.proj.weight[0].float())
-    probabilities = scores.softmax(dim=-1)
-    expected = (probabilities.unsqueeze(-1) * values).sum(dim=-2).to(prefix_sum.dtype)
+    probabilities = scores.softmax(dim=0)
+    expected = (probabilities.unsqueeze(-1) * values).sum(dim=0).to(prefix_sum.dtype)
 
     actual = module(prefix_sum, block_residuals)
 
@@ -1644,11 +1644,11 @@ def test_attention_residual_single_token_matches_batched_rows() -> None:
     torch.manual_seed(0)
     module = _attention_residual_stub(hidden=64, eps=1e-5)
     prefix_sum = torch.randn(5, 64, dtype=torch.bfloat16)
-    block_residuals = torch.randn(5, 8, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(8, 5, 64, dtype=torch.bfloat16)
 
     batched = module(prefix_sum, block_residuals)
     for row in range(5):
-        alone = module(prefix_sum[row : row + 1], block_residuals[row : row + 1])
+        alone = module(prefix_sum[row : row + 1], block_residuals[:, row : row + 1])
         torch.testing.assert_close(alone, batched[row : row + 1])
 
 
@@ -1668,9 +1668,9 @@ def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
         return graph.forward
 
     prefix_sum = torch.randn(1, 64, dtype=torch.bfloat16)
-    block_residuals = torch.randn(1, 8, 64, dtype=torch.bfloat16)
+    block_residuals = torch.randn(8, 1, 64, dtype=torch.bfloat16)
     mark_dynamic(prefix_sum, 0)
-    mark_dynamic(block_residuals, 0)
+    mark_dynamic(block_residuals, 1)
     torch._dynamo.reset()
     # The TPU platform switches to size-oblivious shapes when compile_sizes
     # has 1; that is the mode the bucket-1 trace runs under.
@@ -1830,17 +1830,76 @@ def test_dummy_router_is_fixed_random_and_layer_specific(monkeypatch, transposed
 def test_attention_residual_bridge_fake_shape():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from vllm_torchtpu.models.vllm.kimi_k3.layers import _build_attention_residual_op
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import _build_attention_residual_bt_op
 
-    op = _build_attention_residual_op(1e-5)
-    assert op is _build_attention_residual_op(1e-5)
+    op = _build_attention_residual_bt_op(1e-5)
+    assert op is _build_attention_residual_bt_op(1e-5)
     with FakeTensorMode():
         prefix = torch.empty(256, 7168, dtype=torch.bfloat16)
-        history = torch.empty(256, 8, 7168, dtype=torch.bfloat16)
+        history = torch.empty(8, 256, 7168, dtype=torch.bfloat16)
         weight = torch.empty(7168, dtype=torch.float32)
         output = op(prefix, history, weight)
         assert output.shape == prefix.shape
         assert output.dtype == prefix.dtype
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expect_op"),
+    [(1, False), (15, False), (16, True), (32, True)],
+)
+def test_attention_residual_dispatches_prefill_bt_op_on_tile_multiples(
+    num_tokens: int, expect_op: bool
+) -> None:
+    """Blocks-first AttentionResidual calls `_prefill_bt_op` only on 16-token tiles."""
+    torch.manual_seed(3)
+    hidden, num_blocks, eps = 64, 4, 1e-5
+    module = _attention_residual_stub(hidden=hidden, eps=eps)
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    module._prefill_bt_op = lambda prefix, blocks, _w: (
+        calls.append((tuple(prefix.shape), tuple(blocks.shape))),
+        prefix + 1,
+    )[1]
+    prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    blocks_bt = torch.randn(num_blocks, num_tokens, hidden, dtype=torch.bfloat16)
+
+    out = module(prefix_sum, blocks_bt)
+    assert out.shape == (num_tokens, hidden)
+    assert bool(calls) is expect_op
+    if expect_op:
+        assert calls == [((num_tokens, hidden), (num_blocks, num_tokens, hidden))]
+
+
+def test_kimi_decoder_layer_stacks_block_residuals_blocks_first() -> None:
+    """`KimiDecoderLayer` appends saved residual blocks along leading axis 0."""
+    from vllm_torchtpu.models.vllm.kimi_k3.model import KimiDecoderLayer
+
+    torch.manual_seed(7)
+    num_tokens, hidden = 4, 16
+    layer = KimiDecoderLayer.__new__(KimiDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_idx = 0
+    layer.attn_res_block_size = 2
+    layer.is_moe = False
+    layer.self_attention_res = _attention_residual_stub(hidden=hidden, eps=1e-5)
+    layer.mlp_res = _attention_residual_stub(hidden=hidden, eps=1e-5)
+    layer.input_layernorm = nn.Identity()
+    layer.post_attention_layernorm = nn.Identity()
+    layer.self_attn = lambda _pos, x, *, sequence_parallel=False: x * 0.5
+    layer.mlp = lambda x, *, sequence_parallel=False: x * 0.25
+
+    x0 = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    empty_blocks = x0.unsqueeze(0)[:0, :, :]
+    x1, blocks1 = layer(torch.arange(num_tokens), x0, empty_blocks)
+    assert blocks1 is not None
+    assert blocks1.shape == (1, num_tokens, hidden)
+    torch.testing.assert_close(blocks1[0], x0)
+
+    layer.layer_idx = 2
+    _, blocks2 = layer(torch.arange(num_tokens), x1, blocks1)
+    assert blocks2 is not None
+    assert blocks2.shape == (2, num_tokens, hidden)
+    torch.testing.assert_close(blocks2[0], x0)
+    torch.testing.assert_close(blocks2[1], x1)
 
 
 @pytest.mark.parametrize("sequence_parallel", [False, True])
