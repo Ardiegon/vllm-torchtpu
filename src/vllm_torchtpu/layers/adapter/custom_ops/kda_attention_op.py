@@ -559,6 +559,91 @@ def _pooled_kda_core(
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
+    """One pooled KDA step: stream from `pool` when unsharded at K=0."""
+    num_heads = a_log.shape[0]
+    head_dim = norm_weight.shape[0]
+    kernel_size = conv_weight.shape[0]
+    state_packing = 4 // jnp.dtype(pool.dtype).itemsize
+    if (
+        num_spec_tokens == 0
+        and (conv_shard_heads is None or conv_shard_heads == num_heads)
+        and pool.ndim >= 4
+        and pool.shape[-2] == state_packing
+    ):
+        geom = _kda_pool_geometry(
+            pool,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            kernel_size=kernel_size,
+            pool_block_tokens=pool_block_tokens,
+        )
+        return _pooled_kda_direct(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            conv_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            query_start_loc,
+            state_indices,
+            seq_lens,
+            distribution if window_distribution is None else window_distribution,
+            geom=geom,
+            lower_bound=lower_bound,
+            eps=eps,
+        )
+    return _pooled_kda_gather_scatter(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        pool,
+        conv_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        query_start_loc,
+        state_indices,
+        seq_lens,
+        distribution,
+        window_distribution,
+        slot_read_offsets,
+        ckpt_indices,
+        lower_bound=lower_bound,
+        eps=eps,
+        pool_block_tokens=pool_block_tokens,
+        conv_shard_heads=conv_shard_heads,
+        num_spec_tokens=num_spec_tokens,
+    )
+
+
+def _pooled_kda_gather_scatter(
+    mixed_qkv: jax.Array,
+    raw_gate: jax.Array,
+    beta: jax.Array,
+    output_gate: jax.Array,
+    pool: jax.Array,  # (num_blocks, block_size, *payload, lanes)
+    conv_weight: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    norm_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    window_distribution: jax.Array | None = None,
+    slot_read_offsets: jax.Array | None = None,
+    ckpt_indices: jax.Array | None = None,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    pool_block_tokens: int,
+    conv_shard_heads: int | None = None,
+    num_spec_tokens: int = 0,
+) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     dense_offsets = None
@@ -771,9 +856,10 @@ def build_kimi_pooled_kda_op(
 
     Same torch-level contract as the dense dispatched op, except the two
     state caches are replaced by the single attention-shaped pool buffer.
-    The state regions are gathered out of the pool, run through the fused
-    conv1d + GDN v3 kernel (the only kernel the pooled path supports — the
-    unfused core is not available here), and scattered back.
+    Non-speculative steps with an unsharded conv state stream both state
+    regions straight from/to the pool inside the fused conv1d + GDN v3 kernel;
+    speculative checkpoint windows and conv-sharded layouts gather the state
+    regions out of the pool, run the fused kernel, and scatter them back.
 
     The manager block size (``cache_config.block_size``) lets the op size
     the state regions against the manager block and derive the
@@ -837,6 +923,8 @@ def build_kimi_pooled_kda_op(
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
     op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+    if not num_spec_tokens and conv_shard_heads is None:
+        op_name += "_direct_pool"
     if num_spec_tokens:
         op_name += f"_window{num_spec_tokens + 1}"
     if conv_shard_heads is not None:
@@ -913,9 +1001,9 @@ def build_kimi_pooled_kda_op(
 class _KdaPoolGeometry:
     """Static byte geometry of the unsharded KDA state regions in a pool block.
 
-    Read by the speculative verify and commit ops, which stream the state
-    straight from the unified pool (`supports_deferred_spec_commit`).
-    `_pooled_kda_core` derives the same geometry inline, with conv shards.
+    Read by the direct non-speculative op and the speculative verify/commit ops,
+    which stream state straight from the unified pool. `_pooled_kda_gather_scatter`
+    derives the multi-shard geometry inline when conv state is rank-sharded.
     """
 
     layout: PooledGDNStateLayout
@@ -1052,6 +1140,50 @@ def _run_kda_window_kernel(
         new_logical_pool.reshape(pool.shape) if geom.split > 1 else new_logical_pool
     )
     return new_pool, out
+
+
+def _pooled_kda_direct(
+    mixed_qkv: jax.Array,
+    raw_gate: jax.Array,
+    beta: jax.Array,
+    output_gate: jax.Array,
+    pool: jax.Array,
+    conv_weight: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    norm_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    geom: _KdaPoolGeometry,
+    lower_bound: float | None,
+    eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Non-speculative pooled KDA with in-kernel shared-pool granule streaming."""
+    num_tokens = mixed_qkv.shape[0]
+    num_heads = a_log.shape[0]
+    head_dim = norm_weight.shape[0]
+    new_pool, out = _run_kda_window_kernel(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        pool,
+        conv_weight,
+        a_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        seq_lens,
+        distribution,
+        geom=geom,
+        lower_bound=lower_bound,
+        num_spec_tokens=0,
+    )
+    output = out.reshape(num_tokens, num_heads, head_dim)
+    output = _gated_output_norm(output, output_gate, norm_weight, eps, mixed_qkv.dtype)
+    return output, new_pool
 
 
 def supports_deferred_spec_commit(vllm_config: VllmConfig) -> bool:

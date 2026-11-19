@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pooled KDA speculative verify/commit ops on CPU."""
+"""Pooled KDA op layer on CPU: direct-pool path selection and verify/commit."""
 
 import inspect
 from types import SimpleNamespace
@@ -113,6 +113,96 @@ def test_six_head_d128_conv_granule_offset_is_770():
     assert geom.layout.ssm_tokens == 154
     assert geom.layout.conv_tokens == 16
     assert kop._shared_conv_granule_offset(geom) == 770
+
+
+def _core(b, **kw):
+    return kop._pooled_kda_core(
+        b["mixed_qkv"],
+        b["raw_gate"],
+        b["beta"],
+        b["output_gate"],
+        b["pool"],
+        b["conv_weight"],
+        b["a_log"],
+        b["dt_bias"],
+        b["norm_weight"],
+        b["query_start_loc"],
+        b["state_indices"],
+        b["seq_lens"],
+        kw.pop("distribution"),
+        lower_bound=LOWER_BOUND,
+        eps=EPS,
+        pool_block_tokens=b["pool_block_tokens"],
+        **kw,
+    )
+
+
+class TestPooledCorePathSelection:
+    def _decode_batch(self):
+        b = _batch(np.random.default_rng(1), [1, 1, 1, 9], pad_rows=2, num_tokens=16)
+        return b, jnp.asarray([3, 4, 4], jnp.int32)
+
+    @pytest.mark.parametrize("conv_shard_heads", [None, H])
+    def test_single_conv_shard_streams_from_the_pool(self, kernel, conv_shard_heads):
+        b, dist = self._decode_batch()
+        out, pool = _core(b, distribution=dist, conv_shard_heads=conv_shard_heads)
+        (call,) = kernel.calls
+        assert call["states"] is b["pool"]
+        assert call["shared_conv_granule_offset"] == b["layout"].ssm_tokens * 5
+        assert call["recurrent_dtype"] == jnp.dtype(jnp.float32)
+        assert call["conv_dtype"] == jnp.dtype(jnp.float32)
+        assert call["read_offsets"] is None
+        assert call["num_spec_tokens"] == 0
+        assert call["batched_state_write"] == gdn_config.StateWrite.ALL
+        assert call["conv_weight"].shape == (3 * H * D, 1, KS)
+        assert out.shape == (16, H, D)
+        assert pool is b["pool"]
+
+    def test_sharded_conv_state_gathers_and_scatters(self, kernel, monkeypatch):
+        b, dist = self._decode_batch()
+        seen = {}
+
+        def fake_gather_scatter(*args, **kwargs):
+            seen["conv_shard_heads"] = kwargs["conv_shard_heads"]
+            seen["num_spec_tokens"] = kwargs["num_spec_tokens"]
+            return "gathered"
+
+        monkeypatch.setattr(kop, "_pooled_kda_gather_scatter", fake_gather_scatter)
+        assert _core(b, distribution=dist, conv_shard_heads=1) == "gathered"
+        assert not kernel.calls
+        assert seen == {"conv_shard_heads": 1, "num_spec_tokens": 0}
+
+    def test_speculative_window_gathers_and_scatters(self, kernel, monkeypatch):
+        b, dist = self._decode_batch()
+        seen = {}
+
+        def fake_gather_scatter(*args, **kwargs):
+            seen["num_spec_tokens"] = kwargs["num_spec_tokens"]
+            return "gathered_spec"
+
+        monkeypatch.setattr(kop, "_pooled_kda_gather_scatter", fake_gather_scatter)
+        assert _core(b, distribution=dist, num_spec_tokens=K_SPEC) == "gathered_spec"
+        assert not kernel.calls
+        assert seen["num_spec_tokens"] == K_SPEC
+
+    def test_non_compact_3d_pool_gathers_and_scatters(self, kernel, monkeypatch):
+        b, dist = self._decode_batch()
+        b = {
+            **b,
+            "pool": jnp.zeros((5, 60, PACK * LANES), jnp.bfloat16),
+            "pool_block_tokens": 60,
+        }
+        monkeypatch.setattr(
+            kop, "_pooled_kda_gather_scatter", lambda *a, **kw: "gathered_3d"
+        )
+        assert _core(b, distribution=dist) == "gathered_3d"
+        assert not kernel.calls
+
+    def test_jit_traces_the_direct_path(self, kernel):
+        b = _batch(np.random.default_rng(5), [1, 1], pad_rows=0, num_tokens=2)
+        dist = jnp.asarray([2, 2, 2], jnp.int32)
+        out, _ = jax.jit(lambda: _core(b, distribution=dist))()
+        assert out.shape == (2, H, D)
 
 
 class TestVerifyAndCommit:
