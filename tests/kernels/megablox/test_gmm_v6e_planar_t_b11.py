@@ -439,3 +439,45 @@ def test_can_use_fused_decode_envelope():
         None,
         max_tokens=gmm.FUSED_VERIFY_MOE_MAX_TOKENS,
     )
+
+
+def test_fused_verify_routing_compacts_sparse_and_overflow_experts():
+    m = 192
+    hs = _lhs(m, 7)
+    topk_ids = np.full((m, 2), -1, dtype=np.int32)
+    topk_w = np.zeros((m, 2), dtype=np.float32)
+    # Expert 0 receives 45 tokens (> 32 -> 2 trays); expert 1 receives 0 tokens;
+    # expert 2 receives 10 tokens (1 tray).
+    topk_ids[:45, 0] = 0
+    topk_w[:45, 0] = 0.5
+    topk_ids[50:60, 1] = 2
+    topk_w[50:60, 1] = 0.25
+
+    padded_m, tray_m = gmm._fused_decode_rows(m)
+    assert padded_m == 256
+    assert tray_m == gmm.FUSED_VERIFY_MOE_TRAY_M
+    lhs, active_ids, num_active, expert_trays, sel_gather, w_compact = (
+        gmm._fused_verify_routing(
+            hs,
+            jnp.asarray(topk_w, dtype=jnp.bfloat16),
+            jnp.asarray(topk_ids),
+            padded_m=padded_m,
+            tray_m=tray_m,
+            num_groups=E,
+        )
+    )
+    assert int(num_active[0]) == 2
+    assert int(expert_trays[0]) == 2
+    assert int(expert_trays[1]) == 0
+    assert int(expert_trays[2]) == 1
+    assert set(np.asarray(active_ids[:2]).tolist()) == {0, 2}
+    # Verify one-hot gather reproduces the exact routed token rows.
+    gathered_e2 = jnp.dot(
+        sel_gather[2, 0], lhs, preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(gathered_e2[:10]), np.asarray(hs[50:60]))
+    np.testing.assert_array_equal(np.asarray(gathered_e2[10:]), 0)
+    np.testing.assert_array_equal(
+        np.asarray(w_compact[2, 0, :10, 0]), np.full((10,), 0.25, dtype=np.float32)
+    )
+    np.testing.assert_array_equal(np.asarray(w_compact[2, 0, 10:, 0]), 0)

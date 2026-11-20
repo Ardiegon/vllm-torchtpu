@@ -1293,12 +1293,14 @@ FUSED_DECODE_MOE_MAX_TOKENS = 64
 # the batch size). Callers opt in by passing
 # `max_tokens=FUSED_VERIFY_MOE_MAX_TOKENS` to the eligibility check.
 FUSED_VERIFY_MOE_MAX_TOKENS = 256
-# Measured on v6e (7 local experts of 3584x3072, no VREG spills for
-# 32/64/128/256-row trays): 128-row trays are within 4% of the best tray
-# size at every M in 65..256 (M=96/128: 165/167 us vs 175/176 at 64 rows
-# and 179 at 32; M=192: 203 vs 196 at 64; M=256: 204 vs 215 at 64, 325 at
-# 32, 573 at 16).
-FUSED_VERIFY_MOE_TRAY_M = 128
+# Compacted routed-only tray size for speculative-decoding verify batches
+# (`65..256` tokens). Only the `k_g` tokens routed to each active expert `g`
+# are gathered into `FUSED_VERIFY_MOE_TRAY_M`-row trays via an exact one-hot
+# MXU gather and scattered back via a weighted MXU scatter-add, avoiding
+# compute on unrouted padded rows. `padded_m` stays 128-lane aligned so the
+# `[tray_m, padded_m]` gather matrix has zero minor-dimension VMEM padding.
+FUSED_VERIFY_MOE_TRAY_M = 32
+_FUSED_VERIFY_MOE_ROW_ALIGN = 128
 # Per-kernel VMEM limit requested by the fused decode/verify kernel: 3/8 of
 # v6e's 128 MiB VMEM (48 MiB, above Mosaic's 32 MiB default `_SCOPED_VMEM_LIMIT`,
 # calibrated on TPU v6e with 3584 x 3072 experts and 128-row trays).
@@ -1341,11 +1343,15 @@ def _fused_decode_w2_depth(n: int) -> int:
     return 1 if n >= _FUSED_DECODE_W2_SINGLE_BUFFER_MIN_N else 2
 
 
-def _fused_verify_moe_vmem_bytes(m: int, k: int, n: int, num_groups: int) -> int:
-    """Upper-bound VMEM estimate of the multi-tray kernel at `m` padded rows."""
-    weights = _w13_slab_bytes(k, n) + _fused_decode_w2_depth(n) * _w2_slab_bytes(k, n)
-    accs = 3 * m * PLANAR_WINDOW * 4 + m * n * 2 + m * k * 4
-    io = m * k * 2 + num_groups * m * _LANES * 4 + m * k * 2
+def _fused_verify_moe_vmem_bytes(
+    m: int, k: int, n: int, num_groups: int, *, depth_w2: int | None = None
+) -> int:
+    """Upper-bound VMEM estimate of the compacted verify kernel at `m` padded rows."""
+    w2_d = _fused_decode_w2_depth(n) if depth_w2 is None else depth_w2
+    tm = FUSED_VERIFY_MOE_TRAY_M
+    weights = _w13_slab_bytes(k, n) + w2_d * _w2_slab_bytes(k, n)
+    accs = 3 * tm * PLANAR_WINDOW * 4 + tm * n * 2 + tm * k * 2 + m * k * 4
+    io = m * k * 2 + num_groups * m * m * 2 + num_groups * m * _LANES * 4 + m * k * 2
     return weights + accs + io
 
 
@@ -1409,7 +1415,7 @@ def can_use_fused_decode_moe_v6e_planar_t_b11(
         return False
     m = hidden_states.shape[0]
     if m > FUSED_DECODE_MOE_MAX_TOKENS:
-        padded_m = _round_up(m, FUSED_VERIFY_MOE_TRAY_M)
+        padded_m = _round_up(m, _FUSED_VERIFY_MOE_ROW_ALIGN)
         return (
             _fused_verify_moe_vmem_bytes(padded_m, k, n, num_groups)
             <= _FUSED_VERIFY_MOE_VMEM_BUDGET
@@ -1421,8 +1427,9 @@ def _fused_decode_rows(m: int) -> tuple[int, int]:
     """Row loop of the fused kernel for `m` tokens: `(padded_m, tray_m)`.
 
     Up to FUSED_DECODE_MOE_MAX_TOKENS rows run as one tile
-    (`tray_m == padded_m`); verify batches above it run in
-    FUSED_VERIFY_MOE_TRAY_M-row trays.
+    (`tray_m == padded_m`); verify batches above it run compacted
+    FUSED_VERIFY_MOE_TRAY_M-row trays over `_FUSED_VERIFY_MOE_ROW_ALIGN`-aligned
+    `padded_m`.
 
     Raises:
       ValueError: for more than FUSED_VERIFY_MOE_MAX_TOKENS tokens.
@@ -1433,7 +1440,7 @@ def _fused_decode_rows(m: int) -> tuple[int, int]:
             f"{FUSED_VERIFY_MOE_MAX_TOKENS} tokens, got {m}."
         )
     if m > FUSED_DECODE_MOE_MAX_TOKENS:
-        return _round_up(m, FUSED_VERIFY_MOE_TRAY_M), FUSED_VERIFY_MOE_TRAY_M
+        return _round_up(m, _FUSED_VERIFY_MOE_ROW_ALIGN), FUSED_VERIFY_MOE_TRAY_M
     padded_m = max(_MIN_FUSED_DECODE_ROWS, _round_up(m, _V6E_INFO.num_sublanes))
     return padded_m, padded_m
 
@@ -1483,6 +1490,334 @@ def _fused_decode_routing(
     active_ids = jnp.argsort(~active_mask).astype(jnp.int32)
     w_expert = jnp.broadcast_to(w_em[:, :, None], (num_groups, padded_m, _LANES))
     return lhs, active_ids, num_active, w_expert
+
+
+def _fused_verify_routing(
+    hidden_states: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    *,
+    padded_m: int,
+    tray_m: int,
+    num_groups: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build compacted per-expert routed-token tray tables for verify batches."""
+    lhs, active_ids, num_active, w_expert_full = _fused_decode_routing(
+        hidden_states, topk_weights, topk_ids, padded_m=padded_m, num_groups=num_groups
+    )
+    w_em = w_expert_full[:, :, 0]
+    is_routed = w_em != 0.0
+    counts = jnp.sum(is_routed.astype(jnp.int32), axis=1)
+    expert_trays = (counts + tray_m - 1) // tray_m
+    tok_order = jnp.argsort(~is_routed, axis=1).astype(jnp.int32)
+    num_trays = padded_m // tray_m
+    pos = jnp.arange(padded_m, dtype=jnp.int32)[None, :]
+    valid_pos = pos < counts[:, None]
+    one_hot = jax.nn.one_hot(tok_order, padded_m, dtype=lhs.dtype)
+    sel_gather = jnp.where(valid_pos[:, :, None], one_hot, jnp.zeros((), lhs.dtype))
+    sel_gather = sel_gather.reshape(num_groups, num_trays, tray_m, padded_m)
+    w_comp = jnp.take_along_axis(w_em, tok_order, axis=1)
+    w_comp = jnp.where(valid_pos, w_comp, 0.0)
+    w_compact = jnp.broadcast_to(
+        w_comp.reshape(num_groups, num_trays, tray_m, 1),
+        (num_groups, num_trays, tray_m, _LANES),
+    )
+    return lhs, active_ids, num_active, expert_trays, sel_gather, w_compact
+
+
+def _fused_verify_moe_v6e_planar_t_b11(
+    hidden_states: jax.Array,
+    w13_pt: jax.Array,
+    w13_sc_3d: jax.Array,
+    w2_pt: jax.Array,
+    w2_sc_3d: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    *,
+    situ_beta: float,
+    situ_linear_beta: float | None,
+    out_dtype: jnp.dtype,
+    padded_m: int,
+    tray_m: int,
+) -> jax.Array:
+    """Routed-only compacted verify MoE kernel for `65 <= M <= 256` tokens."""
+    orig_m, k = hidden_states.shape
+    num_groups, _, n = w13_pt.shape
+    num_trays = padded_m // tray_m
+    lhs, active_ids, num_active, expert_trays, sel_gather, w_compact = (
+        _fused_verify_routing(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            padded_m=padded_m,
+            tray_m=tray_m,
+            num_groups=num_groups,
+        )
+    )
+
+    chunk = PLANAR_WINDOW
+    tn13 = PLANAR_WINDOW
+    tn2 = PLANAR_WINDOW
+    steps_13 = k // chunk
+    steps_2 = n // chunk
+    tiles_n13 = n // tn13
+    tiles_n2 = k // tn2
+    plane_rows = chunk // 2
+    scale_rows = chunk // SCALE_GROUP
+    depth_w13 = 2
+    depth_w2 = (
+        2
+        if _fused_verify_moe_vmem_bytes(padded_m, k, n, num_groups, depth_w2=2)
+        <= _FUSED_VERIFY_MOE_VMEM_BUDGET
+        else 1
+    )
+
+    w13_packed_5d = w13_pt.reshape(num_groups, 2, steps_13, plane_rows, n)
+    w13_scales_in = w13_sc_3d.reshape(num_groups, 2, steps_13, scale_rows, n)
+    w2_packed_4d = w2_pt.reshape(num_groups, steps_2, plane_rows, k)
+    w2_scales_in = w2_sc_3d.reshape(num_groups, steps_2, scale_rows, k)
+
+    dims = (((1,), (0,)), ((), ()))
+    lane_tiles_m = padded_m // _LANES
+
+    def kernel(
+        active_ids_ref,
+        nat_ref,
+        expert_trays_ref,
+        lhs_ref,
+        sel_gather_ref,
+        w_compact_ref,
+        w13_p_ref,
+        w13_s_ref,
+        w2_p_ref,
+        w2_s_ref,
+        out_ref,
+        w13_pbuf,
+        w13_sbuf,
+        w2_pbuf,
+        w2_sbuf,
+        lhs_compact,
+        gate_acc,
+        up_acc,
+        w2_acc,
+        h_buf,
+        out_acc,
+        w13_psem,
+        w13_ssem,
+        w2_psem,
+        w2_ssem,
+    ):
+        for t2_init in range(tiles_n2):
+            out_acc[:, pl.ds(t2_init * tn2, tn2)] = jnp.zeros(
+                (padded_m, tn2), jnp.float32
+            )
+
+        def copy_w13_expert(g, slot):
+            return (
+                pltpu.make_async_copy(
+                    w13_p_ref.at[g], w13_pbuf.at[slot], w13_psem.at[slot]
+                ),
+                pltpu.make_async_copy(
+                    w13_s_ref.at[g], w13_sbuf.at[slot], w13_ssem.at[slot]
+                ),
+            )
+
+        def copy_w2_expert(g, slot=0):
+            return (
+                pltpu.make_async_copy(
+                    w2_p_ref.at[g], w2_pbuf.at[slot], w2_psem.at[slot]
+                ),
+                pltpu.make_async_copy(
+                    w2_s_ref.at[g], w2_sbuf.at[slot], w2_ssem.at[slot]
+                ),
+            )
+
+        @pl.when(nat_ref[0] > 0)
+        def _prime_first():
+            g0 = active_ids_ref[0]
+            for c in copy_w13_expert(g0, 0):
+                c.start()
+            if depth_w2 >= 2:
+                for c2 in copy_w2_expert(g0, 0):
+                    c2.start()
+
+        def visit_expert(j, carry):
+            g = active_ids_ref[j]
+            slot = lax.rem(j, depth_w13)
+            next_slot = lax.rem(j + 1, depth_w13)
+            slot2 = lax.rem(j, depth_w2)
+            next_slot2 = lax.rem(j + 1, depth_w2)
+
+            if depth_w2 == 1:
+                for c2 in copy_w2_expert(g, 0):
+                    c2.start()
+            else:
+
+                @pl.when(j + 1 < nat_ref[0])
+                def _prefetch_next_w2():
+                    g_next = active_ids_ref[j + 1]
+                    for c2 in copy_w2_expert(g_next, next_slot2):
+                        c2.start()
+
+            @pl.when(j + 1 < nat_ref[0])
+            def _prefetch_next():
+                g_next = active_ids_ref[j + 1]
+                for c in copy_w13_expert(g_next, next_slot):
+                    c.start()
+
+            for c in copy_w13_expert(g, slot):
+                c.wait()
+
+            n_tr = expert_trays_ref[g]
+
+            def visit_tray(tr, tr_carry):
+                sel_g = sel_gather_ref[g, tr]  # [tray_m, padded_m]
+                for cs in range(steps_13):
+                    k_sl = pl.ds(cs * chunk, chunk)
+                    lhs_compact[:, k_sl] = lax.dot_general(
+                        sel_g,
+                        lhs_ref[:, k_sl],
+                        dimension_numbers=dims,
+                        preferred_element_type=jnp.float32,
+                    ).astype(out_dtype)
+
+                for t in range(tiles_n13):
+                    sl = pl.ds(t * tn13, tn13)
+                    gate_acc[...] = jnp.zeros((tray_m, tn13), jnp.float32)
+                    up_acc[...] = jnp.zeros((tray_m, tn13), jnp.float32)
+                    for cs in range(steps_13):
+                        k_sl = pl.ds(cs * chunk, chunk)
+                        lhs_c = lhs_compact[:, k_sl]
+                        g_codes, g_wscale = _dequantize_chunk_planar_t_b11(
+                            w13_pbuf[slot, 0, cs, :, sl],
+                            w13_sbuf[slot, 0, cs, :, sl],
+                        )
+                        gate_acc[...] += (
+                            lax.dot_general(
+                                lhs_c,
+                                g_codes,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * g_wscale
+                        )
+                        u_codes, u_wscale = _dequantize_chunk_planar_t_b11(
+                            w13_pbuf[slot, 1, cs, :, sl],
+                            w13_sbuf[slot, 1, cs, :, sl],
+                        )
+                        up_acc[...] += (
+                            lax.dot_general(
+                                lhs_c,
+                                u_codes,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * u_wscale
+                        )
+                    h_buf[:, sl] = _situ_f32(
+                        gate_acc[...],
+                        up_acc[...],
+                        beta=situ_beta,
+                        linear_beta=situ_linear_beta,
+                    ).astype(out_dtype)
+
+                @pl.when(tr == 0)
+                def _wait_w2_once():
+                    for c2 in copy_w2_expert(g, slot2):
+                        c2.wait()
+
+                w_c_tile = jnp.tile(w_compact_ref[g, tr], (1, lane_tiles_m))
+                w_sel_t = (sel_g.astype(jnp.float32) * w_c_tile).astype(out_dtype).T
+                for t2 in range(tiles_n2):
+                    sl2 = pl.ds(t2 * tn2, tn2)
+                    w2_acc[...] = jnp.zeros((tray_m, tn2), jnp.float32)
+                    for cs in range(steps_2):
+                        n_sl = pl.ds(cs * chunk, chunk)
+                        codes2, wscale2 = _dequantize_chunk_planar_t_b11(
+                            w2_pbuf[slot2, cs, :, sl2],
+                            w2_sbuf[slot2, cs, :, sl2],
+                        )
+                        w2_acc[...] += (
+                            lax.dot_general(
+                                h_buf[:, n_sl],
+                                codes2,
+                                dimension_numbers=dims,
+                                preferred_element_type=jnp.float32,
+                            )
+                            * wscale2
+                        )
+                    down_bf16 = w2_acc[...].astype(out_dtype)
+                    out_acc[:, sl2] += lax.dot_general(
+                        w_sel_t,
+                        down_bf16,
+                        dimension_numbers=dims,
+                        preferred_element_type=jnp.float32,
+                    )
+                return tr_carry
+
+            lax.fori_loop(0, n_tr, visit_tray, 0)
+            return carry
+
+        lax.fori_loop(0, nat_ref[0], visit_expert, 0)
+        for t2_ep in range(tiles_n2):
+            sl2_ep = pl.ds(t2_ep * tn2, tn2)
+            out_ref[:, sl2_ep] = out_acc[:, sl2_ep].astype(out_dtype)
+
+    scratch_shapes = [
+        pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
+        pltpu.VMEM((depth_w13, 2, steps_13, scale_rows, n), jnp.uint8),
+        pltpu.VMEM((depth_w2, steps_2, plane_rows, k), jnp.uint8),
+        pltpu.VMEM((depth_w2, steps_2, scale_rows, k), jnp.uint8),
+        pltpu.VMEM((tray_m, k), out_dtype),
+        pltpu.VMEM((tray_m, tn13), jnp.float32),
+        pltpu.VMEM((tray_m, tn13), jnp.float32),
+        pltpu.VMEM((tray_m, tn2), jnp.float32),
+        pltpu.VMEM((tray_m, n), out_dtype),
+        pltpu.VMEM((padded_m, k), jnp.float32),
+        pltpu.SemaphoreType.DMA((depth_w13,)),
+        pltpu.SemaphoreType.DMA((depth_w13,)),
+        pltpu.SemaphoreType.DMA((depth_w2,)),
+        pltpu.SemaphoreType.DMA((depth_w2,)),
+    ]
+
+    compiler_params = pltpu.CompilerParams(
+        vmem_limit_bytes=_FUSED_DECODE_MOE_VMEM_LIMIT
+    )
+    kname = f"fused_verify_moe_v6e_planar_t_b11_m{padded_m}_routed{num_trays}x{tray_m}"
+
+    out = pl.pallas_call(
+        kernel,
+        grid=(),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+        out_shape=jax.ShapeDtypeStruct((padded_m, k), out_dtype),
+        scratch_shapes=scratch_shapes,
+        compiler_params=compiler_params,
+        name=kname,
+    )(
+        active_ids,
+        num_active,
+        expert_trays,
+        lhs,
+        sel_gather,
+        w_compact,
+        w13_packed_5d,
+        w13_scales_in,
+        w2_packed_4d,
+        w2_scales_in,
+    )
+    return out[:orig_m]
 
 
 def fused_decode_moe_v6e_planar_t_b11(
@@ -1541,8 +1876,21 @@ def fused_decode_moe_v6e_planar_t_b11(
     situ_beta, situ_linear_beta = parse_situ_activation(activation)
 
     padded_m, tray_m = _fused_decode_rows(orig_m)
-    num_trays = padded_m // tray_m
-    use_trays = orig_m > FUSED_DECODE_MOE_MAX_TOKENS
+    if orig_m > FUSED_DECODE_MOE_MAX_TOKENS:
+        return _fused_verify_moe_v6e_planar_t_b11(
+            hidden_states,
+            w13_pt,
+            w13_sc_3d,
+            w2_pt,
+            w2_sc_3d,
+            topk_weights,
+            topk_ids,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            out_dtype=out_dtype,
+            padded_m=padded_m,
+            tray_m=tray_m,
+        )
     lhs, active_ids, num_active, w_expert = _fused_decode_routing(
         hidden_states, topk_weights, topk_ids, padded_m=padded_m, num_groups=num_groups
     )
@@ -1590,17 +1938,8 @@ def fused_decode_moe_v6e_planar_t_b11(
         w2_psem,
         w2_ssem,
     ):
-        if use_trays:
-            for tr in range(num_trays):
-                r_sl = pl.ds(tr * tray_m, tray_m)
-                for t2_init in range(tiles_n2):
-                    out_acc[r_sl, pl.ds(t2_init * tn2, tn2)] = jnp.zeros(
-                        (tray_m, tn2), jnp.float32
-                    )
-            lhs_tile = None
-        else:
-            out_acc[...] = jnp.zeros_like(out_acc)
-            lhs_tile = lhs_ref[...]
+        out_acc[...] = jnp.zeros_like(out_acc)
+        lhs_tile = lhs_ref[...]
 
         def copy_w13_expert(g, slot):
             return (
@@ -1658,169 +1997,74 @@ def fused_decode_moe_v6e_planar_t_b11(
             for c in copy_w13_expert(g, slot):
                 c.wait()
 
-            if use_trays:
-                for t in range(tiles_n13):
-                    sl = pl.ds(t * tn13, tn13)
-                    for tr in range(num_trays):
-                        r_sl = pl.ds(tr * tray_m, tray_m)
-                        gate_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
-                        up_acc[r_sl, :] = jnp.zeros((tray_m, tn13), jnp.float32)
-                    for cs in range(steps_13):
-                        k_sl = pl.ds(cs * chunk, chunk)
-                        # One weight unpack per chunk, shared by all trays.
-                        g_codes, g_wscale = _dequantize_chunk_planar_t_b11(
-                            w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
+            w_g = w_expert_ref[g]
+            for t in range(tiles_n13):
+                sl = pl.ds(t * tn13, tn13)
+                gate_acc[...] = jnp.zeros_like(gate_acc)
+                up_acc[...] = jnp.zeros_like(up_acc)
+                for cs in range(steps_13):
+                    lhs_chunk = lhs_tile[:, cs * chunk : (cs + 1) * chunk]
+                    g_codes, g_wscale = _dequantize_chunk_planar_t_b11(
+                        w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
+                    )
+                    gate_acc[...] += (
+                        lax.dot_general(
+                            lhs_chunk,
+                            g_codes,
+                            dimension_numbers=dims,
+                            preferred_element_type=jnp.float32,
                         )
-                        for tr in range(num_trays):
-                            r_sl = pl.ds(tr * tray_m, tray_m)
-                            lhs_tr = lhs_ref[r_sl, k_sl]
-                            gate_acc[r_sl, :] += (
-                                lax.dot_general(
-                                    lhs_tr,
-                                    g_codes,
-                                    dimension_numbers=dims,
-                                    preferred_element_type=jnp.float32,
-                                )
-                                * g_wscale
-                            )
-                        u_codes, u_wscale = _dequantize_chunk_planar_t_b11(
-                            w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
+                        * g_wscale
+                    )
+                    u_codes, u_wscale = _dequantize_chunk_planar_t_b11(
+                        w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
+                    )
+                    up_acc[...] += (
+                        lax.dot_general(
+                            lhs_chunk,
+                            u_codes,
+                            dimension_numbers=dims,
+                            preferred_element_type=jnp.float32,
                         )
-                        for tr in range(num_trays):
-                            r_sl = pl.ds(tr * tray_m, tray_m)
-                            lhs_tr = lhs_ref[r_sl, k_sl]
-                            up_acc[r_sl, :] += (
-                                lax.dot_general(
-                                    lhs_tr,
-                                    u_codes,
-                                    dimension_numbers=dims,
-                                    preferred_element_type=jnp.float32,
-                                )
-                                * u_wscale
-                            )
-                    for tr in range(num_trays):
-                        r_sl = pl.ds(tr * tray_m, tray_m)
-                        h_buf[r_sl, sl] = _situ_f32(
-                            gate_acc[r_sl, :],
-                            up_acc[r_sl, :],
-                            beta=situ_beta,
-                            linear_beta=situ_linear_beta,
-                        ).astype(out_dtype)
+                        * u_wscale
+                    )
+                h_tile = _situ_f32(
+                    gate_acc[...],
+                    up_acc[...],
+                    beta=situ_beta,
+                    linear_beta=situ_linear_beta,
+                ).astype(out_dtype)
+                h_buf[:, sl] = h_tile
 
-                for c2 in copy_w2_expert(g, slot2):
-                    c2.wait()
+            for c2 in copy_w2_expert(g, slot2):
+                c2.wait()
 
-                for t2 in range(tiles_n2):
-                    sl2 = pl.ds(t2 * tn2, tn2)
-                    for tr in range(num_trays):
-                        w2_acc[pl.ds(tr * tray_m, tray_m), :] = jnp.zeros(
-                            (tray_m, tn2), jnp.float32
+            h_full = h_buf[...]
+            w_g_tile = jnp.tile(w_g, (1, tn2 // _LANES))
+            for t2 in range(tiles_n2):
+                sl2 = pl.ds(t2 * tn2, tn2)
+                w2_acc[...] = jnp.zeros_like(w2_acc)
+                for cs in range(steps_2):
+                    h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
+                    codes2, wscale2 = _dequantize_chunk_planar_t_b11(
+                        w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
+                    )
+                    w2_acc[...] += (
+                        lax.dot_general(
+                            h_chunk,
+                            codes2,
+                            dimension_numbers=dims,
+                            preferred_element_type=jnp.float32,
                         )
-                    for cs in range(steps_2):
-                        n_sl = pl.ds(cs * chunk, chunk)
-                        # One weight unpack per chunk, shared by all trays.
-                        codes2, wscale2 = _dequantize_chunk_planar_t_b11(
-                            w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
-                        )
-                        for tr in range(num_trays):
-                            r_sl = pl.ds(tr * tray_m, tray_m)
-                            h_tr = h_buf[r_sl, n_sl]
-                            w2_acc[r_sl, :] += (
-                                lax.dot_general(
-                                    h_tr,
-                                    codes2,
-                                    dimension_numbers=dims,
-                                    preferred_element_type=jnp.float32,
-                                )
-                                * wscale2
-                            )
-                    for tr in range(num_trays):
-                        r_sl = pl.ds(tr * tray_m, tray_m)
-                        down_bf16 = (
-                            w2_acc[r_sl, :].astype(out_dtype).astype(jnp.float32)
-                        )
-                        w_g_tr = jnp.tile(w_expert_ref[g, r_sl, :], (1, tn2 // _LANES))
-                        out_acc[r_sl, sl2] += down_bf16 * w_g_tr
-            else:
-                # Narrow the Optional for the type checker; the non-tray
-                # prologue always loads it.
-                tile = lhs_tile
-                assert tile is not None
-                w_g = w_expert_ref[g]
-                for t in range(tiles_n13):
-                    sl = pl.ds(t * tn13, tn13)
-                    gate_acc[...] = jnp.zeros_like(gate_acc)
-                    up_acc[...] = jnp.zeros_like(up_acc)
-                    for cs in range(steps_13):
-                        lhs_chunk = tile[:, cs * chunk : (cs + 1) * chunk]
-                        g_codes, g_wscale = _dequantize_chunk_planar_t_b11(
-                            w13_pbuf[slot, 0, cs, :, sl], w13_sbuf[slot, 0, cs, :, sl]
-                        )
-                        gate_acc[...] += (
-                            lax.dot_general(
-                                lhs_chunk,
-                                g_codes,
-                                dimension_numbers=dims,
-                                preferred_element_type=jnp.float32,
-                            )
-                            * g_wscale
-                        )
-                        u_codes, u_wscale = _dequantize_chunk_planar_t_b11(
-                            w13_pbuf[slot, 1, cs, :, sl], w13_sbuf[slot, 1, cs, :, sl]
-                        )
-                        up_acc[...] += (
-                            lax.dot_general(
-                                lhs_chunk,
-                                u_codes,
-                                dimension_numbers=dims,
-                                preferred_element_type=jnp.float32,
-                            )
-                            * u_wscale
-                        )
-                    h_tile = _situ_f32(
-                        gate_acc[...],
-                        up_acc[...],
-                        beta=situ_beta,
-                        linear_beta=situ_linear_beta,
-                    ).astype(out_dtype)
-                    h_buf[:, sl] = h_tile
-
-                for c2 in copy_w2_expert(g, slot2):
-                    c2.wait()
-
-                h_full = h_buf[...]
-                w_g_tile = jnp.tile(w_g, (1, tn2 // _LANES))
-                for t2 in range(tiles_n2):
-                    sl2 = pl.ds(t2 * tn2, tn2)
-                    w2_acc[...] = jnp.zeros_like(w2_acc)
-                    for cs in range(steps_2):
-                        h_chunk = h_full[:, cs * chunk : (cs + 1) * chunk]
-                        codes2, wscale2 = _dequantize_chunk_planar_t_b11(
-                            w2_pbuf[slot2, cs, :, sl2], w2_sbuf[slot2, cs, :, sl2]
-                        )
-                        w2_acc[...] += (
-                            lax.dot_general(
-                                h_chunk,
-                                codes2,
-                                dimension_numbers=dims,
-                                preferred_element_type=jnp.float32,
-                            )
-                            * wscale2
-                        )
-                    down_bf16 = w2_acc[...].astype(out_dtype).astype(jnp.float32)
-                    out_acc[:, sl2] += down_bf16 * w_g_tile
+                        * wscale2
+                    )
+                down_bf16 = w2_acc[...].astype(out_dtype).astype(jnp.float32)
+                out_acc[:, sl2] += down_bf16 * w_g_tile
 
             return carry
 
         lax.fori_loop(0, nat_ref[0], visit_expert, 0)
-        if use_trays:
-            for tr in range(num_trays):
-                r_sl = pl.ds(tr * tray_m, tray_m)
-                for t2_ep in range(tiles_n2):
-                    sl2_ep = pl.ds(t2_ep * tn2, tn2)
-                    out_ref[r_sl, sl2_ep] = out_acc[r_sl, sl2_ep].astype(out_dtype)
-        else:
-            out_ref[...] = out_acc[...].astype(out_dtype)
+        out_ref[...] = out_acc[...].astype(out_dtype)
 
     scratch_shapes = [
         pltpu.VMEM((depth_w13, 2, steps_13, plane_rows, n), jnp.uint8),
@@ -1843,8 +2087,6 @@ def fused_decode_moe_v6e_planar_t_b11(
     )
 
     kname = f"fused_decode_moe_v6e_planar_t_b11_m{padded_m}"
-    if use_trays:
-        kname += f"_trays{num_trays}x{tray_m}"
 
     out = pl.pallas_call(
         kernel,
