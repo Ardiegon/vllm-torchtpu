@@ -15,25 +15,29 @@
 
 `build_kimi_moe_ep_overlap_op` registers one sharded torch custom op (a
 `jax.shard_map` over the `('dp', 'tp')` mesh via `pallas.jax_op`) that runs a
-whole Kimi K3 MoE block for expert parallelism:
+whole Kimi K3 MoE block for expert parallelism, holding its Pallas DMA
+semaphores internally:
 
 1. Dispatch. Each rank owns a `[B_dp, latent_dim / tp]` slice of the routed
-   latent. XLA all-gathers on contiguous axes collect it over `'tp'`, then
-   the latent plus the byte-packed routing metadata over `'dp'`, next to
-   the shared-expert gate/up matmul and gated activation.
+   latent. Small batches (at most `max_dma_tokens` tokens across DP) gather it
+   in two axial stages: a one-shot remote-DMA all-gather over `'tp'`, then a
+   non-blocking remote-DMA all-gather over `'dp'` of the latent plus the
+   byte-packed routing metadata, with the shared-expert gate/up matmul and
+   `SituAndMul` activation running between start and wait. Larger batches use
+   XLA all-gathers on contiguous axes instead.
 2. Routed experts (`fused_moe_func`) on the gathered tokens.
-3. Combine. A `'dp'` reduce-scatter, a `'tp'` psum, the exact
-   `RMSNorm(latent_dim)` of the routed output, and the slice of this rank's
-   `latent_dim / tp` columns.
+3. Combine. A one-shot `'dp'` reduce-scatter, a `'tp'` psum guarded to small
+   widths (XLA collectives above the caps), the exact `RMSNorm(latent_dim)` of
+   the routed output, and the slice of this rank's `latent_dim / tp` columns.
 
 The op returns `[B_dp, shared_inter_tp + latent_dim / tp]`: the shared
-activation and the normalized routed slice, concatenated. The JAX building
-blocks live in `kernels/kimi_k3/exit_fold.py`. The routed experts must be in
-the planar_t MXFP4 layout (uint8 weights and scales, no biases).
+activation and the normalized routed slice, concatenated. The Pallas and JAX
+building blocks live in `kernels/kimi_k3/exit_fold.py`. The routed experts must
+be in the planar_t MXFP4 layout (uint8 weights and scales, no biases).
 
 Serving note (`LIBTPU_INIT_ARGS`, consumed once by libtpu at PJRT startup):
-overlapping async XLA collectives with the shared-expert compute and fusing
-adjacent all-gathers on TPU v6e uses::
+overlapping the split `'dp'` remote-DMA dispatch with the shared-expert matmul
+and fusing surrounding XLA collectives on TPU v6e uses::
 
     --xla_msa_preferred_overlap_to_async_copy_ratio=12
     --xla_tpu_enable_async_collective_fusion=true
@@ -55,8 +59,14 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dp_tp_mesh import DP_AXIS_NAME, TP_AXIS_NAME
+from vllm_torchtpu.kernels.collectives.one_shot_dma import (
+    DEFAULT_MAX_DMA_TOKENS,
+    latency_all_gather_cols,
+)
 from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
+    COLLECTIVE_ID_MOE_TP_LATENT_AG,
     compute_shared_gu_and_act,
+    dispatch_overlapping_shared_experts,
     hierarchical_combine_rms_slice,
     unpack_axial_gathered,
 )
@@ -126,11 +136,12 @@ def _make_moe_ep_overlap_jax_fn(
     mesh: Mesh,
     cfg: MoeOverlapConfig,
     *,
+    max_dma_tokens: int,
     use_sparse_core: bool,
     onehot_permute_threshold: int,
 ) -> tuple[Callable[..., jax.Array], tuple[PartitionSpec, ...], PartitionSpec]:
     """The SPMD JAX function of the op with its input and output specs."""
-    _, tp_size = mesh.devices.shape
+    dp_size, tp_size = mesh.devices.shape
     topk = cfg.topk
     names = _operand_names(cfg.use_norm)
 
@@ -156,19 +167,44 @@ def _make_moe_ep_overlap_jax_fn(
             named["norm_weight"] if cfg.use_norm else jnp.ones((1,), jnp.bfloat16)
         )
 
-        latent_dim = tp_size * local_rdown.shape[1]
+        b_dp, d_local = local_rdown.shape
+        latent_dim = tp_size * d_local
+        b_global = dp_size * b_dp
+        dp_lanes = latent_dim + 3 * topk
 
-        # 1. Dispatch + shared gate/up compute. XLA all-gathers on contiguous
-        # axes (TP on axis 1, then DP on axis 0), so no 4D transpose is needed.
-        shared_act = compute_shared_gu_and_act(
-            local_hidden,
-            local_w_shared_gu,
-            situ_beta=cfg.situ_beta,
-            situ_linear_beta=cfg.situ_linear_beta,
-        )
-        lat_tp = lax.all_gather(local_rdown, TP_AXIS_NAME, axis=1, tiled=True)
-        packed_dp = jnp.concatenate((lat_tp, local_meta[:, : 3 * topk]), axis=-1)
-        gathered_dp = lax.all_gather(packed_dp, DP_AXIS_NAME, axis=0, tiled=True)
+        # 1. Dispatch + shared gate/up compute.
+        if b_global > max_dma_tokens:
+            # Prefill / large batch: XLA all-gathers on contiguous axes (TP on
+            # axis 1, then DP on axis 0), so no 4D transpose is needed.
+            shared_act = compute_shared_gu_and_act(
+                local_hidden,
+                local_w_shared_gu,
+                situ_beta=cfg.situ_beta,
+                situ_linear_beta=cfg.situ_linear_beta,
+            )
+            lat_tp = lax.all_gather(local_rdown, TP_AXIS_NAME, axis=1, tiled=True)
+            packed_dp = jnp.concatenate((lat_tp, local_meta[:, : 3 * topk]), axis=-1)
+            gathered_dp = lax.all_gather(packed_dp, DP_AXIS_NAME, axis=0, tiled=True)
+        else:
+            # Small batch: one-shot TP all-gather of the latent, then the async
+            # DP dispatch of latent + metadata overlapped with shared experts.
+            lat_tp = latency_all_gather_cols(
+                local_rdown,
+                TP_AXIS_NAME,
+                collective_id=COLLECTIVE_ID_MOE_TP_LATENT_AG,
+            )
+            packed_dp = jnp.concatenate((lat_tp, local_meta[:, : 3 * topk]), axis=-1)
+            gathered_dp_3d, shared_act = dispatch_overlapping_shared_experts(
+                packed_dp,
+                DP_AXIS_NAME,
+                local_hidden,
+                local_w_shared_gu,
+                rows=b_dp,
+                orig_lanes=dp_lanes,
+                situ_beta=cfg.situ_beta,
+                situ_linear_beta=cfg.situ_linear_beta,
+            )
+            gathered_dp = gathered_dp_3d.reshape(b_global, dp_lanes)
         ag_latent, ag_ids, ag_weights = unpack_axial_gathered(
             gathered_dp, latent_dim=latent_dim, topk=topk
         )
@@ -206,6 +242,7 @@ def _make_moe_ep_overlap_jax_fn(
             latent_dim=latent_dim,
             use_norm=cfg.use_norm,
             rms_eps=cfg.rms_eps,
+            max_dma_tokens=max_dma_tokens,
         )
 
         # One contiguous [B_dp, s_inter_tp + latent_local] output.
@@ -228,6 +265,8 @@ def _make_moe_ep_overlap_jax_fn(
 def build_kimi_moe_ep_overlap_op(
     mesh: Mesh,
     cfg: MoeOverlapConfig,
+    *,
+    max_dma_tokens: int = DEFAULT_MAX_DMA_TOKENS,
 ) -> Callable[..., torch.Tensor]:
     """Build (or reuse the cached) EP-overlap op for one MoE layer shape."""
     dp_size, tp_size = mesh.devices.shape
@@ -237,7 +276,7 @@ def build_kimi_moe_ep_overlap_op(
     op_name = (
         f"pallas::kimi_moe_ep_overlap_k{cfg.topk}_situ"
         f"_n{int(cfg.use_norm)}_m{cfg.fused_decode_max_tokens}"
-        f"_dp{dp_size}_tp{tp_size}"
+        f"_cap{max_dma_tokens}_dp{dp_size}_tp{tp_size}"
     )
     cache_key = (op_name, dev_ids, cfg, use_sparse_core, onehot_permute_threshold)
     if cache_key in _OVERLAP_OPS:
@@ -246,6 +285,7 @@ def build_kimi_moe_ep_overlap_op(
     jax_fn, in_specs, out_spec = _make_moe_ep_overlap_jax_fn(
         mesh,
         cfg,
+        max_dma_tokens=max_dma_tokens,
         use_sparse_core=use_sparse_core,
         onehot_permute_threshold=onehot_permute_threshold,
     )

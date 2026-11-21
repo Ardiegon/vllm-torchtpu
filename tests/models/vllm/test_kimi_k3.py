@@ -3187,8 +3187,8 @@ def test_ep_overlap_op_is_built_once_per_layer_shape(registered_overlap_ops) -> 
 
     assert same is op and verify is not op
     assert [o.name for o in registered_overlap_ops] == [
-        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m64_dp8_tp16",
-        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m256_dp8_tp16",
+        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m64_cap64_dp8_tp16",
+        "pallas::kimi_moe_ep_overlap_k8_situ_n1_m256_cap64_dp8_tp16",
     ]
     assert op.kwargs["mesh"] is mesh
     assert op.kwargs["output_partition_specs"] == (
