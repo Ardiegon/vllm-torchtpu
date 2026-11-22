@@ -261,6 +261,86 @@ def test_moe_gmm_matches_reference(weights, sizes, activation):
     )
 
 
+@pytest.mark.parametrize("ep_shards", [1, 32])
+def test_moe_gmm_ep_shards_skewed_matches_reference(weights, ep_shards):
+    # One skewed group (> _MIN_EXPECTED_TM) straddles tile boundaries.
+    sizes = [45, 0, 19]
+    m = sum(sizes)
+    lhs = _lhs(m, 177 + ep_shards)
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+    with pltpu.force_tpu_interpret_mode():
+        out = gmm.moe_gmm_v6e_planar_t_b11(
+            lhs,
+            *weights["planar_t"],
+            group_sizes,
+            activation=ACT,
+            ep_shards=ep_shards,
+        )
+    assert out.shape == (m, K)
+    _assert_close(
+        out, _moe_reference(weights, lhs, group_sizes, activation=ACT), rel=3e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "m, ep_shards, expected_tm",
+    [
+        # 32-shard EP (224 global experts): b_dp = 256 / 512 / 1024.
+        (8192, 32, 64),
+        (16384, 32, 128),
+        (32768, 32, 256),
+        # 128-shard EP (896 global experts): b_dp = 256 / 512 / 1024.
+        (32768, 128, 64),
+        (65536, 128, 128),
+        (131072, 128, 256),
+    ],
+)
+def test_moe_gmm_per_expert_tiling_selects_wider_n_tile(
+    monkeypatch, m, ep_shards, expected_tm
+):
+    """Per-expert row-tile sizing unlocks wide N tiles on large EP prefill buckets."""
+    k, n, num_groups = 3584, 3072, 7
+    recorded: dict[str, tuple[int, int, int]] = {}
+
+    def fake_gate_up(lhs, w13_pt, w13_sc_3d, *, tiling, **kwargs):
+        del w13_pt, w13_sc_3d, kwargs
+        recorded["t13"] = tiling
+        return jnp.zeros((lhs.shape[0], n), dtype=lhs.dtype)
+
+    def fake_down(h, w2_pt, w2_sc_3d, group_sizes, *, tiling, **kwargs):
+        del w2_pt, w2_sc_3d, group_sizes, kwargs
+        recorded["t2"] = tiling
+        return jnp.zeros((h.shape[0], k), dtype=h.dtype)
+
+    monkeypatch.setattr(gmm, "_run_fused_gate_up_5d", fake_gate_up)
+    monkeypatch.setattr(gmm, "mxfp4_gmm", fake_down)
+
+    lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
+    w13 = jax.ShapeDtypeStruct((num_groups, k, n), jnp.uint8)
+    w13_sc = jax.ShapeDtypeStruct((num_groups, 2 * (k // 32), 1, n), jnp.uint8)
+    w2 = jax.ShapeDtypeStruct((num_groups, n // 2, k), jnp.uint8)
+    w2_sc = jax.ShapeDtypeStruct((num_groups, n // 32, 1, k), jnp.uint8)
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+
+    jax.eval_shape(
+        lambda *a: gmm.moe_gmm_v6e_planar_t_b11(
+            *a, activation=ACT, ep_shards=ep_shards
+        ),
+        lhs,
+        w13,
+        w13_sc,
+        w2,
+        w2_sc,
+        group_sizes,
+    )
+    assert recorded["t13"] == (expected_tm, gmm.PLANAR_WINDOW, 1536)
+    assert recorded["t2"] == (expected_tm, gmm.PLANAR_WINDOW, 1792)
+    assert (
+        gmm._vmem_bytes(expected_tm, k, 1536, gmm.PLANAR_WINDOW, 2, rhs_pairs=2)
+        <= gmm.V6E_ROLLED_VMEM_BUDGET
+    )
+
+
 def test_moe_gmm_rejects_unsupported_operands(weights):
     w13_pt, w13_sc, w2_pt, w2_sc = weights["planar_t"]
     lhs = _lhs(8, 1)
@@ -321,7 +401,7 @@ def test_support_predicate_rejects_exactly_the_widths_without_a_tiling(rhs_pairs
             return False
         return True
 
-    widths = range(gmm.PLANAR_WINDOW, 250 * gmm.PLANAR_WINDOW, gmm.PLANAR_WINDOW)
+    widths = range(gmm.PLANAR_WINDOW, 800 * gmm.PLANAR_WINDOW, gmm.PLANAR_WINDOW)
     fits = [gmm._smallest_tiling_fits(k, rhs_pairs) for k in widths]
     assert fits == [has_tiling(k) for k in widths]
     # Both outcomes occur, and the measured widths are far inside the bound.
@@ -332,7 +412,7 @@ def test_support_predicate_rejects_exactly_the_widths_without_a_tiling(rhs_pairs
 def test_support_predicate_rejects_a_width_without_a_tiling():
     v6e = pltpu.ChipVersion.TPU_V6E
     supported = gmm.is_supported_by_planar_t_b11
-    too_wide = 249 * gmm.PLANAR_WINDOW
+    too_wide = 799 * gmm.PLANAR_WINDOW
     assert not supported(too_wide, 3072, chip_version=v6e, activation=ACT)
     assert not supported(3584, too_wide, chip_version=v6e, activation=ACT)
 
@@ -481,3 +561,94 @@ def test_fused_verify_routing_compacts_sparse_and_overflow_experts():
         np.asarray(w_compact[2, 0, :10, 0]), np.full((10,), 0.25, dtype=np.float32)
     )
     np.testing.assert_array_equal(np.asarray(w_compact[2, 0, 10:, 0]), 0)
+
+
+def test_high_vmem_rolled_tiling_selects_wide_output_tiles():
+    """64 MiB per-kernel VMEM limit / 48 MiB budget unlocks wide tn tiles."""
+    assert gmm._SCOPED_VMEM_LIMIT == 64 * 1024 * 1024
+    assert gmm.V6E_ROLLED_VMEM_BUDGET == 48 * 1024 * 1024
+
+    for m, expected_rows, exp_tm in (
+        (8192, 1024, 512),
+        (16384, 2048, 512),
+        (32768, 4096, 512),
+        (8192, 64, 64),
+        (16384, 128, 128),
+        (32768, 256, 256),
+        (131072, 256, 256),
+    ):
+        t13 = gmm.default_tiling(
+            m,
+            3584,
+            3072,
+            lhs_bytes=2,
+            rhs_pairs=2,
+            expected_rows=expected_rows,
+            vmem_budget=gmm.V6E_ROLLED_VMEM_BUDGET,
+            scoped_elem_bytes=gmm.SCOPED_ELEM_BYTES_B11,
+            force_chunk=gmm.PLANAR_WINDOW,
+        )
+        t2 = gmm.default_tiling(
+            m,
+            3072,
+            3584,
+            lhs_bytes=2,
+            rhs_pairs=1,
+            expected_rows=expected_rows,
+            vmem_budget=gmm.V6E_ROLLED_VMEM_BUDGET,
+            scoped_elem_bytes=gmm.SCOPED_ELEM_BYTES_B11,
+            force_chunk=gmm.PLANAR_WINDOW,
+        )
+        assert t13 == (exp_tm, 512, 1536)
+        assert t2 == (exp_tm, 512, 1792)
+
+
+def test_moe_gmm_matches_reference_wide_tn():
+    """Numerical parity under force_tpu_interpret_mode when tn > 512 is selected."""
+    rng = np.random.default_rng(77)
+    e, k, inter = 2, 512, 1536
+    w13, s13 = _ckpt_stack(rng, e, 2 * inter, k)
+    w2, s2 = _ckpt_stack(rng, e, k, inter)
+    w13_pt, w13_sc = gmm.repack_w13_planar_t(jnp.asarray(w13), jnp.asarray(s13))
+    w2_pt, w2_sc = gmm.repack_w2_planar_t(jnp.asarray(w2), jnp.asarray(s2))
+
+    # Confirm default_tiling actually selects tn=1536 for this shape.
+    t13 = gmm.default_tiling(
+        128,
+        k,
+        inter,
+        lhs_bytes=2,
+        rhs_pairs=2,
+        expected_rows=32,
+        vmem_budget=gmm.V6E_ROLLED_VMEM_BUDGET,
+        scoped_elem_bytes=gmm.SCOPED_ELEM_BYTES_B11,
+        force_chunk=gmm.PLANAR_WINDOW,
+    )
+    assert t13 == (32, 512, 1536)
+
+    sizes = [19, 13]
+    m = sum(sizes)
+    lhs = _lhs(m, 99, k=k)
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+    with pltpu.force_tpu_interpret_mode():
+        out = gmm.moe_gmm_v6e_planar_t_b11(
+            lhs, w13_pt, w13_sc, w2_pt, w2_sc, group_sizes, activation=ACT
+        )
+    h_ref = _fused_gate_up_reference(
+        lhs,
+        jnp.asarray(w13[:, :inter]),
+        jnp.asarray(s13[:, :inter]),
+        jnp.asarray(w13[:, inter:]),
+        jnp.asarray(s13[:, inter:]),
+        group_sizes,
+        activation=ACT,
+    )
+    ref = _gmm_reference(
+        h_ref,
+        jnp.asarray(w2),
+        jnp.asarray(s2),
+        group_sizes,
+        preferred_element_type=jnp.float32,
+    )
+    assert out.shape == (m, k)
+    _assert_close(out, ref, rel=3e-2)

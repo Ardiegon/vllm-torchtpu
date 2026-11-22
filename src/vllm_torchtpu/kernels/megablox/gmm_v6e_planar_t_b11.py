@@ -78,13 +78,13 @@ def _round_up(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
-# Mosaic's default per-kernel stack ("scoped vmem") limit, from
-# --xla_tpu_scoped_vmem_limit_kib=32768 (1/4 of v6e's 128 MiB VMEM). A kernel
-# whose live temporaries exceed it fails the whole compile with
-# CompileTimeScopedVmemOom. Raising it is a PROGRAM-WIDE flag flip
-# that takes the same bytes away from MSA for every other op in the
-# serving step, so the tiling search fits under the default instead.
-_SCOPED_VMEM_LIMIT = _V6E_INFO.vmem_capacity_bytes // 4
+# Per-kernel VMEM limit requested by the rolled grouped kernels (`mxfp4_gmm`
+# and `_run_fused_gate_up_5d`): half of v6e's 128 MiB VMEM (64 MiB), passed
+# explicitly via `pltpu.CompilerParams(vmem_limit_bytes=...)`. Passing this
+# per-kernel avoids a program-wide `--xla_tpu_scoped_vmem_limit_kib` flip
+# while unlocking wider output-column tiles (`tn` up to 1792) that cut
+# activation HBM reloads and grid iterations.
+_SCOPED_VMEM_LIMIT = _V6E_INFO.vmem_capacity_bytes // 2
 
 
 def _vmem_bytes(
@@ -207,7 +207,9 @@ def default_tiling(
     """
     budget = vmem_budget
     tms = [t for t in (512, 256, 128, 64, 32, 16, 8) if m % t == 0] or [m]
-    tns = [t for t in (512, 256, 128) if n % t == 0] or [n]
+    tns = [
+        t for t in (2048, 1792, 1536, 1280, 1024, 768, 512, 256, 128) if n % t == 0
+    ] or [n]
     chunks = [c for c in (512, 256, 128, 64, SCALE_GROUP) if c <= k and k % c == 0] or [
         k
     ]
@@ -800,7 +802,8 @@ def mxfp4_gmm(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")
+            dimension_semantics=("parallel", "arbitrary"),
+            vmem_limit_bytes=_SCOPED_VMEM_LIMIT,
         ),
         interpret=interpret,
         cost_estimate=cost,
@@ -817,15 +820,17 @@ def mxfp4_gmm(
 # Served entry points (TPU v6e)
 # ============================================================================
 
-# Per-grid-step VMEM budget of the served entry point: half of the 32 MiB
-# default scoped VMEM limit.
-V6E_ROLLED_VMEM_BUDGET = _SCOPED_VMEM_LIMIT // 2
+# Per-grid-step VMEM budget of the served entry point: 3/4 of the 64 MiB
+# per-kernel VMEM limit (48 MiB, leaving 16 MiB headroom for Mosaic stack
+# temporaries and VREG spill slots).
+V6E_ROLLED_VMEM_BUDGET = (_SCOPED_VMEM_LIMIT * 3) // 4
 # Routed-row padding of `moe_gmm_v6e_planar_t_b11`.
 _MOE_GMM_ROW_ALIGN = 128
-# Expert-parallel shard count assumed when sizing the row tile: each
-# shard expects to own about `padded_m / _MOE_GMM_EP_SHARDS` of the routed
-# rows (`default_tiling(expected_rows=...)`). A fixed assumption, not read
-# from the deployment: it only steers the row tile, every value is correct.
+# Default expert-parallel shard count assumed when the caller does not supply
+# `ep_shards`: each local expert expects to own about
+# `padded_m / (ep_shards * num_groups)` of the routed rows
+# (`default_tiling(expected_rows=...)`). It only steers the row tile; every
+# positive value is numerically valid.
 _MOE_GMM_EP_SHARDS = 8
 
 
@@ -1158,7 +1163,8 @@ def _run_fused_gate_up_5d(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")
+            dimension_semantics=("parallel", "arbitrary"),
+            vmem_limit_bytes=_SCOPED_VMEM_LIMIT,
         ),
         interpret=interpret,
         cost_estimate=cost,
@@ -1183,7 +1189,7 @@ def moe_gmm_v6e_planar_t_b11(
     *,
     activation: str,
     preferred_element_type: jax.typing.DTypeLike | None = None,
-    ep_shards: int = _MOE_GMM_EP_SHARDS,
+    ep_shards: int | None = None,
 ) -> jax.Array:
     """Routed MoE expert MLP over planar_t MXFP4 weights on TPU v6e.
 
@@ -1201,9 +1207,9 @@ def moe_gmm_v6e_planar_t_b11(
       group_sizes: `[E]` int32 local expert row counts.
       activation: expert activation (`'situ:<beta>:<linear_beta>'` or `'silu'`).
       preferred_element_type: output dtype (defaults to `lhs.dtype`).
-      ep_shards: expected expert-parallel shard count for row-tile sizing
-        (`expected_rows = ceil(padded_m / ep_shards)`; steers tile size only,
-        every positive value is numerically valid).
+      ep_shards: expert-parallel shard count for per-expert row-tile sizing
+        (`expected_rows = ceil(padded_m / (ep_shards * num_groups))`; steers
+        tile size only, every positive value is numerically valid).
 
     Returns:
       `[M, K]` expert outputs in `preferred_element_type`.
@@ -1227,7 +1233,9 @@ def moe_gmm_v6e_planar_t_b11(
     if padded_m != orig_m:
         lhs = jnp.pad(lhs, ((0, padded_m - orig_m), (0, 0)))
 
-    expected_rows = max(_MIN_EXPECTED_TM, -(-padded_m // max(ep_shards, 1)))
+    effective_ep_shards = _MOE_GMM_EP_SHARDS if ep_shards is None else ep_shards
+    total_experts = max(effective_ep_shards, 1) * num_groups
+    expected_rows = max(_MIN_EXPECTED_TM, -(-padded_m // total_experts))
 
     tiling_13 = default_tiling(
         padded_m,
@@ -1302,7 +1310,7 @@ FUSED_VERIFY_MOE_MAX_TOKENS = 256
 FUSED_VERIFY_MOE_TRAY_M = 32
 _FUSED_VERIFY_MOE_ROW_ALIGN = 128
 # Per-kernel VMEM limit requested by the fused decode/verify kernel: 3/8 of
-# v6e's 128 MiB VMEM (48 MiB, above Mosaic's 32 MiB default `_SCOPED_VMEM_LIMIT`,
+# v6e's 128 MiB VMEM (48 MiB, above Mosaic's 32 MiB default `vmem_limit_bytes`,
 # calibrated on TPU v6e with 3584 x 3072 experts and 128-row trays).
 _FUSED_DECODE_MOE_VMEM_LIMIT = (_V6E_INFO.vmem_capacity_bytes * 3) // 8
 # Bound on `_fused_verify_moe_vmem_bytes`, leaving a 2 MiB (1/64 of VMEM)

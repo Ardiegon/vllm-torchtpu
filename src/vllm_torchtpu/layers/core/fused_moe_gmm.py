@@ -522,6 +522,7 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    ep_size: int | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -549,6 +550,7 @@ def moe_gmm(
             group_sizes,
             activation=activation,
             preferred_element_type=x.dtype,
+            ep_shards=ep_size if ep_size is not None else (None if use_ep else 1),
         )
     else:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -700,6 +702,7 @@ def moe_gmm(
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "fused_decode_max_tokens",
+        "ep_size",
     ),
 )
 def fused_moe_func(
@@ -721,6 +724,7 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     fused_decode_max_tokens: int = FUSED_DECODE_MOE_MAX_TOKENS,
+    ep_size: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -870,5 +874,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        ep_size=ep_size,
     )
     return x[:num_tokens, :hidden_size]
