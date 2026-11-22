@@ -87,6 +87,8 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
         _is_dspark_pd_producer=False,
+        _dp_step_any_final_or_decode=True,
+        drafter=None,
         _execute_dp_mm_encoder=lambda: order.append("encoder"),
         _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
         speculative_config=SimpleNamespace(use_eagle=lambda: True),
@@ -822,6 +824,7 @@ def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
     def runner(is_drafter):
         return SimpleNamespace(
             _is_dspark_pd_producer=False,
+            _dp_step_any_final_or_decode=True,
             _execute_dp_mm_encoder=MagicMock(),
             _run_dp_dummy_chunk=MagicMock(),
             _is_async_drafter=is_drafter,
@@ -4485,3 +4488,156 @@ class TestSpecStateCommit:
             tpu_runner._check_single_chunk_spec_commit((layer,), 2)
         tpu_runner._check_single_chunk_spec_commit((layer,), 1)
         tpu_runner._check_single_chunk_spec_commit((), 2)
+
+
+class TestIntermediatePrefillSkip:
+    """Intermediate prefill chunks skip draft forwards and no-op spec commits."""
+
+    def test_dp_idle_pairing_runs_context_only_on_intermediate_prefill(self):
+        from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+        drafter = MagicMock(spec=DFlashProposer)
+        runner = SimpleNamespace(
+            _is_dspark_pd_producer=False,
+            _dp_step_any_final_or_decode=False,
+            _execute_dp_mm_encoder=MagicMock(),
+            _run_dp_dummy_chunk=MagicMock(),
+            _is_async_drafter=True,
+            _async_drafter=drafter,
+            drafter=drafter,
+        )
+        TPUModelRunner._run_dp_idle_pairing(runner, 1024, 2)
+        drafter.run_dp_dummy_context.assert_called_once_with(2)
+        drafter.run_dp_dummy_draft.assert_not_called()
+
+        drafter.reset_mock()
+        runner._dp_step_any_final_or_decode = True
+        TPUModelRunner._run_dp_idle_pairing(runner, 1024, 2)
+        drafter.run_dp_dummy_draft.assert_called_once_with(2)
+        drafter.run_dp_dummy_context.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("mode", "any_final_or_decode", "spec_commit_md", "computed", "total", "sched"),
+        [
+            # Intermediate prefill chunk: context KV only, skip draft fwd & commit.
+            ("intermediate", False, None, 0, 4096, 1024),
+            # Final prefill chunk: full draft propose + bootstrap, skip no-op commit.
+            ("final_prefill", True, None, 3072, 4096, 1024),
+            # Mixed / decode step with deferred commit metadata: both run.
+            ("mixed_decode", True, {"layer0": object()}, 4096, 4097, 1),
+        ],
+    )
+    def test_sample_tokens_dflash_and_commit_gating(
+        self, mode, any_final_or_decode, spec_commit_md, computed, total, sched
+    ):
+        from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+        drafter = MagicMock(spec=DFlashProposer)
+        drafter.bucketed_drafts = True
+        draft_chunk_out = [torch.zeros((1, 7), dtype=torch.int32)]
+        propose_mock = MagicMock(return_value=draft_chunk_out)
+        bootstrap_mock = MagicMock(
+            return_value=(
+                [torch.zeros((8,), dtype=torch.int32)],
+                {0: 0},
+                torch.zeros((1,), dtype=torch.int32),
+                {0: 0},
+            )
+        )
+        commit_mock = MagicMock()
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"r0": sched},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        runner = SimpleNamespace(
+            _pp_handoff=None,
+            _dp_step_other_decode=False,
+            _dp_step_any_final_or_decode=any_final_or_decode,
+            num_prompt_logprobs={},
+            max_num_reqs=4,
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[SimpleNamespace(aux_hidden_states=[torch.zeros(1)])],
+                logits_list=[torch.zeros((1, 8), dtype=torch.float32)],
+                num_reqs_list=[1],
+                spec_decode_metadata_list=[None],
+                mamba_state_indices_list=None,
+                mamba_boundary_plans=None,
+                spec_commit_metadata_list=[spec_commit_md],
+                pooler_output_list=[],
+                top_tokens=False,
+                kv_save_nan_check=None,
+                prompt_logprobs_chunks=[],
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=None,
+                num_reqs=1,
+                req_ids=["r0"],
+                req_id_to_index={"r0": 0},
+                all_greedy=True,
+                generators={},
+            ),
+            requests={
+                "r0": SimpleNamespace(
+                    num_computed_tokens=computed,
+                    num_tokens=total,
+                    output_token_ids=[],
+                )
+            },
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=7,
+                draft_tensor_parallel_size=8,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+            _is_async_drafter=True,
+            _async_drafter=drafter,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
+            _min_tokens_batch_state=lambda: {},
+            _adaptive_verification=None,
+            is_pooling_model=False,
+            drafter=drafter,
+            spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose_mock),
+            _get_sampling_generator=lambda: None,
+            _greedy_sample=lambda logits: torch.zeros((1,), dtype=torch.int32),
+            _modify_prev_results=lambda: None,
+            _commit_spec_state=commit_mock,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _sync_replicated_drafts_across_tp=lambda d: d,
+            _assemble_async_prefill_bootstrap=bootstrap_mock,
+            _update_placeholder=lambda *_args: {},
+            _stage_timing=MagicMock(),
+        )
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_build_kv_connector_output",
+        ):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+
+        with patch.object(
+            tpu_runner.AsyncTPUCopyState,
+            "from_device_chunks",
+            return_value=MagicMock(),
+        ):
+            TPUModelRunner.sample_tokens(runner, None)
+
+        if mode == "intermediate":
+            drafter.prepare_prefill_handoff.assert_called_once_with()
+            propose_mock.assert_not_called()
+            bootstrap_mock.assert_not_called()
+            commit_mock.assert_not_called()
+        elif mode == "final_prefill":
+            drafter.prepare_prefill_handoff.assert_not_called()
+            propose_mock.assert_called_once()
+            bootstrap_mock.assert_called_once()
+            commit_mock.assert_not_called()
+        else:
+            drafter.prepare_prefill_handoff.assert_not_called()
+            propose_mock.assert_called_once()
+            bootstrap_mock.assert_called_once()
+            commit_mock.assert_called_once()

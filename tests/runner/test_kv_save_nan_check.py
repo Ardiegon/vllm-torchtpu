@@ -234,6 +234,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner = SimpleNamespace(
         _pp_handoff=None if pp_is_last else handoff,
         _dp_step_other_decode=False,
+        _dp_step_any_final_or_decode=True,
         _pp_is_first=True,
         _pp_is_last=pp_is_last,
         _pp_pending_scheduler_output=None,
@@ -335,6 +336,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     runner.forward_model = MagicMock(side_effect=[(out, None) for out in chunk_outputs])
     for name in (
         "_any_decode",
+        "_any_final_or_decode",
         "_readmit_trimmed_drafts",
         "_spec_commit_layers",
         "maybe_wait_for_kv_save",

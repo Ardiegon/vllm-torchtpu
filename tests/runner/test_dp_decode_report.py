@@ -109,3 +109,85 @@ def test_any_decode_means_a_request_past_its_prompt(
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={"a": 8, "b": 1})
     assert runner._any_decode(scheduler_output) is expected
+
+
+@pytest.mark.parametrize(
+    ("final_or_decode_ranks", "expected"),
+    [
+        (set(), [False, False, False, False]),
+        ({0}, [True, True, True, True]),
+        ({2, 3}, [True, True, True, True]),
+    ],
+)
+def test_each_rank_learns_whether_any_rank_has_final_or_decode(
+    monkeypatch, final_or_decode_ranks, expected
+):
+    runners = [_runner() for _ in range(DP_SIZE)]
+    sent: list[torch.Tensor] = []
+    for rank, runner in enumerate(runners):
+        group = SimpleNamespace(rank_in_group=rank, world_size=DP_SIZE, cpu_group=None)
+        monkeypatch.setattr(parallel_state, "get_dp_group", lambda g=group: g)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda t, op=None, group=None: sent.append(t.clone()),
+        )
+        runner._dp_coordinated_step(
+            16 if rank in final_or_decode_ranks else 0,
+            1 if rank in final_or_decode_ranks else 0,
+            local_any_final_or_decode=rank in final_or_decode_ranks,
+        )
+    reduced = torch.stack(sent).amax(dim=0)
+    for rank, runner in enumerate(runners):
+        group = SimpleNamespace(rank_in_group=rank, world_size=DP_SIZE, cpu_group=None)
+        monkeypatch.setattr(parallel_state, "get_dp_group", lambda g=group: g)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda t, op=None, group=None: t.copy_(reduced),
+        )
+        runner._dp_coordinated_step(
+            16 if rank in final_or_decode_ranks else 0,
+            1 if rank in final_or_decode_ranks else 0,
+            local_any_final_or_decode=rank in final_or_decode_ranks,
+        )
+    assert [r._dp_step_any_final_or_decode for r in runners] == expected
+
+
+@pytest.mark.parametrize(
+    ("requests_map", "scheduled", "expected"),
+    [
+        # Intermediate prefill chunk only.
+        (
+            {"a": SimpleNamespace(num_computed_tokens=0, num_tokens=4096)},
+            {"a": 1024},
+            False,
+        ),
+        # Final prefill chunk.
+        (
+            {"a": SimpleNamespace(num_computed_tokens=3072, num_tokens=4096)},
+            {"a": 1024},
+            True,
+        ),
+        # Mixed intermediate + final prefill.
+        (
+            {
+                "a": SimpleNamespace(num_computed_tokens=0, num_tokens=4096),
+                "b": SimpleNamespace(num_computed_tokens=100, num_tokens=200),
+            },
+            {"a": 1024, "b": 100},
+            True,
+        ),
+        # Decode step.
+        (
+            {"a": SimpleNamespace(num_computed_tokens=4096, num_tokens=4097)},
+            {"a": 1},
+            True,
+        ),
+    ],
+)
+def test_any_final_or_decode(requests_map, scheduled, expected):
+    runner = object.__new__(TPUModelRunner)
+    runner.requests = requests_map
+    scheduler_output = SimpleNamespace(num_scheduled_tokens=scheduled)
+    assert runner._any_final_or_decode(scheduler_output) is expected

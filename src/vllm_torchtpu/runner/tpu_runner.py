@@ -770,6 +770,7 @@ class TPUModelRunner(GPUModelRunner):
     # Default for a runner built without __init__.
     _pp_handoff: PPBuffered | None = None
     _dp_step_other_decode: bool = False
+    _dp_step_any_final_or_decode: bool = True
     _adaptive_verification: AdaptiveVerificationManager | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
@@ -1027,6 +1028,7 @@ class TPUModelRunner(GPUModelRunner):
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
+        self._dp_step_any_final_or_decode = True
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -4194,9 +4196,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        local_any_final_or_decode: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
+        self._dp_step_any_final_or_decode = bool(local_any_final_or_decode)
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -4217,6 +4221,7 @@ class TPUModelRunner(GPUModelRunner):
                 # tell under a MAX reduction whether another one decodes.
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
+                int(local_any_final_or_decode),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -4235,7 +4240,16 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
         )
+        self._dp_step_any_final_or_decode = bool(t[6].item())
         return bucket, int(t[1].item())
+
+    def _any_final_or_decode(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether any scheduled request finishes prefill or is decoding."""
+        for req_id, num_sched in scheduler_output.num_scheduled_tokens.items():
+            req_state = self.requests[req_id]
+            if req_state.num_computed_tokens + num_sched >= req_state.num_tokens:
+                return True
+        return False
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
         """Whether this step schedules a request past its prompt; computed
@@ -4328,6 +4342,13 @@ class TPUModelRunner(GPUModelRunner):
                 # forward here would emit collectives with no busy-rank peer.
                 self.drafter.run_dp_dummy_context(num_chunks)
                 synchronize_tensors()
+            elif (
+                isinstance(self.drafter, DFlashProposer)
+                and not self._dp_step_any_final_or_decode
+            ):
+                # Intermediate-only prefill step: busy ranks only project
+                # context KV and skip draft forwards.
+                self.drafter.run_dp_dummy_context(num_chunks)
             else:
                 self._async_drafter.run_dp_dummy_draft(num_chunks)
 
@@ -4399,6 +4420,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
+            local_any_final_or_decode=self._any_final_or_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
@@ -4764,8 +4786,11 @@ class TPUModelRunner(GPUModelRunner):
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
+            chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
             spec_commit_metadata_list.append(
-                attn_metadata if spec_commit_layers else None
+                attn_metadata
+                if (spec_commit_layers and chunk_num_windowed > 0)
+                else None
             )
             ctx = self._attn_metadata_builder_ctx
             if self.mamba_slot_read_offsets is None:
@@ -5889,6 +5914,15 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         next_tokens_per_chunk=next_tokens_per_chunk,
                     )
+            elif (
+                isinstance(self.drafter, DFlashProposer)
+                and not self._dp_step_any_final_or_decode
+            ):
+                # Intermediate-only prefill across all DP ranks: update draft
+                # context KV for the chunk without running a draft forward
+                # whose proposals would be discarded.
+                with self._stage_timing.stage("draft_propose"):
+                    self.drafter.prepare_prefill_handoff()
             else:
                 # Seed = the just-sampled tokens, kept on-device (no D2H):
                 # propose takes the sync seed path but reads the seed from
@@ -6000,7 +6034,11 @@ class TPUModelRunner(GPUModelRunner):
                 ) = self._assemble_async_spec_substitution(
                     eagle3_drafts, next_tokens_per_chunk, state
                 )
-            elif self._is_async_drafter and next_tokens_tpu_chunks:
+            elif (
+                self._is_async_drafter
+                and eagle3_drafts is not None
+                and next_tokens_tpu_chunks
+            ):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
