@@ -387,6 +387,285 @@ def hierarchical_combine_rms_slice(
 
 
 # =============================================================================
+# Large-batch compact ragged EP all-to-all over DP
+# =============================================================================
+
+_COMPACT_MIN_CAPACITY = 4096
+_COMPACT_SEND_HEADROOM_FACTOR = 4
+_COMPACT_RECV_HEADROOM_FACTOR = 8
+_COMPACT_ROW_ALIGN = 512
+
+
+def _round_up_capacity(n: int, align: int) -> int:
+    return ((n + align - 1) // align) * align
+
+
+def compact_ep_capacity(
+    *,
+    b_dp: int,
+    dp_size: int,
+    tp_size: int,
+    e_local: int,
+    topk: int,
+) -> tuple[int, int]:
+    """Compact `(send_cap, recv_cap)` row capacities for ragged DP EP exchange.
+
+    Each `(dp, tp)` shard owns `1 / (dp * tp)` of experts and handles only
+    routes targeting its `tp` column (`expected = ceil(b_dp * topk / tp_size)`).
+    Sizing the send buffer at `max(4096, 4 * expected)` and the receive buffer
+    at `max(4096, 8 * expected)` (each capped by its exact theoretical upper
+    bound and aligned to 512 rows for GMM tiling) gives `4x` column headroom
+    and `8x` per-shard skew headroom while eliminating `[dp * b_dp * topk,
+    latent_dim]` allocations.
+    """
+    expected_local = -(-(b_dp * topk) // max(tp_size, 1))
+    send_target = max(
+        _COMPACT_MIN_CAPACITY, _COMPACT_SEND_HEADROOM_FACTOR * expected_local
+    )
+    recv_target = max(
+        _COMPACT_MIN_CAPACITY, _COMPACT_RECV_HEADROOM_FACTOR * expected_local
+    )
+    send_upper = min(b_dp * topk, b_dp * dp_size * e_local)
+    recv_upper = min(dp_size * b_dp * topk, dp_size * b_dp * e_local)
+
+    def _cap(upper: int, target: int) -> int:
+        raw = min(upper, target)
+        if raw >= _COMPACT_ROW_ALIGN:
+            return _round_up_capacity(raw, _COMPACT_ROW_ALIGN)
+        if raw >= 128:
+            return _round_up_capacity(raw, 128)
+        return max(1, raw)
+
+    return _cap(send_upper, send_target), _cap(recv_upper, recv_target)
+
+
+def ragged_dp_dispatch_combine_rms_slice(
+    lat_tp: jax.Array,
+    local_meta: jax.Array,
+    w13: jax.Array,
+    w2: jax.Array,
+    w13_scale: jax.Array,
+    w2_scale: jax.Array,
+    local_norm_w: jax.Array,
+    local_tp_rank: jax.Array,
+    *,
+    dp_axis_name: str,
+    tp_axis_name: str,
+    dp_size: int,
+    tp_size: int,
+    topk: int,
+    routed_activation: str,
+    use_norm: bool,
+    rms_eps: float,
+    use_sparse_core: bool,
+    counting_sort_fn: Any,
+    ragged_gather_fn: Any,
+    ragged_gather_reduce_fn: Any,
+    moe_gmm_fn: Any,
+    ragged_all_to_all_fn: Any = lax.ragged_all_to_all,
+    send_cap: int | None = None,
+    recv_cap: int | None = None,
+) -> jax.Array:
+    """Compact ragged EP dispatch, local planar_t GMM, and reverse combine.
+
+    Replaces padded `all_gather(dp)` + full-batch `[dp * b_dp * topk, H]` MoE
+    buffers + `psum_scatter(dp)` for large-batch prefill (`b_global >
+    max_dma_tokens`, `dp_size > 1`).
+
+    Each `(dp, tp)` rank selects only routes whose expert belongs to its `tp`
+    column (`owner_tp == tp_rank`), groups them by `(owner_dp, local_exp)`,
+    dispatches them into expert-major order on the owning `dp` peer via
+    `ragged_all_to_all(dp)`, runs the local planar_t MXFP4 GMM on the compact
+    `[recv_cap, H]` buffer, returns outputs via reverse `ragged_all_to_all(dp)`,
+    performs weighted local reduction, `tp` `psum`, exact `RMSNorm`, and slices
+    this rank's `latent_dim / tp_size` columns.
+    """
+    b_dp, latent_dim = lat_tp.shape
+    latent_local = latent_dim // tp_size
+    e_local = w13.shape[0]
+
+    if send_cap is None or recv_cap is None:
+        auto_send, auto_recv = compact_ep_capacity(
+            b_dp=b_dp,
+            dp_size=dp_size,
+            tp_size=tp_size,
+            e_local=e_local,
+            topk=topk,
+        )
+        send_cap = auto_send if send_cap is None else send_cap
+        recv_cap = auto_recv if recv_cap is None else recv_cap
+
+    local_ids, local_weights = unpack_meta_columns(local_meta, topk=topk)
+    ids_flat = local_ids.reshape(-1)
+    weights_flat = local_weights.reshape(-1)
+    tok_flat = jnp.arange(b_dp, dtype=jnp.int32).repeat(topk)
+
+    tp_rank = local_tp_rank[0, 0]
+    owner_ep = ids_flat // e_local
+    owner_dp = owner_ep // tp_size
+    owner_tp = owner_ep % tp_size
+    local_exp = ids_flat - owner_ep * e_local
+
+    in_col = (
+        (ids_flat >= 0)
+        & (weights_flat != 0)
+        & (owner_tp == tp_rank)
+        & (owner_dp >= 0)
+        & (owner_dp < dp_size)
+    )
+    num_buckets = dp_size * e_local
+    bucket = jnp.where(in_col, owner_dp * e_local + local_exp, num_buckets)
+
+    # Counting sort gives stable within-bucket positions + per-(dp, exp) counts.
+    revert_idx, bucket_counts = counting_sort_fn(bucket, num_buckets + 1)
+    token_bits = max(1, (b_dp - 1).bit_length())
+    packable = (num_buckets + 1).bit_length() + token_bits < 31
+    if revert_idx is not None and packable:
+        send_counts_flat = bucket_counts[:num_buckets]
+        packed = lax.sort(
+            jnp.left_shift(bucket, token_bits) | tok_flat,
+            is_stable=False,
+        )
+        sorted_tok = jnp.bitwise_and(packed, (1 << token_bits) - 1)
+    else:
+        sorted_idx = jnp.argsort(bucket, stable=True)
+        revert_idx = jnp.argsort(sorted_idx)
+        sorted_tok = tok_flat[sorted_idx]
+        send_counts_flat = jnp.bincount(bucket, length=num_buckets + 1)[
+            :num_buckets
+        ].astype(jnp.int32)
+
+    send_tok = sorted_tok[:send_cap]
+
+    # Bounds-safe send/recv offsets for `(dp_size, e_local)` updates.
+    send_offsets_flat = jnp.cumsum(send_counts_flat) - send_counts_flat
+    send_start = jnp.minimum(send_offsets_flat, send_cap).reshape(dp_size, e_local)
+    send_end = jnp.minimum(send_offsets_flat + send_counts_flat, send_cap).reshape(
+        dp_size, e_local
+    )
+    send_counts_clamped = send_end - send_start
+
+    # Exchange (send_counts_clamped, send_start) over 'dp' in one tiny all_to_all:
+    # receiver learns both how many rows arrive from each peer and where to write
+    # each peer's outputs back in the reverse combine ragged_all_to_all.
+    fwd_meta = lax.all_to_all(
+        jnp.stack((send_counts_clamped, send_start), axis=-1),
+        dp_axis_name,
+        split_axis=0,
+        concat_axis=0,
+    )
+    recv_counts_raw = fwd_meta[..., 0]
+    rev_output_offsets = fwd_meta[..., 1]
+    # Place received rows in expert-major order [e_local, dp_size] so recv_buf
+    # feeds directly into moe_gmm without any post-dispatch sort or gather.
+    rc_ed = recv_counts_raw.T.reshape(-1)
+    ro_ed = jnp.cumsum(rc_ed) - rc_ed
+    recv_start_ed = jnp.minimum(ro_ed, recv_cap)
+    recv_end_ed = jnp.minimum(ro_ed + rc_ed, recv_cap)
+    recv_start = recv_start_ed.reshape(e_local, dp_size).T
+    recv_counts = (recv_end_ed - recv_start_ed).reshape(e_local, dp_size).T
+
+    # Single small all_to_all returning (output_offsets, eff_send_counts) to senders.
+    back = lax.all_to_all(
+        jnp.stack((recv_start, recv_counts), axis=-1),
+        dp_axis_name,
+        split_axis=0,
+        concat_axis=0,
+    )
+    output_offsets = back[..., 0]
+    eff_send_counts = back[..., 1]
+
+    # 1. Gather compact send buffer [send_cap, latent_dim].
+    total_sent = send_counts_clamped.sum(dtype=jnp.int32)
+    if use_sparse_core:
+        send_buf = ragged_gather_fn(
+            lat_tp,
+            send_tok,
+            jnp.array([0], dtype=jnp.int32),
+            total_sent[None],
+        )
+    else:
+        send_buf = lat_tp[send_tok]
+
+    # 2. Forward ragged EP dispatch over 'dp' directly into expert-major recv_buf.
+    recv_init = lax.empty((recv_cap, latent_dim), dtype=lat_tp.dtype)
+    recv_buf = ragged_all_to_all_fn(
+        send_buf,
+        recv_init,
+        send_start.reshape(-1),
+        eff_send_counts.reshape(-1),
+        output_offsets.reshape(-1),
+        recv_counts.reshape(-1),
+        axis_name=dp_axis_name,
+    )
+
+    # 3. Local planar_t MXFP4 GMM on compact [recv_cap, padded_hidden] buffer.
+    group_sizes = recv_counts.sum(axis=0)
+    padded_hidden = w13.shape[1]
+    gmm_in = (
+        jnp.pad(recv_buf, ((0, 0), (0, padded_hidden - latent_dim)))
+        if padded_hidden > latent_dim
+        else recv_buf
+    )
+    expected_local = -(-(b_dp * topk) // max(tp_size, 1))
+    gmm_ep_shards = max(1, recv_cap // max(expected_local, 1))
+    gmm_out = moe_gmm_fn(
+        gmm_in,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        activation=routed_activation,
+        preferred_element_type=lat_tp.dtype,
+        ep_shards=gmm_ep_shards,
+    )
+    if padded_hidden > latent_dim:
+        gmm_out = gmm_out[:, :latent_dim]
+
+    # 4. Reverse ragged EP combine over 'dp' back into sender's send_buf order.
+    comb_init = jnp.zeros((send_cap, latent_dim), dtype=lat_tp.dtype)
+    comb_buf = ragged_all_to_all_fn(
+        gmm_out,
+        comb_init,
+        recv_start.reshape(-1),
+        recv_counts.reshape(-1),
+        rev_output_offsets.reshape(-1),
+        eff_send_counts.reshape(-1),
+        axis_name=dp_axis_name,
+    )
+
+    # 5. Weighted local reduction back to [b_dp, latent_dim].
+    eff_valid = in_col & (revert_idx < send_cap)
+    safe_revert = jnp.where(eff_valid, revert_idx, 0)
+    if use_sparse_core:
+        routed_dp = ragged_gather_reduce_fn(
+            comb_buf,
+            safe_revert,
+            weights_flat,
+            eff_valid,
+            reduce_group_size=topk,
+            allow_fallback=False,
+        ).astype(lat_tp.dtype)
+    else:
+        tok_h = comb_buf[safe_revert].reshape(b_dp, topk, latent_dim)
+        tok_h = tok_h * weights_flat.reshape(b_dp, topk, 1).astype(jnp.float32)
+        tok_h = jnp.where(eff_valid.reshape(b_dp, topk, 1), tok_h, 0)
+        routed_dp = tok_h.sum(axis=1).astype(lat_tp.dtype)
+
+    # 6. TP psum + exact RMSNorm(latent_dim) + local column slice.
+    routed_full = lax.psum(routed_dp, tp_axis_name)
+    if use_norm:
+        routed_full = _jax_rms_norm(routed_full, local_norm_w, rms_eps)
+    return lax.dynamic_slice_in_dim(
+        routed_full,
+        tp_rank * latent_local,
+        latent_local,
+        axis=1,
+    )
+
+
+# =============================================================================
 # Dispatch overlapped by the shared experts
 # =============================================================================
 

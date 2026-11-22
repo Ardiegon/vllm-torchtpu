@@ -68,9 +68,19 @@ from vllm_torchtpu.kernels.kimi_k3.exit_fold import (
     compute_shared_gu_and_act,
     dispatch_overlapping_shared_experts,
     hierarchical_combine_rms_slice,
+    ragged_dp_dispatch_combine_rms_slice,
     unpack_axial_gathered,
 )
+from vllm_torchtpu.kernels.megablox.gmm_v6e_planar_t_b11 import (
+    is_planar_t_b11_layout,
+    moe_gmm_v6e_planar_t_b11,
+)
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
+    ragged_gather_reduce_v2,
+)
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    _counting_sort_positions,
     fused_moe_func,
     resolve_onehot_permute_threshold,
 )
@@ -172,10 +182,57 @@ def _make_moe_ep_overlap_jax_fn(
         b_global = dp_size * b_dp
         dp_lanes = latent_dim + 3 * topk
 
-        # 1. Dispatch + shared gate/up compute.
+        # 1. Dispatch + shared gate/up compute + routed experts + combine.
+        w13 = jnp.squeeze(named["w13"], axis=(0, 1))
+        w2 = jnp.squeeze(named["w2"], axis=(0, 1))
+        w13_scale = jnp.squeeze(named["w13_scale"], axis=(0, 1))
+        w2_scale = jnp.squeeze(named["w2_scale"], axis=(0, 1))
+
+        ragged_min_tokens = max(max_dma_tokens, cfg.fused_decode_max_tokens)
+        if (
+            b_global > ragged_min_tokens
+            and dp_size > 1
+            and is_planar_t_b11_layout(w13, w13_scale, rhs_quant_dtype=None)
+        ):
+            # Prefill / large batch with multi-DP: compact ragged EP all-to-all
+            # over 'dp' (dispatches only routes belonging to this TP column into
+            # expert-major local buffers, avoiding full [b_global * topk, H]
+            # allocations and padded DP all-gather / reduce-scatter).
+            shared_act = compute_shared_gu_and_act(
+                local_hidden,
+                local_w_shared_gu,
+                situ_beta=cfg.situ_beta,
+                situ_linear_beta=cfg.situ_linear_beta,
+            )
+            lat_tp = lax.all_gather(local_rdown, TP_AXIS_NAME, axis=1, tiled=True)
+            routed_local = ragged_dp_dispatch_combine_rms_slice(
+                lat_tp,
+                local_meta,
+                w13,
+                w2,
+                w13_scale,
+                w2_scale,
+                local_norm_w,
+                named["tp_rank"],
+                dp_axis_name=DP_AXIS_NAME,
+                tp_axis_name=TP_AXIS_NAME,
+                dp_size=dp_size,
+                tp_size=tp_size,
+                topk=topk,
+                routed_activation=cfg.routed_activation,
+                use_norm=cfg.use_norm,
+                rms_eps=cfg.rms_eps,
+                use_sparse_core=use_sparse_core,
+                counting_sort_fn=_counting_sort_positions,
+                ragged_gather_fn=ragged_gather_v2,
+                ragged_gather_reduce_fn=ragged_gather_reduce_v2,
+                moe_gmm_fn=moe_gmm_v6e_planar_t_b11,
+            )
+            return jnp.concatenate((shared_act, routed_local), axis=-1)
+
         if b_global > max_dma_tokens:
-            # Prefill / large batch: XLA all-gathers on contiguous axes (TP on
-            # axis 1, then DP on axis 0), so no 4D transpose is needed.
+            # Prefill / large batch fallback (single-DP or non-planar weights):
+            # XLA all-gathers on contiguous axes.
             shared_act = compute_shared_gu_and_act(
                 local_hidden,
                 local_w_shared_gu,
@@ -212,10 +269,10 @@ def _make_moe_ep_overlap_jax_fn(
         # 2. Routed experts.
         moe_out = fused_moe_func(
             ag_latent,
-            jnp.squeeze(named["w13"], axis=(0, 1)),
-            jnp.squeeze(named["w2"], axis=(0, 1)),
-            jnp.squeeze(named["w13_scale"], axis=(0, 1)),
-            jnp.squeeze(named["w2_scale"], axis=(0, 1)),
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
             None,
             None,
             ag_weights,
@@ -229,6 +286,7 @@ def _make_moe_ep_overlap_jax_fn(
             rhs_quant_dtype=None,
             skip_padded_tokens=True,
             fused_decode_max_tokens=cfg.fused_decode_max_tokens,
+            ep_size=dp_size * tp_size,
         )
 
         # 3. Exact combine + RMSNorm(latent_dim) + [latent_local] slice.
